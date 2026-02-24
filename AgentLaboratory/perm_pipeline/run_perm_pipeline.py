@@ -72,6 +72,12 @@ def main():
     p.add_argument("--out", default=str(Path.cwd() / "generated" / "solve_module.py"), help="Where to write the final solver.")
     p.add_argument("--max-iters", type=int, default=4, help="Max repair iterations.")
     p.add_argument("--no-llm", action="store_true", help="Skip LLM, write baseline solver directly.")
+    p.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail with non-zero exit code if LLM generation/repair does not validate. "
+             "By default, the pipeline falls back to the offline baseline solver and exits 0.",
+    )
     p.add_argument("--validator", default=str(Path.cwd() / "validate_solve_output.py"),
                    help="Path to validate_solve_output.py (supports LRX/ISK simulation).")
     args = p.parse_args()
@@ -101,6 +107,16 @@ def main():
         print(f"[+] Wrote baseline solver to {out_path}")
         sys.exit(0)
 
+    def _fallback_to_baseline(reason: str) -> None:
+        """Write baseline solver and exit (unless --strict)."""
+        print(f"[!] {reason}", file=sys.stderr)
+        if args.strict:
+            sys.exit(1)
+        out_path.write_text(baseline_code, encoding="utf-8")
+        print("[!] Falling back to the offline baseline solver.", file=sys.stderr)
+        print(f"[+] Wrote baseline solver to {out_path}")
+        sys.exit(0)
+
     # --- Agent 1: Planner ---
     try:
         plan = query_model(model_fallback, user_prompt, prompts["planner"])
@@ -113,13 +129,18 @@ def main():
         out_path.write_text(baseline_code, encoding="utf-8")
         print(f"[+] Wrote baseline solver to {out_path}")
         sys.exit(0)
+    except Exception as e:
+        _fallback_to_baseline(f"Planner failed (LLM error): {e}")
 
     # --- Agent 2: Coder ---
     coder_prompt = f"USER TASK:\n{user_prompt}\n\nPLANNER NOTES:\n{plan}\n\nNow write the solver file."
-    resp = query_model(model_fallback, coder_prompt, prompts["coder"])
-    code = extract_python(resp or "") if resp else None
-    if not code:
-        code = baseline_code
+    try:
+        resp = query_model(model_fallback, coder_prompt, prompts["coder"])
+        code = extract_python(resp or "") if resp else None
+        if not code:
+            code = baseline_code
+    except Exception as e:
+        _fallback_to_baseline(f"Coder failed (LLM error): {e}")
 
     out_path.write_text(code, encoding="utf-8")
 
@@ -150,15 +171,26 @@ def main():
 
         # --- Agent 3: Fixer ---
         fix_prompt = f"""USER TASK:\n{user_prompt}\n\nCURRENT CODE:\n```python\n{out_path.read_text(encoding='utf-8')}\n```\n\nVALIDATOR REPORT:\n{last_report}\n\nReturn a corrected full python file."""
-        resp = query_model(model_fallback, fix_prompt, prompts["fixer"])
-        new_code = extract_python(resp or "") if resp else None
-        if not new_code:
-            print("[!] Fixer failed to return code. Stopping.", file=sys.stderr)
-            break
-        out_path.write_text(new_code, encoding="utf-8")
+        try:
+            resp = query_model(model_fallback, fix_prompt, prompts["fixer"])
+            new_code = extract_python(resp or "") if resp else None
+            if not new_code:
+                print("[!] Fixer failed to return code. Stopping.", file=sys.stderr)
+                break
+            out_path.write_text(new_code, encoding="utf-8")
+        except Exception as e:
+            _fallback_to_baseline(f"Fixer failed (LLM error): {e}")
 
+    # If we get here, LLM-generated code did not validate.
+    if args.strict:
+        print("[!] Failed to validate solver within max iterations.", file=sys.stderr)
+        sys.exit(1)
+
+    out_path.write_text(baseline_code, encoding="utf-8")
     print("[!] Failed to validate solver within max iterations.", file=sys.stderr)
-    sys.exit(1)
+    print("[!] Falling back to the offline baseline solver.", file=sys.stderr)
+    print(f"[+] Wrote baseline solver to {out_path}")
+    sys.exit(0)
 
 if __name__ == "__main__":
     main()

@@ -105,7 +105,38 @@ def curr_cost_est():
     }
     return sum([costmap_in[_]*TOKENS_IN[_] for _ in TOKENS_IN]) + sum([costmap_out[_]*TOKENS_OUT[_] for _ in TOKENS_OUT])
 
-def query_model(model_str, prompt, system_prompt, openai_api_key=None, gemini_api_key=None,  anthropic_api_key=None, tries=5, timeout=5.0, temp=None, print_cost=True, version="1.5"):
+def query_model(
+    model_str,
+    prompt,
+    system_prompt,
+    openai_api_key=None,
+    gemini_api_key=None,
+    anthropic_api_key=None,
+    tries=5,
+    timeout=20.0,
+    temp=None,
+    print_cost=True,
+    version="1.5",
+):
+    """Query an LLM backend.
+
+    Robustness notes:
+    - g4f providers can be slow/unstable. The previous default timeout (5s) caused frequent
+      false timeouts. We default to 20s.
+    - You can override retries/timeouts via env vars without touching code:
+        AGENTLAB_TRIES=3 AGENTLAB_TIMEOUT=60
+      (G4F_TRIES/G4F_TIMEOUT are supported as aliases)
+    """
+
+    # Allow env overrides (useful in Colab / CI where providers are flaky)
+    try:
+        tries = int(os.getenv("AGENTLAB_TRIES", os.getenv("G4F_TRIES", str(tries))))
+    except Exception:
+        pass
+    try:
+        timeout = float(os.getenv("AGENTLAB_TIMEOUT", os.getenv("G4F_TIMEOUT", str(timeout))))
+    except Exception:
+        pass
     # Allow a simple "fallback list" syntax: model_a|model_b|model_c
     if isinstance(model_str, str) and ("|" in model_str):
         last_err = None
@@ -181,7 +212,9 @@ def query_model(model_str, prompt, system_prompt, openai_api_key=None, gemini_ap
                 resp = g4f.ChatCompletion.create(
                     model=model_str,
                     messages=messages,
-                    timeout=int(max(5, timeout)),
+                    # g4f expects an integer timeout (seconds). Allow <5s for quick smoke tests,
+                    # but never pass 0.
+                    timeout=int(max(1, timeout)),
                     **kwargs,
                 )
                 answer = _g4f_to_text(resp)
@@ -366,7 +399,12 @@ def query_model(model_str, prompt, system_prompt, openai_api_key=None, gemini_ap
                 ) from e
 
             print("Inference Exception:", e)
-            time.sleep(timeout)
+            # Don't sleep for the whole request timeout; use a small backoff.
+            try:
+                backoff = min(2.0, max(0.1, timeout * 0.25))
+            except Exception:
+                backoff = 1.0
+            time.sleep(backoff)
             continue
     raise Exception("Max retries: timeout")
 
