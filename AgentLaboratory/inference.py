@@ -22,10 +22,7 @@ try:
 except Exception:
     anthropic = None  # type: ignore
 
-try:
-    import google.generativeai as genai  # type: ignore
-except Exception:
-    genai = None  # type: ignore
+genai = None  # type: ignore
 
 # g4f (GPT4Free) backend (optional)
 try:
@@ -60,6 +57,23 @@ def _g4f_to_text(resp):
         except Exception:
             return ""
     return ""
+
+
+class MissingLLMCredentials(RuntimeError):
+    """Raised when the selected backend requires credentials that are not provided."""
+
+
+_FATAL_AUTH_MARKERS = (
+    'Add a "api_key"',
+    "MissingAuthError",
+    "Add a .har file",
+    'Add a "api_key" or a .har file',
+)
+
+
+def _looks_like_missing_auth(err: Exception) -> bool:
+    msg = str(err)
+    return any(m in msg for m in _FATAL_AUTH_MARKERS)
 
 
 TOKENS_IN = dict()
@@ -120,8 +134,7 @@ def query_model(model_str, prompt, system_prompt, openai_api_key=None, gemini_ap
         raise ImportError("openai package is required for OpenAI-backed models; install it or use g4f:")
     if anthropic_api_key is not None and anthropic is None:
         raise ImportError("anthropic package is required for Claude-backed models")
-    if gemini_api_key is not None and genai is None:
-        raise ImportError("google-generativeai package is required for Gemini-backed models")
+    # Gemini SDK is imported lazily only if a Gemini model is actually requested.
     if openai_api_key is None and anthropic_api_key is None and gemini_api_key is None and g4f is None:
         raise Exception("No API key provided and g4f is not available in query_model")
     if openai_api_key is not None:
@@ -139,6 +152,25 @@ def query_model(model_str, prompt, system_prompt, openai_api_key=None, gemini_ap
                     {"role": "user", "content": prompt},
                 ]
                 kwargs = {}
+
+                # Some g4f providers require credentials (API key or .har). If the user provided
+                # one via env vars, pass it through (only if supported by this installed g4f).
+                try:
+                    import inspect
+                    sig = inspect.signature(g4f.ChatCompletion.create)  # type: ignore
+                    if "api_key" in sig.parameters:
+                        api_key = (
+                            os.getenv("OPENROUTER_API_KEY")
+                            or os.getenv("OPENAI_API_KEY")
+                            or os.getenv("GROQ_API_KEY")
+                            or os.getenv("TOGETHER_API_KEY")
+                            or os.getenv("GEMINI_API_KEY")
+                        )
+                        if api_key:
+                            kwargs["api_key"] = api_key
+                except Exception:
+                    pass
+
                 provider_name = os.getenv("G4F_PROVIDER", "").strip()
                 if provider_name:
                     try:
@@ -185,10 +217,18 @@ def query_model(model_str, prompt, system_prompt, openai_api_key=None, gemini_ap
                 answer = completion.choices[0].message.content
 
             elif model_str == "gemini-2.0-pro":
+                try:
+                    import google.generativeai as genai  # type: ignore
+                except Exception as e:
+                    raise ImportError("Gemini backend requires 'google-generativeai' (legacy) or update this code to google-genai.") from e
                 genai.configure(api_key=gemini_api_key)
                 model = genai.GenerativeModel(model_name="gemini-2.0-pro-exp-02-05", system_instruction=system_prompt)
                 answer = model.generate_content(prompt).text
             elif model_str == "gemini-1.5-pro":
+                try:
+                    import google.generativeai as genai  # type: ignore
+                except Exception as e:
+                    raise ImportError("Gemini backend requires 'google-generativeai' (legacy) or update this code to google-genai.") from e
                 genai.configure(api_key=gemini_api_key)
                 model = genai.GenerativeModel(model_name="gemini-1.5-pro", system_instruction=system_prompt)
                 answer = model.generate_content(prompt).text
@@ -316,6 +356,15 @@ def query_model(model_str, prompt, system_prompt, openai_api_key=None, gemini_ap
                 if print_cost: print(f"Cost approximation has an error? {e}")
             return answer
         except Exception as e:
+            # Fail fast on missing credentials (common with g4f providers that need api_key or .har)
+            if _looks_like_missing_auth(e):
+                raise MissingLLMCredentials(
+                    "g4f provider requires credentials (api_key or .har). "
+                    "Set OPENROUTER_API_KEY / OPENAI_API_KEY (or other provider key), or place a .har/.json in ./har_and_cookies, "
+                    "or run with --no-llm to use the offline baseline solver. "
+                    f"Original error: {e}"
+                ) from e
+
             print("Inference Exception:", e)
             time.sleep(timeout)
             continue

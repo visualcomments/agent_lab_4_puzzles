@@ -30,7 +30,7 @@ from typing import Dict, List, Optional, Tuple
 THIS_DIR = Path(__file__).resolve().parent
 AGENTLAB_ROOT = THIS_DIR.parent
 sys.path.insert(0, str(AGENTLAB_ROOT))
-from inference import query_model  # type: ignore
+from inference import query_model, MissingLLMCredentials  # type: ignore
 
 RE_PY_BLOCK = re.compile(r"```python\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 
@@ -102,9 +102,17 @@ def main():
         sys.exit(0)
 
     # --- Agent 1: Planner ---
-    plan = query_model(model_fallback, user_prompt, prompts["planner"])
-    if not plan:
-        plan = "(planner failed; proceeding)"
+    try:
+        plan = query_model(model_fallback, user_prompt, prompts["planner"])
+        if not plan:
+            plan = "(planner failed; proceeding)"
+    except MissingLLMCredentials as e:
+        # Make the CLI usable out-of-the-box even when g4f providers require auth.
+        print(f"[!] {e}")
+        print("[!] Falling back to the offline baseline solver. To enable LLM generation, set a provider API key or cookies/HAR for g4f, or pass --no-llm explicitly.")
+        out_path.write_text(baseline_code, encoding="utf-8")
+        print(f"[+] Wrote baseline solver to {out_path}")
+        sys.exit(0)
 
     # --- Agent 2: Coder ---
     coder_prompt = f"USER TASK:\n{user_prompt}\n\nPLANNER NOTES:\n{plan}\n\nNow write the solver file."
