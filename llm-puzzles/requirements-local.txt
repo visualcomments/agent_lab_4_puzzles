@@ -1,0 +1,9 @@
+-r requirements.txt
+transformers>=4.44.0
+accelerate>=0.33.0
+huggingface_hub>=0.24.0
+sentencepiece>=0.2.0
+safetensors>=0.4.4
+# torch install is platform specific; recommended:
+# pip install torch --index-url https://download.pytorch.org/whl/cpu  # CPU only
+# pip install torch --index-url https://download.pytorch.org/whl/cu121 # CUDA 12.1

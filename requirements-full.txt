@@ -1,0 +1,14 @@
+# Full (optional) dependencies
+# Note: you can run offline selftest without installing anything.
+
+# g4f backend (if you prefer pip instead of bundled ./gpt4free)
+g4f
+
+# Kaggle submission/score
+kaggle
+
+# AgentLaboratory optional backends (only needed if you want OpenAI/Claude/Gemini)
+openai
+anthropic
+google-generativeai
+tiktoken

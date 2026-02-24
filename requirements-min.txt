@@ -1,0 +1,7 @@
+# Minimal (offline): no external dependencies required.
+#
+# If you want real LLM calls via g4f:
+#   pip install g4f
+#
+# If you want Kaggle submit/score:
+#   pip install kaggle
