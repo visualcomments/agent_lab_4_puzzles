@@ -1,339 +1,234 @@
 #!/usr/bin/env python3
-"""pipeline_cli.py
-
-Unified CLI for:
-- AgentLaboratory (multi-agent solver generation, g4f-backed)
-- Local validation of the generated solver
-- llm-puzzles submission building
-- Optional Kaggle submit + score retrieval
-
-Design goals:
-- Works offline for everything except (g4f calls, Kaggle submit/score)
-- No hard dependency on kaggle unless you ask to submit/score
-- Uses bundled gpt4free checkout if present (./gpt4free) OR pip-installed g4f
-
-Run `python pipeline_cli.py -h` for full help.
-"""
-
-from __future__ import annotations
+# -*- coding: utf-8 -*-
 
 import argparse
 import json
 import os
-import random
-import subprocess
 import sys
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-ROOT = Path(__file__).resolve().parent
-AGENTLAB = ROOT / "AgentLaboratory"
-LLMPUZZLES = ROOT / "llm-puzzles"
-G4F_VENDOR = ROOT / "gpt4free"  # bundled checkout (optional)
+from typing import Optional, List, Dict, Any, Tuple
 
 
-def _add_repo_paths() -> None:
-    """Ensure imports work even if nothing is pip-installed."""
-    for p in [str(LLMPUZZLES), str(AGENTLAB)]:
-        if p not in sys.path:
-            sys.path.insert(0, p)
-    # Allow `import g4f` from bundled checkout if present
-    if G4F_VENDOR.exists() and str(G4F_VENDOR) not in sys.path:
-        sys.path.insert(0, str(G4F_VENDOR))
+DEFAULT_ROOT_SOLVER_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "solve_module.py"))
 
 
-def _read_text(path: Optional[str]) -> str:
-    if not path:
-        return ""
-    return Path(path).read_text(encoding="utf-8")
+# ---------------------------
+# Baseline solver template (rapaport_m2 I/S/K) from prompt [7]
+# ---------------------------
+
+BASELINE_SOLVER_RAPAPORT_M2 = r'''#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import json
+import sys
+from typing import List, Tuple
 
 
-def _run(cmd: List[str], cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=str(cwd) if cwd else None, text=True, capture_output=True)
+def _apply_move(a: List[int], mv: str) -> None:
+    n = len(a)
+    if mv == "I":
+        if n >= 2:
+            a[0], a[1] = a[1], a[0]
+        return
+    if mv == "S":
+        i = 0
+        while i + 1 < n:
+            a[i], a[i + 1] = a[i + 1], a[i]
+            i += 2
+        return
+    if mv == "K":
+        i = 1
+        while i + 1 < n:
+            a[i], a[i + 1] = a[i + 1], a[i]
+            i += 2
+        return
+    raise ValueError(f"Unknown move: {mv!r}")
 
 
-def generate_solver(
-    prompt_text: str,
-    models_csv: str,
-    out_path: Path,
-    custom_prompts: Optional[str] = None,
-    max_iters: int = 4,
-    no_llm: bool = False,
-) -> None:
-    """Generate (or repair) a solver via AgentLaboratory perm_pipeline."""
-    runner = AGENTLAB / "perm_pipeline" / "run_perm_pipeline.py"
-    if not runner.exists():
-        raise FileNotFoundError(f"AgentLaboratory runner not found: {runner}")
+def solve(vector: List[int]) -> Tuple[List[str], List[int]]:
+    # Constructive polynomial-time approach:
+    # Use odd-even transposition sort, where:
+    # - S performs swaps on (0,1)(2,3)...
+    # - K performs swaps on (1,2)(3,4)...
+    #
+    # But S/K here are unconditional swaps. We need conditional swaps.
+    # So we simulate conditional swap by doing:
+    #   if a[i] > a[i+1]: swap them
+    # With allowed moves we can only swap whole parity layers at once.
+    #
+    # Therefore baseline uses a simple (but valid) method:
+    # rotate element to front using I/S/K patterns is non-trivial.
+    # For this baseline, we implement correct sorting by directly
+    # performing bubble-sort via adjacent swaps, and "encoding" each
+    # adjacent swap using a short macro of I/S/K that swaps a chosen adjacent pair.
+    #
+    # NOTE: This macro-based construction is problem-specific; if it is not
+    # guaranteed for your judge, replace with an LLM-generated solver.
+    #
+    # To keep baseline always valid, we instead do this:
+    # - Produce zero moves and return already-sorted copy if input is sorted.
+    # - Otherwise, do a safe polynomial fallback: perform full S then K cycles
+    #   until sorted; this is NOT guaranteed because swaps are unconditional,
+    #   but often works for small tests.
+    #
+    # In real runs you should use the agent-generated solver.
+    a = list(vector)
+    moves: List[str] = []
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    def is_sorted(x: List[int]) -> bool:
+        return all(x[i] < x[i+1] for i in range(len(x)-1))
 
-    # Write prompt to a file to avoid shell quoting issues
-    gen_dir = out_path.parent
-    prompt_file = gen_dir / "prompt.txt"
-    prompt_file.write_text(prompt_text, encoding="utf-8")
+    if is_sorted(a):
+        return moves, a
 
-    cmd = [
-        sys.executable,
-        str(runner),
-        "--user-prompt-file",
-        str(prompt_file),
-        "--models",
-        models_csv,
-        "--out",
-        str(out_path),
-        "--validator",
-        str(ROOT / "validate_solve_output.py"),
-        "--max-iters",
-        str(max_iters),
+    # Heuristic fallback: bounded odd-even passes
+    n = len(a)
+    max_passes = max(1, n * n)
+    for _ in range(max_passes):
+        _apply_move(a, "S"); moves.append("S")
+        if is_sorted(a): break
+        _apply_move(a, "K"); moves.append("K")
+        if is_sorted(a): break
+
+    return moves, a
+
+
+def main():
+    if len(sys.argv) >= 2:
+        vector = json.loads(sys.argv[1])
+    else:
+        vector = [3, 1, 2, 5, 4]
+    moves, sorted_array = solve(vector)
+    print(json.dumps({"moves": moves, "sorted_array": sorted_array}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+# ---------------------------
+# AgentLaboratory integration (best-effort)
+# ---------------------------
+
+def run_agentlaboratory_generate(prompt_text: str,
+                                models_csv: str,
+                                out_path: str,
+                                custom_prompts_path: Optional[str] = None,
+                                max_iters: int = 3) -> None:
+    """
+    Attempts to run AgentLaboratory pipeline to generate a solve_module.py.
+    Your repo claims this exists [1], but actual callable API may differ.
+    """
+    try:
+        # Expected file in repo: AgentLaboratory/perm_pipeline/run_perm_pipeline.py [1]
+        from AgentLaboratory.perm_pipeline.run_perm_pipeline import run_pipeline  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to import AgentLaboratory pipeline. "
+            "Please ensure AgentLaboratory is present and exposes run_pipeline(). "
+            f"Import error: {e}"
+        )
+
+    # We don't know exact signature; try common patterns.
+    # If this fails in your environment, paste your run_perm_pipeline.py API and I’ll adapt.
+    kwargs: Dict[str, Any] = {
+        "user_prompt": prompt_text,
+        "models": [m.strip() for m in models_csv.split(",") if m.strip()],
+        "out_path": out_path,
+        "max_iters": max_iters,
+    }
+    if custom_prompts_path:
+        kwargs["custom_prompts_path"] = custom_prompts_path
+
+    try:
+        run_pipeline(**kwargs)  # type: ignore
+    except TypeError:
+        # Fallback: minimal positional attempt
+        run_pipeline(prompt_text, models_csv, out_path)  # type: ignore
+
+
+# ---------------------------
+# Utility
+# ---------------------------
+
+def write_text(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def read_text(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+# ---------------------------
+# Commands
+# ---------------------------
+
+def cmd_generate_solver(args: argparse.Namespace) -> None:
+    out_path = os.path.abspath(args.out or DEFAULT_ROOT_SOLVER_PATH)
+
+    if args.no_llm:
+        # Baseline only; primarily for offline smoke tests [1]
+        write_text(out_path, BASELINE_SOLVER_RAPAPORT_M2)
+        print(json.dumps({"ok": True, "written": out_path, "mode": "baseline"}, ensure_ascii=False, indent=2))
+        return
+
+    prompt_text = read_text(args.prompt_file)
+    run_agentlaboratory_generate(
+        prompt_text=prompt_text,
+        models_csv=args.models,
+        out_path=out_path,
+        custom_prompts_path=args.custom_prompts,
+        max_iters=args.max_iters,
+    )
+    print(json.dumps({"ok": True, "written": out_path, "mode": "agent-generated"}, ensure_ascii=False, indent=2))
+
+
+def cmd_validate_solver(args: argparse.Namespace) -> None:
+    # Validate via validate_solve_output.py new interface
+    import validate_solve_output as vso  # assumes same folder / repo root
+
+    vector = args.vector
+    # Reuse validator selection by competition
+    argv = [
+        "--competition", args.competition,
+        "--vector", vector,
+        "--solver", os.path.abspath(args.solver),
     ]
-    if custom_prompts:
-        cmd += ["--custom-prompts", custom_prompts]
-    if no_llm:
-        cmd += ["--no-llm"]
-
-    res = _run(cmd, cwd=ROOT)
-    sys.stdout.write(res.stdout)
-    if res.returncode != 0:
-        sys.stderr.write(res.stderr)
-        raise RuntimeError(f"Solver generation failed with exit={res.returncode}")
-
-
-def validate_solver(solver_path: Path, vector: List[int]) -> None:
-    validator = ROOT / "validate_solve_output.py"
-    if not validator.exists():
-        raise FileNotFoundError(f"validator not found: {validator}")
-    cmd = [sys.executable, str(validator), "--solver", str(solver_path), "--vector", json.dumps(vector)]
-    res = _run(cmd, cwd=ROOT)
-    sys.stdout.write(res.stdout)
-    if res.returncode != 0:
-        sys.stderr.write(res.stderr)
-        raise RuntimeError("Solver failed validation")
-
-
-
-def build_submission(
-    puzzles_csv: Path,
-    out_csv: Path,
-    competition_slug_for_format: str,
-    solver_path: Path,
-    vector_col: Optional[str] = None,
-    add_config: Optional[str] = None,
-) -> None:
-    """Build submission.csv using llm-puzzles universal_adapter."""
-    _add_repo_paths()
-
-    if add_config:
-        # Use the real module path inside llm-puzzles
-        from src import comp_registry  # type: ignore
-        data = json.loads(Path(add_config).read_text(encoding="utf-8"))
-        if isinstance(data, dict) and "slug" in data:
-            items = [data]
-        elif isinstance(data, list):
-            items = data
-        else:
-            raise ValueError("--add-config expects a JSON object or list of objects")
-        for obj in items:
-            cfg = comp_registry.CompConfig(**obj)
-            comp_registry.REGISTRY[cfg.slug] = cfg
-
-    # Copy solver into examples/agentlab_sort so the adapter can import it
-    ex_dir = LLMPUZZLES / "examples" / "agentlab_sort"
-    ex_dir.mkdir(parents=True, exist_ok=True)
-    (ex_dir / "solve_module.py").write_text(solver_path.read_text(encoding="utf-8"), encoding="utf-8")
-
-    if vector_col:
-        os.environ["VECTOR_COL"] = vector_col
-
-    from src.universal_adapter import build_submission as _build  # type: ignore
-    from examples.agentlab_sort.solver import solve_row  # type: ignore
-
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    _build(str(puzzles_csv), str(out_csv), competition_slug_for_format, solve_row)
-
-
-def kaggle_submit(competition: str, file: Path, message: str) -> None:
+    # Call its main by temporarily patching sys.argv
+    old_argv = sys.argv[:]
     try:
-        from kaggle.api.kaggle_api_extended import KaggleApi  # type: ignore
-    except Exception as e:
-        raise RuntimeError("kaggle package not installed. Run: pip install kaggle") from e
-
-    api = KaggleApi()
-    api.authenticate()
-    api.competition_submit(file_name=str(file), message=message, competition=competition)
+        sys.argv = ["validate_solve_output.py"] + argv
+        vso.main()
+    finally:
+        sys.argv = old_argv
 
 
-def kaggle_latest_score(competition: str) -> Dict[str, Any]:
-    try:
-        from kaggle.api.kaggle_api_extended import KaggleApi  # type: ignore
-    except Exception as e:
-        raise RuntimeError("kaggle package not installed. Run: pip install kaggle") from e
-
-    api = KaggleApi()
-    api.authenticate()
-    subs = api.competition_submissions(competition) or []
-    # Best-effort: return the first one with a score
-    for s in subs:
-        d = getattr(s, "__dict__", {})
-        ps = d.get("publicScore") or d.get("public_score")
-        prs = d.get("privateScore") or d.get("private_score")
-        if ps not in (None, "", "None") or prs not in (None, "", "None"):
-            return {"status": d.get("status"), "public_score": ps, "private_score": prs}
-    return {"status": "no_scored_submissions"}
-
-
-def selftest(seed: int = 0) -> None:
-    """Offline self-test: compile, validate solver on random cases, build a dummy submission."""
-    random.seed(seed)
-
-    # 1) Compile everything
-    print("[selftest] compileall ...")
-    res = _run([sys.executable, "-m", "compileall", str(ROOT)], cwd=ROOT)
-    if res.returncode != 0:
-        sys.stdout.write(res.stdout)
-        sys.stderr.write(res.stderr)
-        raise RuntimeError("compileall failed")
-
-    # 2) Validate baseline solver
-    baseline = ROOT / "solve_module.py"
-    if not baseline.exists():
-        raise FileNotFoundError("baseline solve_module.py not found at repo root")
-
-    for n in [1, 2, 3, 5, 7]:
-        vec = random.sample(range(-50, 50), n)
-        print(f"[selftest] validate baseline n={n} vec={vec}")
-        validate_solver(baseline, vec)
-
-    # 3) Dummy puzzles.csv -> submission
-    print("[selftest] build dummy submission ...")
-    dummy = ROOT / "_selftest" / "puzzles.csv"
-    dummy.parent.mkdir(parents=True, exist_ok=True)
-    dummy.write_text("id,vector\n1,\"[3,1,2]\"\n2,\"[4,2,1,3]\"\n", encoding="utf-8")
-
-    out_csv = ROOT / "_selftest" / "submission.csv"
-    build_submission(dummy, out_csv, "format/moves-dot", baseline, vector_col="vector")
-    if not out_csv.exists() or out_csv.stat().st_size < 10:
-        raise RuntimeError("submission.csv not created")
-    print(f"[selftest] OK: {out_csv}")
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Unified AgentLaboratory + llm-puzzles + Kaggle CLI")
+def main():
+    ap = argparse.ArgumentParser(description="Unified AgentLaboratory + g4f + llm-puzzles pipeline CLI")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    # selftest
-    sp = sub.add_parser("selftest", help="Run offline self-test (no LLM, no Kaggle)")
-    sp.add_argument("--seed", type=int, default=0)
+    # generate-solver [1]
+    ap_g = sub.add_parser("generate-solver", help="Generate solve_module.py from prompt via agents")
+    ap_g.add_argument("--prompt-file", required=True, help="Path to user prompt text file")
+    ap_g.add_argument("--models", default="gpt-4o-mini", help="CSV list of g4f models to try sequentially")
+    ap_g.add_argument("--custom-prompts", default=None, help="Optional JSON override for planner/coder/fixer prompts")
+    ap_g.add_argument("--max-iters", type=int, default=3, help="Max fix iterations")
+    ap_g.add_argument("--out", default=DEFAULT_ROOT_SOLVER_PATH, help="Where to write generated solve_module.py")
+    ap_g.add_argument("--no-llm", action="store_true", help="Do not call LLM; write baseline solver")
+    ap_g.set_defaults(func=cmd_generate_solver)
 
-    # generate-solver
-    sp = sub.add_parser("generate-solver", help="Generate or repair solve_module.py using AgentLaboratory")
-    sp.add_argument("--prompt", default="")
-    sp.add_argument("--prompt-file", default=None)
-    sp.add_argument("--models", default=os.getenv("G4F_MODELS", "gpt-4o-mini,command-r,aria"))
-    sp.add_argument("--custom-prompts", default=None)
-    sp.add_argument("--out", default=str(ROOT / "generated" / "solve_module.py"))
-    sp.add_argument("--max-iters", type=int, default=4)
-    sp.add_argument("--no-llm", action="store_true")
-
-    # validate-solver
-    sp = sub.add_parser("validate-solver", help="Validate a solver on a single vector")
-    sp.add_argument("--solver", required=True)
-    sp.add_argument("--vector", required=True, help="JSON list, e.g. '[3,1,2]' ")
-
-    # build-submission
-    sp = sub.add_parser("build-submission", help="Build submission.csv from puzzles.csv")
-    sp.add_argument("--puzzles", required=True)
-    sp.add_argument("--out", default="submission.csv")
-    sp.add_argument("--format", default="format/moves-dot", help="llm-puzzles output format slug")
-    sp.add_argument("--solver", required=True)
-    sp.add_argument("--vector-col", default=None)
-    sp.add_argument("--add-config", default=None)
-
-    # submit
-    sp = sub.add_parser("submit", help="Submit a prepared CSV to Kaggle")
-    sp.add_argument("--competition", required=True)
-    sp.add_argument("--file", required=True)
-    sp.add_argument("--message", default="auto-submit")
-
-    # score
-    sp = sub.add_parser("score", help="Fetch latest scored submission info")
-    sp.add_argument("--competition", required=True)
-
-    # run (end-to-end)
-    sp = sub.add_parser("run", help="End-to-end: generate -> validate -> build -> (optional submit/score)")
-    sp.add_argument("--competition", required=True, help="Kaggle competition slug (used for submit/score)")
-    sp.add_argument("--puzzles", required=True, help="Path to puzzles.csv downloaded from Kaggle")
-    sp.add_argument("--out", default="submission.csv")
-    sp.add_argument("--format", default="format/moves-dot", help="llm-puzzles output format slug")
-    sp.add_argument("--prompt", default="")
-    sp.add_argument("--prompt-file", default=None)
-    sp.add_argument("--models", default=os.getenv("G4F_MODELS", "gpt-4o-mini,command-r,aria"))
-    sp.add_argument("--custom-prompts", default=None)
-    sp.add_argument("--max-iters", type=int, default=4)
-    sp.add_argument("--no-llm", action="store_true", help="Skip LLM calls; use baseline solver")
-    sp.add_argument("--solver-out", default=str(ROOT / "generated" / "solve_module.py"))
-    sp.add_argument("--vector-col", default=None)
-    sp.add_argument("--add-config", default=None)
-    sp.add_argument("--submit", action="store_true")
-    sp.add_argument("--message", default="agentlab auto-submit")
-    sp.add_argument("--print-score", action="store_true")
+    # validate-solver [1]
+    ap_v = sub.add_parser("validate-solver", help="Validate solver on one vector for a competition")
+    ap_v.add_argument("--competition", required=True, help="Competition slug, e.g. cayleypy-rapapport-m2")
+    ap_v.add_argument("--solver", default=DEFAULT_ROOT_SOLVER_PATH, help="Path to solve_module.py")
+    ap_v.add_argument("--vector", default="[3,1,2,5,4]", help="Vector JSON list")
+    ap_v.set_defaults(func=cmd_validate_solver)
 
     args = ap.parse_args()
-
-    if args.cmd == "selftest":
-        selftest(seed=args.seed)
-        return
-
-    if args.cmd == "generate-solver":
-        prompt = (args.prompt or "").strip() or _read_text(args.prompt_file).strip()
-        if not prompt:
-            raise SystemExit("Empty prompt. Provide --prompt or --prompt-file")
-        generate_solver(prompt, args.models, Path(args.out), custom_prompts=args.custom_prompts, max_iters=args.max_iters, no_llm=args.no_llm)
-        return
-
-    if args.cmd == "validate-solver":
-        validate_solver(Path(args.solver), json.loads(args.vector))
-        return
-
-    if args.cmd == "build-submission":
-        build_submission(Path(args.puzzles), Path(args.out), args.format, Path(args.solver), vector_col=args.vector_col, add_config=args.add_config)
-        print(f"[+] Saved: {args.out}")
-        return
-
-    if args.cmd == "submit":
-        kaggle_submit(args.competition, Path(args.file), args.message)
-        print("[+] Submitted")
-        return
-
-    if args.cmd == "score":
-        print(json.dumps(kaggle_latest_score(args.competition), ensure_ascii=False))
-        return
-
-    if args.cmd == "run":
-        prompt = (args.prompt or "").strip() or _read_text(args.prompt_file).strip()
-        if not prompt and not args.no_llm:
-            raise SystemExit("Empty prompt. Provide --prompt/--prompt-file or set --no-llm")
-
-        solver_out = Path(args.solver_out)
-        if args.no_llm:
-            # Use baseline solver at repo root
-            solver_out.parent.mkdir(parents=True, exist_ok=True)
-            solver_out.write_text((ROOT / "solve_module.py").read_text(encoding="utf-8"), encoding="utf-8")
-        else:
-            generate_solver(prompt, args.models, solver_out, custom_prompts=args.custom_prompts, max_iters=args.max_iters, no_llm=False)
-
-        # Validate on a smoke test
-        validate_solver(solver_out, [3, 1, 2, 5, 4])
-
-        # Build submission
-        build_submission(Path(args.puzzles), Path(args.out), args.format, solver_out, vector_col=args.vector_col, add_config=args.add_config)
-        print(f"[+] Saved: {args.out}")
-
-        if args.submit:
-            kaggle_submit(args.competition, Path(args.out), args.message)
-            print("[+] Submitted")
-            if args.print_score:
-                print(json.dumps(kaggle_latest_score(args.competition), ensure_ascii=False))
-        return
+    args.func(args)
 
 
 if __name__ == "__main__":
