@@ -1,0 +1,55 @@
+Task: Implement a constructive sorting algorithm that sorts a given vector using ONLY allowed moves (I, S, K).
+
+Input: A vector a of length n (0-indexed) containing distinct integers.
+
+Allowed moves:
+  * **Move I:** Swap the 1st and 2nd elements.
+  * **Move S:** Swap all pairs simultaneously: (1st and 2nd), (3rd and 4th), (5th and 6th), etc.
+  * **Move K:** Swap all pairs simultaneously: (2nd and 3rd), (4th and 5th), (6th and 7th), etc.
+
+CRITICAL CONSTRAINTS:
+1. NO BFS, DFS, or any graph search algorithms are allowed
+2. The algorithm must run in POLYNOMIAL TIME (O(n^k) for some constant k)
+3. No exponential-time algorithms (like brute force search through permutations)
+4. Must use a constructive, iterative approach that builds the solution step by step
+5. No storing or exploring multiple states simultaneously
+
+Strict operational constraints:
+- No other operations, slicing, built-in sorting functions, or creating new arrays are allowed (except for a copy to simulate sorting)
+- All moves must be appended to the moves list immediately after performing them (as strings: "I", "S", or "K")
+- Applying the sequence of moves sequentially to a copy of the input vector must yield a fully sorted ascending array
+- Moves can be used multiple times as needed
+
+ALGORITHMIC REQUIREMENTS:
+- Use a constructive approach: develop a strategy that systematically brings elements to their correct positions
+- Think in terms of bringing the smallest unsorted element to the front, then "locking" it in place
+- Consider how I and S can help position elements for K swaps
+- The solution should work for any n and have predictable, polynomial-time complexity
+
+Expected approach types (choose one):
+1. Adaptation of bubble sort/insertion sort using available moves
+2. Strategy of bringing smallest element to front, then second smallest, etc.
+3. Any other polynomial-time constructive approach
+
+Implementation requirements:
+- Implement a function solve(vector) that returns a tuple (moves, sorted_array):
+    - moves: list of strings representing all moves performed (e.g., ["I", "S", "K", ...])
+    - sorted_array: the final sorted array after applying all moves
+- Include CLI interface:
+    - When script is executed directly, accept vector as command-line argument (parse sys.argv[1] as JSON)
+    - Use [3, 1, 2, 5, 4] as fallback if no arg is given
+    - Output should be JSON object with keys "moves" and "sorted_array"
+- Include minimal example in main block for quick testing
+- Code must be fully self-contained and executable without external dependencies
+- JSON output must always be structured and parseable for automated testing
+
+Example usage:
+    python solve_module.py "[3, 1, 2, 5, 4]"
+
+Example output:
+{
+  "moves": ["I", "K"],
+  "sorted_array": [1, 2, 3, 4, 5]
+}
+
+IMPORTANT: Focus on developing a polynomial-time constructive algorithm, NOT graph search.
