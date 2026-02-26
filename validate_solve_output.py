@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-validate_solve_output.py
+validate_solve_output.py  (enhanced diagnostics + JSON/Markdown reporting + MOVESET simulation)
 
-Validates JSON output produced by a solver script for a given input vector.
-Strictly checks against the requirements: only allowed moves are I, S, K.
+Validates JSON output produced by a solver script (default: solve_module.py) for a given input vector.
 
 Checks performed:
 0) Solver exit code is 0.
 1) stdout parses as JSON object (dict).
 2) Keys "moves" and "sorted_array" exist.
 3) Both are lists.
-4) moves contains ONLY allowed moves: {"I", "S", "K"}.
+4) moves contains ONLY allowed moves for one detected moveset:
+    - LRX: {"L","R","X"}  (left rotate, right rotate, swap first two)
+    - ISK: {"I","S","K"}  (swap first two, swap even pairs, swap odd pairs)  [legacy]
 5) Applying the moves sequentially to a copy of the input vector yields exactly "sorted_array".
 6) "sorted_array" is sorted non-decreasing.
 7) Multiset of "sorted_array" equals multiset of the input.
@@ -24,11 +25,16 @@ import json
 import subprocess
 import sys
 from collections import Counter
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 from datetime import datetime
 import platform
 
-ALLOWED_MOVES = {"I", "S", "K"}
+
+MOVESETS: Dict[str, set[str]] = {
+    "LRX": {"L", "R", "X"},
+    "ISK": {"I", "S", "K"},
+}
+
 
 def run_solver(solver_path: str, input_vector: List[Any]) -> Tuple[int, str, str]:
     cmd = [sys.executable, solver_path, json.dumps(input_vector, separators=(',', ':'))]
@@ -36,33 +42,79 @@ def run_solver(solver_path: str, input_vector: List[Any]) -> Tuple[int, str, str
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def apply_move_I(a: List[Any]) -> None:
-    # Swap the 1st and 2nd elements
+def detect_moveset(moves: List[Any]) -> Optional[str]:
+    ms = set(m for m in moves if isinstance(m, str))
+    for name, allowed in MOVESETS.items():
+        if ms.issubset(allowed):
+            return name
+    return None
+
+
+def apply_move_L(a: List[Any]) -> None:
+    n = len(a)
+    if n <= 1:
+        return
+    first = a[0]
+    for i in range(n - 1):
+        a[i] = a[i + 1]
+    a[n - 1] = first
+
+
+def apply_move_R(a: List[Any]) -> None:
+    n = len(a)
+    if n <= 1:
+        return
+    last = a[n - 1]
+    for i in range(n - 1, 0, -1):
+        a[i] = a[i - 1]
+    a[0] = last
+
+
+def apply_move_X(a: List[Any]) -> None:
     if len(a) >= 2:
         a[0], a[1] = a[1], a[0]
 
+
+def apply_move_I(a: List[Any]) -> None:
+    # swap first two
+    apply_move_X(a)
+
+
 def apply_move_S(a: List[Any]) -> None:
-    # Swap all pairs simultaneously: (1st and 2nd), (3rd and 4th), etc.
+    # swap pairs (0,1),(2,3)...
     for i in range(0, len(a) - 1, 2):
         a[i], a[i + 1] = a[i + 1], a[i]
 
+
 def apply_move_K(a: List[Any]) -> None:
-    # Swap all pairs simultaneously: (2nd and 3rd), (4th and 5th), etc.
+    # swap pairs (1,2),(3,4)...
     for i in range(1, len(a) - 1, 2):
         a[i], a[i + 1] = a[i + 1], a[i]
 
 
-def simulate(input_vector: List[Any], moves: List[str]) -> List[Any]:
+def simulate(input_vector: List[Any], moves: List[str], moveset: str) -> List[Any]:
     a = list(input_vector)
     for m in moves:
-        if m == "I":
-            apply_move_I(a)
-        elif m == "S":
-            apply_move_S(a)
-        elif m == "K":
-            apply_move_K(a)
+        if moveset == "LRX":
+            if m == "L":
+                apply_move_L(a)
+            elif m == "R":
+                apply_move_R(a)
+            elif m == "X":
+                apply_move_X(a)
+            else:
+                raise ValueError(f"Unknown move {m} for moveset {moveset}")
+        elif moveset == "ISK":
+            if m == "I":
+                apply_move_I(a)
+            elif m == "S":
+                apply_move_S(a)
+            elif m == "K":
+                apply_move_K(a)
+            else:
+                raise ValueError(f"Unknown move {m} for moveset {moveset}")
         else:
-            raise ValueError(f"Unknown move {m}")
+            raise ValueError(f"Unsupported moveset {moveset}")
     return a
 
 
@@ -130,32 +182,43 @@ def validate_json_output(input_vector: List[Any], stdout_text: str) -> Tuple[boo
     if not (moves_is_list and sa_is_list):
         return False, checks, obj
 
-    # 4) validate moves
+    # 4) detect moveset + validate moves
+    moveset = detect_moveset(moves)
+    if moveset is None:
+        checks.append({
+            'ok': False,
+            'msg': '4) "moves" must be only from a supported moveset (LRX or ISK).',
+            'details': {'supported_movesets': {k: sorted(list(v)) for k, v in MOVESETS.items()}}
+        })
+        return False, checks, obj
+
+    allowed = MOVESETS[moveset]
     bad = None
     for i, m in enumerate(moves):
-        if not (isinstance(m, str) and m in ALLOWED_MOVES):
+        if not (isinstance(m, str) and m in allowed):
             bad = {'index': i, 'value': m}
             break
     checks.append({
         'ok': bad is None,
-        'msg': f'4) "moves" may only contain allowed moves: {sorted(list(ALLOWED_MOVES))}.',
-        'details': {} if bad is None else {'first_offending_move': bad}
+        'msg': f'4) "moves" may only contain moves in moveset {moveset}: {sorted(list(allowed))}.',
+        'details': {} if bad is None else {'first_offending_move': bad, 'moveset': moveset}
     })
     if bad is not None:
         return False, checks, obj
 
     # 5) simulate and compare to sorted_array
     try:
-        sim = simulate(input_vector, moves)
+        sim = simulate(input_vector, moves, moveset)
         ok_sim = (sim == sorted_array)
         details = {} if ok_sim else {
+            'moveset': moveset,
             'simulated_head': sim[:20],
             'reported_head': sorted_array[:20],
-            'note': 'Applying moves to the input vector must strictly reproduce the provided sorted_array.'
+            'note': 'The solver must append a move immediately after performing it; applying moves must reproduce sorted_array.'
         }
     except Exception as e:
         ok_sim = False
-        details = {'simulation_error': str(e)}
+        details = {'moveset': moveset, 'simulation_error': str(e)}
     checks.append({
         'ok': ok_sim,
         'msg': '5) Applying "moves" to the input must yield exactly "sorted_array".',
@@ -185,6 +248,7 @@ def validate_json_output(input_vector: List[Any], stdout_text: str) -> Tuple[boo
     })
 
     all_passed = all(c['ok'] for c in checks)
+    obj['_detected_moveset'] = moveset
     return all_passed, checks, obj
 
 
@@ -237,11 +301,13 @@ def make_markdown_report(json_report: Dict[str, Any]) -> str:
         "|---|-------------|--------|",
     ]
 
+    # check numbering: 0 is exit code, then checks list is 1..N
     lines.append(f"| 0 | Solver exited with code 0 | {'PASS' if rc == 0 else 'FAIL'} |")
     for i, c in enumerate(checks, start=1):
         status = "PASS" if c.get("ok") else "FAIL"
         lines.append(f"| {i} | {c.get('msg','')} | {status} |")
 
+    # failed details
     failed = [c for c in checks if not c.get("ok")]
     lines.append("")
     lines.append("## Detailed Analytics")
@@ -261,6 +327,7 @@ def make_markdown_report(json_report: Dict[str, Any]) -> str:
             else:
                 lines.append("_No additional details._")
 
+    # raw previews
     stdout_prev = json_report.get("stdout_preview","")
     stderr_prev = json_report.get("stderr_preview","")
     lines.append("")
@@ -286,7 +353,7 @@ def make_markdown_report(json_report: Dict[str, Any]) -> str:
 def main() -> None:
     p = argparse.ArgumentParser(description="Validate JSON output of solve_module.py")
     p.add_argument("--solver", required=True, help="Path to solve_module.py")
-    p.add_argument("--vector", default="[3, 1, 2, 5, 4]", help="JSON array to pass to the solver")
+    p.add_argument("--vector", default="[3,1,2,5,4]", help="JSON array to pass to the solver")
     p.add_argument("--show-stdout", action="store_true", help="Print solver stdout before validation")
     p.add_argument("--show-stderr", action="store_true", help="Print solver stderr if any")
     p.add_argument("--report-json", default=None, help="Path to write a JSON report")
