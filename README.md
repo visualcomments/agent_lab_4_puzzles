@@ -49,6 +49,21 @@ python pipeline_cli.py list-pipelines
 
 ---
 
+
+## Full usage guide
+
+For a complete, detailed tutorial (all commands and flags, schema checks, run logs, Kaggle submit), see:
+
+- `docs/USAGE.md`
+
+Quickly inspect a pipeline (paths, bundled files, expected submission columns):
+
+```bash
+python pipeline_cli.py show-pipeline --competition <slug>
+```
+
+---
+
 ## End-to-end pipeline
 
 ### LRX (Discover / OEIS)

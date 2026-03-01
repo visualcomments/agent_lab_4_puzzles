@@ -535,6 +535,178 @@ def cmd_list_pipelines(_: argparse.Namespace) -> None:
         print(f"- {spec.key:45s}  (competition='{spec.competition}', format='{spec.format_slug}')")
 
 
+
+
+def cmd_show_pipeline(args: argparse.Namespace) -> None:
+    """Print a human-friendly description of a pipeline (and optionally JSON).
+
+    Includes:
+    - all configured paths (baseline, validator, prompts)
+    - bundled test/sample_submission locations (if any)
+    - llm-puzzles submission format (expected columns, id field, joiner)
+    """
+    spec = get_pipeline(args.competition) if args.competition else None
+    if spec is None:
+        raise SystemExit(
+            "Unknown --competition. Run `python pipeline_cli.py list-pipelines` to see supported pipelines."
+        )
+
+    format_slug = args.format or spec.format_slug
+
+    # Bundle discovery (best-effort; do not crash)
+    default_puzzles: Path | None
+    try:
+        default_puzzles = _resolve_default_puzzles(spec)
+    except Exception:
+        default_puzzles = None
+
+    sample: Path | None
+    try:
+        sample = _resolve_sample_submission(spec)
+    except Exception:
+        sample = None
+
+    # llm-puzzles formatting rules
+    cfg_dict: dict[str, Any] = {}
+    try:
+        _ensure_llm_puzzles_on_path()
+        from src.comp_registry import get_config  # type: ignore
+
+        cfg = get_config(format_slug)
+        cfg_dict = {
+            "slug": cfg.slug,
+            "submission_headers": list(cfg.submission_headers or []),
+            "header_keys": list(cfg.header_keys or []),
+            "puzzles_id_field": cfg.puzzles_id_field,
+            "moves_key": cfg.moves_key,
+            "move_joiner": cfg.move_joiner,
+        }
+    except Exception as e:
+        cfg_dict = {"error": f"could not load llm-puzzles comp_registry: {e}"}
+
+    def rel(p: Path | None) -> str | None:
+        if p is None:
+            return None
+        try:
+            return str(p.relative_to(ROOT))
+        except Exception:
+            return str(p)
+
+    def exists(p: Path | None) -> bool:
+        return bool(p and p.exists())
+
+    sample_header: list[str] | None = None
+    if sample and sample.exists():
+        try:
+            sample_header, _ = _read_csv_header_and_ids(sample)
+        except Exception:
+            sample_header = None
+
+    record: dict[str, Any] = {
+        "pipeline": {
+            "key": spec.key,
+            "competition": spec.competition,
+            "format_slug": format_slug,
+            "state_columns": list(spec.state_columns or []),
+            "smoke_vector": list(spec.smoke_vector or []),
+        },
+        "paths": {
+            "baseline_solver": {"path": rel(spec.baseline_solver), "exists": spec.baseline_solver.exists()},
+            "validator": {"path": rel(spec.validator), "exists": spec.validator.exists()},
+            "prompt_file": {"path": rel(spec.prompt_file) if spec.prompt_file else None, "exists": exists(spec.prompt_file) if spec.prompt_file else False},
+            "custom_prompts_file": {"path": rel(spec.custom_prompts_file) if spec.custom_prompts_file else None, "exists": exists(spec.custom_prompts_file) if spec.custom_prompts_file else False},
+        },
+        "bundled_files": {
+            "default_puzzles_csv": {"path": rel(default_puzzles) if default_puzzles else None, "exists": exists(default_puzzles)},
+            "sample_submission_csv": {"path": rel(sample) if sample else None, "exists": exists(sample), "header": sample_header},
+        },
+        "submission_format": cfg_dict,
+    }
+
+    # Extra directory listing for convenience (non-recursive)
+    comp_dir = ROOT / 'competitions' / spec.key
+
+    def list_dir(d: Path) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        if not d.exists() or not d.is_dir():
+            return out
+        for p in sorted(d.iterdir()):
+            if p.name.startswith('.'):
+                continue
+            try:
+                st = p.stat()
+                out.append({"name": p.name, "is_dir": p.is_dir(), "bytes": int(st.st_size)})
+            except Exception:
+                out.append({"name": p.name, "is_dir": p.is_dir()})
+        return out
+
+    record['bundled_files']['competition_dir'] = {
+        'path': rel(comp_dir),
+        'exists': comp_dir.exists(),
+        'data': list_dir(comp_dir / 'data'),
+        'submissions': list_dir(comp_dir / 'submissions'),
+        'prompts': list_dir(comp_dir / 'prompts'),
+    }
+
+    if args.json:
+        print(json.dumps(record, ensure_ascii=False, indent=2))
+        return
+
+    # Human-friendly print
+    print(f"\nPipeline: {spec.key}")
+    print(f"  Kaggle competition slug: {spec.competition}")
+    print(f"  Submission format slug: {format_slug}")
+
+    print("\nSubmission format (llm-puzzles):")
+    if 'error' in cfg_dict:
+        print(f"  [warn] {cfg_dict['error']}")
+    else:
+        print(f"  expected columns: {cfg_dict.get('submission_headers')}")
+        print(f"  maps from keys:   {cfg_dict.get('header_keys')}")
+        print(f"  id field in puzzles/test.csv: {cfg_dict.get('puzzles_id_field')}")
+        print(f"  moves column in submission:   {cfg_dict.get('moves_key')}")
+        j = cfg_dict.get('move_joiner')
+        print(f"  move joiner: {repr(j)}")
+
+    print("\nConfigured files:")
+    print(f"  baseline solver: {rel(spec.baseline_solver)}  (exists={spec.baseline_solver.exists()})")
+    print(f"  validator:       {rel(spec.validator)}  (exists={spec.validator.exists()})")
+    print(f"  prompt file:     {rel(spec.prompt_file) if spec.prompt_file else '(none)'}  (exists={exists(spec.prompt_file)})")
+    print(f"  custom prompts:  {rel(spec.custom_prompts_file) if spec.custom_prompts_file else '(none)'}  (exists={exists(spec.custom_prompts_file)})")
+
+    print("\nBundled inputs:")
+    print(f"  default puzzles CSV: {rel(default_puzzles) if default_puzzles else '(not found)'}  (exists={exists(default_puzzles)})")
+    print(f"  sample_submission.csv: {rel(sample) if sample else '(not found)'}  (exists={exists(sample)})")
+    if sample_header:
+        print(f"  sample header: {sample_header}")
+
+    print("\nState extraction:")
+    print(f"  candidate state columns: {list(spec.state_columns or [])}")
+    print(f"  smoke vector: {list(spec.smoke_vector or [])}")
+
+    print("\nBundled competition directory:")
+    print(f"  {rel(comp_dir)}  (exists={comp_dir.exists()})")
+    for subname in ['data', 'submissions', 'prompts']:
+        items = record['bundled_files']['competition_dir'].get(subname, [])
+        if items:
+            print(f"  - {subname}/")
+            for it in items:
+                suffix = '/' if it.get('is_dir') else ''
+                b = it.get('bytes', None)
+                if b is not None:
+                    print(f"      {it['name']}{suffix}  ({b} bytes)")
+                else:
+                    print(f"      {it['name']}{suffix}")
+        else:
+            print(f"  - {subname}/  (empty or missing)")
+
+    print("\nTip:")
+    print(f"  Show as JSON:     python pipeline_cli.py show-pipeline --competition {spec.key} --json")
+    print(f"  Build submission: python pipeline_cli.py build-submission --competition {spec.key} --solver {rel(spec.baseline_solver)} --output submissions/submission.csv")
+    if spec.prompt_file:
+        print(f"  Generate solver:  python pipeline_cli.py generate-solver --competition {spec.key} --out generated/solve_{spec.key}.py")
+
+
 def cmd_generate_solver(args: argparse.Namespace) -> None:
     spec = get_pipeline(args.competition) if args.competition else None
     if spec is None:
@@ -933,6 +1105,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("list-pipelines", help="List built-in pipeline configs")
     sp.set_defaults(func=cmd_list_pipelines)
+
+    sp = sub.add_parser("show-pipeline", help="Show details for a single pipeline (paths, bundled files, submission schema)")
+    sp.add_argument("--competition", required=True, help="Competition slug / pipeline key")
+    sp.add_argument("--format", default=None, help="Override llm-puzzles format slug (for inspection)")
+    sp.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    sp.set_defaults(func=cmd_show_pipeline)
 
     sp = sub.add_parser("generate-solver", help="Generate/repair a solver with AgentLaboratory")
     sp.add_argument("--competition", required=True, help="Competition slug / pipeline key")
