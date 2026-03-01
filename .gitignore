@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# outputs
+/generated/
+/_selftest/
+
+# local submissions
+/competitions/*/submissions/submission*.csv
+
+# kaggle credentials
+.kaggle/

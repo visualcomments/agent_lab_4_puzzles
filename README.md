@@ -30,7 +30,9 @@ It now supports **multiple competitions** via a single CLI entrypoint (`pipeline
 ## Install
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-min.txt
+# or, with Kaggle + g4f
+pip install -r requirements-full.txt
 ```
 
 > Notes:
@@ -48,6 +50,24 @@ python pipeline_cli.py list-pipelines
 ---
 
 ## End-to-end pipeline
+
+### LRX (Discover / OEIS)
+
+These LRX competitions are bundled with `test.csv` and `sample_submission.csv` under each competition folder,
+so you can omit `--puzzles` to use the bundled `competitions/<slug>/data/test.csv`.
+
+```bash
+python pipeline_cli.py run \
+  --competition lrx-discover-math-gods-algorithm \
+  --output competitions/lrx-discover-math-gods-algorithm/submissions/submission.csv \
+  --no-llm
+
+python pipeline_cli.py run \
+  --competition lrx-oeis-a-186783-brainstorm-math-conjecture \
+  --output competitions/lrx-oeis-a-186783-brainstorm-math-conjecture/submissions/submission.csv \
+  --no-llm
+```
+
 
 ### 1) Build a submission with the baseline solver (no LLM)
 
@@ -142,7 +162,7 @@ python pipeline_cli.py selftest
 
 ## Kaggle submit (optional)
 
-If you have the Kaggle API installed and configured:
+If you have the Kaggle API installed and configured (either via `~/.kaggle/kaggle.json` or by passing `--kaggle-json`):
 
 ```bash
 python pipeline_cli.py run \
@@ -152,6 +172,16 @@ python pipeline_cli.py run \
   --no-llm \
   --submit \
   --message "baseline"
+
+# Or pass kaggle.json explicitly
+python pipeline_cli.py run \
+  --competition lrx-discover-math-gods-algorithm \
+  --output submission.csv \
+  --no-llm \
+  --submit \
+  --message "baseline" \
+  --kaggle-json /path/to/kaggle.json \
+  --submit-via api
 ```
 
 ---
@@ -161,3 +191,11 @@ python pipeline_cli.py run \
 - Every pipeline has its own `competitions/<pipeline>/validate_solve_output.py`.
 - For **RapaportM2** and **Pancake**, validators fully simulate the moves.
 - For complex twisty-puzzle competitions in the CayleyPy series (cube/minx/etc.), the included baseline returns `UNSOLVED` and the validator is a lightweight smoke-check (format + runtime). Use AgentLaboratory prompts + competition files (`graphs_info.json`, etc.) to implement full solvers.
+
+
+---
+
+## Progress logging
+
+- Submission building shows a lightweight progress bar by default.
+- Disable it with `--no-progress`.

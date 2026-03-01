@@ -93,6 +93,28 @@ REGISTRY: Dict[str, CompConfig] = {
         joiner=" ",
     ),
 
+
+
+    # LRX puzzle series (submission schema differs per competition)
+    # lrx-discover-math-gods-algorithm: submission echoes the permutation string
+    "lrx-discover-math-gods-algorithm": CompConfig(
+        slug="lrx-discover-math-gods-algorithm",
+        submission_headers=["permutation", "solution"],
+        header_keys=["permutation", "moves"],
+        puzzles_id_field="permutation",
+        moves_key="solution",
+        move_joiner=".",
+    ),
+
+    # lrx-oeis-a-186783-brainstorm-math-conjecture: submission keyed by n, moves concatenated (no delimiter)
+    "lrx-oeis-a-186783-brainstorm-math-conjecture": CompConfig(
+        slug="lrx-oeis-a-186783-brainstorm-math-conjecture",
+        submission_headers=["n", "solution"],
+        header_keys=["n", "moves"],
+        puzzles_id_field="n",
+        moves_key="solution",
+        move_joiner="",
+    ),
     # CayleyPy series (most are initial_state_id + path)
     "cayley-py-444-cube": FORMAT_INITIAL_STATE_ID_PATH,
     "cayley-py-professor-tetraminx-solve-optimally": FORMAT_INITIAL_STATE_ID_PATH,

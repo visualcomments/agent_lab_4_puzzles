@@ -1,0 +1,30 @@
+Task: Implement a constructive sorting algorithm that sorts a given vector using ONLY allowed moves (L, R, X).
+
+Input: A vector a of length n (0-indexed) containing distinct integers.
+
+Allowed moves:
+L: Left cyclic shift — shifts all elements one position to the left, with the first element moving to the end. Example: [1,2,3,4] -> [2,3,4,1].
+R: Right cyclic shift — shifts all elements one position to the right, with the last element moving to the beginning. Example: [1,2,3,4] -> [4,1,2,3].
+X: Transposition of the first two elements — swaps the elements at positions 0 and 1. Example: [1,2,3,4] -> [2,1,3,4].
+
+CRITICAL CONSTRAINTS:
+1. NO BFS, DFS, or any graph search algorithms are allowed
+2. The algorithm must run in POLYNOMIAL TIME (O(n^k) for some constant k)
+3. No exponential-time algorithms (like brute force search through permutations)
+4. Must use a constructive, iterative approach that builds the solution step by step
+5. No storing or exploring multiple states simultaneously
+
+Strict operational constraints:
+- No other operations, slicing, built-in sorting functions, or creating new arrays are allowed (except for a copy to simulate sorting)
+- All moves must be appended to the moves list immediately after performing them (as strings: 'L', 'R', or 'X')
+- Applying the sequence of moves sequentially to a copy of the input vector must yield a fully sorted ascending array
+- Moves can be used multiple times as needed
+- The algorithm must continue applying moves until the array is fully sorted
+
+Implementation requirements:
+- Implement a function solve(vector) that returns a tuple (moves, sorted_array)
+- Include CLI interface:
+    - When script is executed directly, accept vector as command-line argument (parse sys.argv[1] as JSON)
+    - Use [3, 1, 2] as fallback if no arg is given
+    - Output should be JSON object with keys "moves" and "sorted_array"
+- Code must be fully self-contained and executable without external dependencies
