@@ -1,237 +1,163 @@
-# Unified AgentLaboratory + g4f + llm-puzzles Kaggle Pipeline
+# agent_lab_4_puzzles
 
-Этот репозиторий объединяет три вещи в **единый CLI-пайплайн**:
+This repository is a template for solving **Kaggle CayleyPy**-style puzzle competitions using:
 
-1) **AgentLaboratory** — мульти-агентный цикл (planner → coder → fixer), который генерирует/чинит `solve_module.py` под заданный пользовательский промпт.
-2) **g4f (GPT4Free)** — LLM backend по умолчанию для агентов (можно указывать несколько моделей и использовать их как fallback по очереди).
-3) **llm-puzzles** — универсальный адаптер для генерации `submission.csv` и (опционально) автоматического сабмита на Kaggle.
+- **AgentLaboratory** (perm_pipeline) to generate / repair a `solve_module.py` with an LLM
+- **llm-puzzles** utilities to format a Kaggle **submission.csv**
 
-Цель: вы даёте **пользовательский промпт** (например, про сортировку вектора ходами `L/R/X`), а пайплайн:
-
-- генерирует solver,
-- прогоняет локальную валидацию,
-- собирает `submission.csv` из `puzzles.csv` соревнования,
-- (опционально) сабмитит на Kaggle и пытается прочитать score.
+It now supports **multiple competitions** via a single CLI entrypoint (`pipeline_cli.py`).
 
 ---
 
-## Быстрый старт (без интернета)
+## What changed (high level)
 
-1) Проверка, что всё компилируется и baseline solver валиден:
+- Each supported competition now has its own:
+  - baseline `solve_module.py`
+  - validator `validate_solve_output.py`
+  - (optionally) prompt bundle for AgentLaboratory
+
+  under `competitions/<competition>/...`
+
+- `pipeline_cli.py` selects the correct validator / baseline / prompt bundle based on **`--competition`**.
+
+- `llm-puzzles` formatting registry (`llm-puzzles/src/comp_registry.py`) now includes:
+  - `cayleypy-rapapport-m2` (special submission schema)
+  - `CayleyPy-pancake` (and lowercase alias)
+  - other CayleyPy competitions (default `initial_state_id,path` schema)
+
+---
+
+## Install
+
+```bash
+pip install -r requirements.txt
+```
+
+> Notes:
+> - `AgentLaboratory/perm_pipeline` uses `g4f` for model access.
+> - If you do **not** want to use an LLM, you can run everything with `--no-llm`.
+
+---
+
+## List available pipelines
+
+```bash
+python pipeline_cli.py list-pipelines
+```
+
+---
+
+## End-to-end pipeline
+
+### 1) Build a submission with the baseline solver (no LLM)
+
+#### CayleyPy RapaportM2
+
+```bash
+python pipeline_cli.py run \
+  --competition cayleypy-rapapport-m2 \
+  --puzzles /path/to/test.csv \
+  --output submission.csv \
+  --no-llm
+```
+
+#### CayleyPy Pancake
+
+```bash
+python pipeline_cli.py run \
+  --competition CayleyPy-pancake \
+  --puzzles /path/to/test.csv \
+  --output submission.csv \
+  --no-llm
+```
+
+### 2) Generate a solver with AgentLaboratory (custom prompt + per-competition validator)
+
+#### RapaportM2 (custom prompt bundle included)
+
+```bash
+python pipeline_cli.py generate-solver \
+  --competition cayleypy-rapapport-m2 \
+  --out generated/solve_rapapport_m2.py \
+  --models gpt-4o-mini \
+  --max-iters 8
+```
+
+#### Pancake (custom prompt bundle included)
+
+```bash
+python pipeline_cli.py generate-solver \
+  --competition CayleyPy-pancake \
+  --out generated/solve_pancake.py \
+  --models gpt-4o-mini \
+  --max-iters 8
+```
+
+### 3) Build submission from an existing solver
+
+```bash
+python pipeline_cli.py build-submission \
+  --competition cayleypy-rapapport-m2 \
+  --puzzles /path/to/test.csv \
+  --solver generated/solve_rapapport_m2.py \
+  --output submission.csv
+```
+
+---
+
+## Competition assets layout
+
+```
+competitions/
+  lrx-sort/
+    solve_module.py
+    validate_solve_output.py
+    prompts/
+  cayleypy-rapapport-m2/
+    solve_module.py
+    validate_solve_output.py
+    prompts/
+      user_prompt.txt
+      custom_prompts.json
+  cayleypy-pancake/
+    solve_module.py
+    validate_solve_output.py
+    prompts/
+      user_prompt.txt
+      custom_prompts.json
+  ...
+```
+
+---
+
+## Offline self-test
+
+Runs `compileall`, validates several baseline solvers, and builds tiny dummy submissions.
 
 ```bash
 python pipeline_cli.py selftest
 ```
 
-Это:
-- компилирует весь репозиторий,
-- проверяет `solve_module.py` на случайных тестах,
-- создаёт маленький `puzzles.csv` и собирает `submission.csv`.
-
 ---
 
-## Установка
+## Kaggle submit (optional)
 
-### Вариант A — использовать **встроенный** g4f
-В репозитории есть папка `./gpt4free/` (vendor checkout). В этом случае `import g4f` будет работать автоматически.
-
-### Вариант B — установить g4f через pip
-
-```bash
-pip install g4f
-```
-
-### Kaggle (опционально)
-Чтобы сабмитить решения и читать результаты, нужен Kaggle API:
-
-```bash
-pip install kaggle
-```
-
-Дальше настройте `kaggle.json` (обычно `~/.kaggle/kaggle.json` на Linux/macOS или `C:\Users\<you>\.kaggle\kaggle.json` на Windows).
-
----
-
-## Структура репозитория
-
-- `pipeline_cli.py` — **единая CLI-точка входа**.
-- `solve_module.py` — baseline solver (LRX сортировка за полиномиальное время).
-- `validate_solve_output.py` — валидатор: симулирует ходы и проверяет `moves → sorted_array`.
-- `AgentLaboratory/` — исходный репозиторий AgentLaboratory (пропатчен под g4f).
-  - `AgentLaboratory/perm_pipeline/run_perm_pipeline.py` — генератор/чинитель solver.
-  - `AgentLaboratory/perm_pipeline/default_prompts.json` — дефолтные системные промпты для planner/coder/fixer.
-- `llm-puzzles/` — исходный репозиторий llm-puzzles + добавленные entrypoints.
-  - `llm-puzzles/examples/agentlab_sort/solver.py` — адаптер «строка CSV → moves».
-
----
-
-## Команды CLI
-
-Посмотреть все команды:
-
-```bash
-python pipeline_cli.py -h
-```
-
-### 1) Сгенерировать solver
-
-```bash
-python pipeline_cli.py generate-solver \
-  --prompt-file prompts/example_user_prompt.txt \
-  --models "gpt-4o-mini,command-r,aria" \
-  --out generated/solve_module.py
-```
-
-Опции:
-- `--models` — CSV списка g4f моделей. Пайплайн будет пробовать их по очереди.
-- `--custom-prompts` — JSON override системных промптов (см. ниже).
-- `--no-llm` — **не вызывать LLM**, а просто сохранить baseline solver.
-
-### 2) Провалидировать solver на одном векторе
-
-```bash
-python pipeline_cli.py validate-solver --solver generated/solve_module.py --vector "[3,1,2,5,4]"
-```
-
-### 3) Собрать submission.csv из puzzles.csv
-
-```bash
-python pipeline_cli.py build-submission \
-  --puzzles /path/to/puzzles.csv \
-  --out submission.csv \
-  --format format/moves-dot \
-  --solver generated/solve_module.py \
-  --vector-col vector
-```
-
-Опции:
-- `--format` — формат вывода для llm-puzzles:
-  - `format/moves-dot` (по умолчанию) — moves соединяются точками
-  - `format/moves-space` — moves соединяются пробелами
-  - `format/initial_state_id+path` — колонки `initial_state_id,path`
-- `--vector-col` — имя колонки, где лежит JSON-вектор (иначе пытаемся угадать автоматически).
-- `--add-config` — добавить кастомный формат (JSON) в runtime.
-
-### 4) End-to-end run: prompt → solver → validate → submission → (submit)
+If you have the Kaggle API installed and configured:
 
 ```bash
 python pipeline_cli.py run \
-  --competition <kaggle-slug> \
-  --puzzles /path/to/puzzles.csv \
-  --format format/moves-dot \
-  --prompt-file prompts/example_user_prompt.txt \
-  --models "gpt-4o-mini,command-r,aria" \
-  --out submission.csv
-```
-
-Добавить сабмит:
-
-```bash
-python pipeline_cli.py run \
-  --competition <kaggle-slug> \
-  --puzzles /path/to/puzzles.csv \
-  --format format/moves-dot \
-  --prompt-file prompts/example_user_prompt.txt \
-  --submit --message "auto" --print-score
-```
-
-Офлайн режим (без LLM):
-
-```bash
-python pipeline_cli.py run \
-  --competition <kaggle-slug> \
-  --puzzles /path/to/puzzles.csv \
-  --format format/moves-dot \
-  --no-llm
+  --competition cayleypy-rapapport-m2 \
+  --puzzles /path/to/test.csv \
+  --output submission.csv \
+  --no-llm \
+  --submit \
+  --message "baseline"
 ```
 
 ---
 
-## Как добавлять/модифицировать системные промпты (planner/coder/fixer)
+## Notes about validators
 
-Дефолтные промпты лежат тут:
-
-- `AgentLaboratory/perm_pipeline/default_prompts.json`
-
-Чтобы переопределить часть промптов — создайте свой JSON:
-
-```json
-{
-  "planner": "...",
-  "coder": "...",
-  "fixer": "..."
-}
-```
-
-И передайте:
-
-```bash
-python pipeline_cli.py run ... --custom-prompts prompts/custom_prompts.json
-```
-
-Рекомендация по стилю промптов:
-- **Planner**: запрещать BFS/DFS/перебор и требовать конструктивную схему.
-- **Coder**: требовать полный self-contained файл с CLI и строгими ограничениями операций.
-- **Fixer**: давать отчёт валидатора + требовать вернуть полный исправленный файл.
-
----
-
-## Как выбирать g4f модели
-
-- Через `--models "modelA,modelB,modelC"`.
-- Порядок важен: пайплайн пробует по очереди.
-
-Также можно задать env:
-
-```bash
-export G4F_MODELS="modelA,modelB"
-```
-
----
-
-## Как добавить кастомный формат submission
-
-Если ваш Kaggle competition требует нестандартные колонки/формат moves:
-
-1) Создайте JSON, например:
-
-```json
-{
-  "slug": "my-format",
-  "submission_headers": ["id","moves"],
-  "header_keys": ["id","moves"],
-  "puzzles_id_field": "id",
-  "moves_key": "moves",
-  "move_joiner": "."
-}
-```
-
-2) Запускайте с:
-
-```bash
-python pipeline_cli.py build-submission --add-config my_format.json --format my-format ...
-```
-
----
-
-## Troubleshooting
-
-### 1) Solver не проходит валидацию
-- Запустите `python pipeline_cli.py validate-solver ...` и посмотрите stderr.
-- Увеличьте `--max-iters` (если используете LLM).
-- Убедитесь, что solver **строго** записывает ходы в список и возвращает JSON-совместимый вывод.
-
-### 2) g4f не работает
-- Проверьте, что доступна папка `./gpt4free/` или установлен `pip install g4f`.
-- Некоторые провайдеры могут требовать cookies/токены (зависит от выбранного провайдера/модели).
-
-### 3) Kaggle submit/score
-- Установите `pip install kaggle`.
-- Настройте `kaggle.json` и права доступа.
-- Учтите: некоторые соревнования не принимают файл-сабмиты и требуют notebook-only.
-
----
-
-## Лицензии и происхождение кода
-
-Внутри папок `AgentLaboratory/`, `llm-puzzles/`, `gpt4free/` находятся исходные репозитории со своими лицензиями. Этот репозиторий добавляет glue-код и CLI.
+- Every pipeline has its own `competitions/<pipeline>/validate_solve_output.py`.
+- For **RapaportM2** and **Pancake**, validators fully simulate the moves.
+- For complex twisty-puzzle competitions in the CayleyPy series (cube/minx/etc.), the included baseline returns `UNSOLVED` and the validator is a lightweight smoke-check (format + runtime). Use AgentLaboratory prompts + competition files (`graphs_info.json`, etc.) to implement full solvers.

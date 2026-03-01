@@ -1,0 +1,37 @@
+We are solving the CayleyPy Pancake sorting Kaggle competition:
+https://www.kaggle.com/competitions/CayleyPy-pancake
+
+TASK
+Write a Python module solve_module.py that sorts a permutation using ONLY prefix-reversal moves.
+
+ALLOWED MOVE
+- Rk: reverse the first k elements (a "pancake flip"), for 2 <= k <= n.
+
+INPUT / OUTPUT CONTRACT
+- The function signature must be: solve(vec) -> (moves, sorted_array)
+- vec is a Python list of ints.
+- moves must be a list of strings. Each move must be exactly "Rk" where k is an integer.
+- sorted_array must be the final array after applying the moves.
+- Script mode: python solve_module.py "[3,1,2,0]" must print JSON:
+  {"moves": [...], "sorted_array": [...]}
+
+GOAL
+After applying all moves to vec, the array must be sorted in nondecreasing order.
+
+STRICT OPERATIONAL CONSTRAINTS
+- No BFS/DFS/A*/graph search.
+- No slicing tricks for reversing; implement flips with a while-swap loop.
+- No built-in sorting (sorted(), list.sort()) to reorder vec.
+- Must be constructive polynomial-time.
+
+HINT / CONSTRUCTIVE ALGORITHM
+Implement the classic Pancake Sort:
+for size = n, n-1, ..., 2:
+  find the index of the maximum value in vec[0:size]
+  if it is not already at position size-1:
+     if index != 0: flip index+1 (R{index+1})
+     flip size (R{size})
+This sorts in O(n^2) flips.
+
+REQUIRED
+Return the full python file in one ```python ...``` block.

@@ -1,0 +1,27 @@
+We are solving the CayleyPy V.M. Glushkov permutations problem Kaggle competition:
+https://www.kaggle.com/competitions/cayleypy-glushkov
+
+TASK
+Write solve_module.py to sort a permutation using ONLY these moves:
+
+- L : cyclic left shift by 1 ( [a0,a1,...,a_{n-1}] -> [a1,...,a_{n-1},a0] )
+- X : swap positions 0 and 1
+
+INPUT / OUTPUT CONTRACT
+- solve(vec) -> (moves, sorted_array)
+- moves is a list[str] with tokens only in {"L","X"}
+- sorted_array is the final array after applying moves
+- Script mode prints JSON {"moves":..., "sorted_array":...}
+
+CONSTRAINTS
+- No BFS/DFS/A*/graph search.
+- No slicing tricks for L; implement shift with a loop.
+- No built-in sorting.
+- Constructive polynomial time.
+
+HINT
+You can implement an adjacent swap at any index i via conjugation:
+  swap(i,i+1) = L^i  X  L^{n-i}
+Then use selection sort / insertion sort via repeated adjacent swaps.
+
+Return full python file in one ```python``` block.

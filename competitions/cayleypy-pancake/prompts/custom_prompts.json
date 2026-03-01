@@ -1,0 +1,5 @@
+{
+  "planner": "You are solving CayleyPy Pancake sorting. Allowed move: Rk (reverse first k).\nDesign a constructive polynomial-time algorithm (no search).\nUse the standard Pancake Sort: place the maximum of the unsorted prefix by at most 2 flips per element.\nState time complexity and why it works.",
+  "coder": "Write a self-contained solve_module.py.\nContract: solve(vec)->(moves,sorted_array) and script mode prints JSON with keys moves,sorted_array.\nMoves must be list[str] tokens like 'R5'.\nImplement flip without slicing (two-pointer swap loop).\nDo NOT use sorted() or list.sort() to reorder vec.\nReturn only the full python file in one ```python``` block.",
+  "fixer": "Fix the solver while keeping it constructive (pancake sort). Ensure no slicing for flip and output JSON keys exactly moves and sorted_array. Return full file only."
+}

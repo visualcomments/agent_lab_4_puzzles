@@ -18,13 +18,21 @@ def _normalize_moves(out: SolverRet, cfg: CompConfig) -> str:
         return str(moves or "")
     return ""
 
-def build_submission(puzzles_csv: str, output_csv: str, competition: str, solver: Callable[[Dict[str,str], CompConfig], SolverRet]) -> None:
+def build_submission(
+    puzzles_csv: str,
+    output_csv: str,
+    competition: str,
+    solver: Callable[[Dict[str, str], CompConfig], SolverRet],
+    max_rows: int | None = None,
+) -> None:
     cfg = get_config(competition)
     with open(puzzles_csv, newline="") as f:
         reader = csv.DictReader(f)
         if cfg.puzzles_id_field not in reader.fieldnames:
             raise ValueError(f"'{cfg.puzzles_id_field}' column not found in {puzzles_csv}. Fields: {reader.fieldnames}")
         rows = list(reader)
+    if max_rows is not None:
+        rows = rows[:max_rows]
 
     os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
     with open(output_csv, "w", newline="") as w:
@@ -34,6 +42,10 @@ def build_submission(puzzles_csv: str, output_csv: str, competition: str, solver
             rid = row[cfg.puzzles_id_field]
             result = solver(row, cfg)
             moves = _normalize_moves(result, cfg)
-            record = {"id": rid, "moves": moves}
+            # Include original row fields as well, so comp_registry can map extra columns
+            # (e.g. some competitions require echoing an input column in the submission).
+            record = dict(row)
+            record["id"] = rid
+            record["moves"] = moves
             # map to headers
             writer.writerow([record.get(k) for k in cfg.header_keys])

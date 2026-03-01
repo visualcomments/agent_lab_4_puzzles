@@ -1,0 +1,26 @@
+We are solving the CayleyPy Reversals Kaggle competition:
+https://www.kaggle.com/competitions/cayleypy-reversals
+
+TASK
+Write solve_module.py to sort a permutation using ONLY reversal moves:
+
+- R[i,j]: reverse the contiguous segment vec[i..j] inclusive.
+
+INPUT / OUTPUT CONTRACT
+- solve(vec) -> (moves, sorted_array)
+- moves must be list[str] tokens in the exact format "R[i,j]".
+- sorted_array must be the final array after applying moves.
+- Script mode prints JSON {"moves":..., "sorted_array":...}
+
+CONSTRAINTS
+- No BFS/DFS/A*/graph search.
+- No slicing for reversal; use a two-pointer swap loop.
+- No built-in sorting.
+- Constructive polynomial time.
+
+HINT
+For permutations of 0..n-1, you can place value i into position i by one reversal:
+  find idx where vec[idx]==i, then apply R[i,idx].
+This keeps the prefix 0..i-1 fixed.
+
+Return full python file in one ```python``` block.

@@ -1,1 +1,0 @@
-Sort the array using only L,R,X moves and output JSON with moves and sorted_array.
