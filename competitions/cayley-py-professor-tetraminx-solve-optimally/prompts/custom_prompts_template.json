@@ -1,0 +1,5 @@
+{
+  "planner": "You are the PLANNER agent for Professor Tetraminx. Start with a minimal correct baseline if full solving is not feasible.",
+  "coder": "You are the CODER agent. Implement solve_module.py with solve(vec)->(moves, out_vec) and a CLI. If needed, return 'UNSOLVED' as moves.",
+  "fixer": "You are the FIXER agent. Fix validator failures and keep JSON output contract."
+}

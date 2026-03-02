@@ -99,7 +99,33 @@ def _resolve_sample_submission(spec: PipelineSpec) -> Optional[Path]:
     return None
 
 
+def _ensure_csv_field_size_limit() -> None:
+    """Increase Python's CSV field size limit.
+
+    Kaggle submissions for some competitions can contain extremely long fields
+    (e.g. a huge moves/path string). The default csv module limit (131072 bytes)
+    can raise:
+
+        _csv.Error: field larger than field limit (131072)
+
+    We raise the limit to the maximum supported by the current platform.
+    """
+    try:
+        max_int = sys.maxsize
+        while True:
+            try:
+                csv.field_size_limit(max_int)
+                break
+            except OverflowError:
+                # On some platforms sys.maxsize can overflow a C long.
+                max_int = int(max_int / 10)
+    except Exception:
+        # Best-effort only.
+        pass
+
+
 def _read_csv_header_and_ids(path: Path) -> tuple[list[str], list[str]]:
+    _ensure_csv_field_size_limit()
     with path.open(newline='') as f:
         reader = csv.reader(f)
         header = next(reader, None)
@@ -228,6 +254,7 @@ def _file_stats(path: Path, *, csv_stats: bool = False) -> dict[str, Any]:
 
     if csv_stats:
         try:
+            _ensure_csv_field_size_limit()
             with path.open("r", newline="", encoding="utf-8") as f:
                 reader = csv.reader(f)
                 header = next(reader, [])
@@ -239,6 +266,7 @@ def _file_stats(path: Path, *, csv_stats: bool = False) -> dict[str, Any]:
         except UnicodeDecodeError:
             # fallback: try default encoding
             try:
+                _ensure_csv_field_size_limit()
                 with path.open("r", newline="") as f:
                     reader = csv.reader(f)
                     header = next(reader, [])

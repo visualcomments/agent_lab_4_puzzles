@@ -1,0 +1,30 @@
+You are writing a solver for the Kaggle competition "CayleyPy Transposons".
+Competition page (for reference): https://www.kaggle.com/competitions/cayleypy-transposons
+
+Task summary (local/offline version used by this repo):
+- Input to your solver is a permutation/state vector: a Python list of ints.
+- You must output a JSON object with keys:
+  - "moves": a list of move tokens (strings)
+  - "sorted_array": the resulting state after applying those moves
+
+Moves / generators:
+- A move token looks like:  T[i,j,k]
+- In this repository you can inspect available generators in:
+  competitions/cayleypy-transposons/data/graphs_info.json
+  (for each state size it contains "central_state" and a dict of "generators").
+
+Goal:
+- Transform the given state into the corresponding "central_state" (the solved state).
+- Produce any valid sequence of moves; shorter is better on Kaggle, but correctness is the priority here.
+
+Constraints for this repo's agent pipeline:
+- Do NOT use brute-force search over the whole state space.
+- Prefer constructive / greedy / polynomial-time methods.
+- Avoid Python built-in sorting (sorted / .sort) for the core logic.
+
+Implementation contract:
+- Implement solve(vec) -> (moves, out_vec)
+  where moves is List[str] and out_vec is List[int].
+- Provide a CLI entrypoint so the validator can run:
+    python solve_module.py "[ ... ]"
+  and print the JSON result to stdout.

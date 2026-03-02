@@ -26,7 +26,7 @@ import subprocess
 import sys
 from collections import Counter
 from typing import Any, Dict, List, Tuple, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import platform
 
 
@@ -253,7 +253,8 @@ def validate_json_output(input_vector: List[Any], stdout_text: str) -> Tuple[boo
 
 
 def make_json_report(args, rc, out, err, input_vector, all_passed, checks, parsed) -> Dict[str, Any]:
-    now = datetime.utcnow().isoformat() + 'Z'
+    # Use timezone-aware UTC datetime (utcnow() is deprecated in recent Python).
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     return {
         "meta": {
             "timestamp_utc": now,

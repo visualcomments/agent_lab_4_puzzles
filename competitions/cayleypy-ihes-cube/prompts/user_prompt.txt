@@ -1,0 +1,15 @@
+You are writing a solver for the Kaggle competition "CayleyPy SuperCube from IHES".
+Competition page (for reference): https://www.kaggle.com/competitions/cayleypy-ihes-cube
+
+This repository currently contains a TEMPLATE pipeline for this competition.
+
+Task summary:
+- Input: a puzzle state vector (Python list of ints).
+- Output: JSON dict with keys "moves" (list of move tokens) and "sorted_array" (final state).
+
+Implementation contract:
+- Implement solve(vec) -> (moves, out_vec)
+- Provide a CLI entrypoint to print the JSON result, e.g.:
+    python solve_module.py "[ ... ]"
+
+If you do not implement a real solver yet, return moves="UNSOLVED" and out_vec=vec.
