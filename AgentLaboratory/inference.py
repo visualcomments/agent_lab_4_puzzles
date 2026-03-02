@@ -1,9 +1,6 @@
 import time
 import os
 import json
-import sys
-import tempfile
-import subprocess
 
 # Optional dependencies: keep g4f-only usage lightweight.
 try:
@@ -60,52 +57,6 @@ def _g4f_to_text(resp):
         except Exception:
             return ""
     return ""
-
-
-def _g4f_call_isolated(*, model: str, messages, timeout_s: float, provider_name: str | None, api_key: str | None, max_tokens: int | None) -> str:
-    """Run g4f in a short-lived subprocess to avoid RAM growth/leaks.
-
-    Some g4f providers/versions can steadily grow memory usage across many calls.
-    Spawning a new Python process per request guarantees memory is returned to the OS
-    when the process exits.
-    """
-    here = os.path.dirname(os.path.abspath(__file__))
-    worker = os.path.join(here, "g4f_worker.py")
-    if not os.path.exists(worker):
-        raise FileNotFoundError(worker)
-
-    with tempfile.TemporaryDirectory(prefix="agentlab_g4f_") as td:
-        req_path = os.path.join(td, "req.json")
-        resp_path = os.path.join(td, "resp.json")
-        with open(req_path, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "model": model,
-                    "messages": messages,
-                    "timeout": float(timeout_s),
-                    "provider_name": provider_name or "",
-                    "api_key": api_key or "",
-                    "max_tokens": max_tokens,
-                },
-                f,
-                ensure_ascii=False,
-            )
-
-        cmd = [sys.executable, worker, req_path, resp_path]
-        # Do NOT capture stdout/stderr: provider debug output can be large and capturing it may increase RAM.
-        p = subprocess.run(cmd, cwd=here)
-        if p.returncode != 0:
-            raise RuntimeError(f"g4f worker failed with returncode={p.returncode}")
-
-        try:
-            with open(resp_path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-        except Exception as e:
-            raise RuntimeError(f"g4f worker produced no readable response: {e}")
-
-        if not payload.get("ok"):
-            raise RuntimeError(payload.get("error") or "g4f worker error")
-        return (payload.get("answer") or "").strip()
 
 
 class MissingLLMCredentials(RuntimeError):
@@ -231,58 +182,42 @@ def query_model(
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt},
                 ]
-                api_key = (
-                    os.getenv("OPENROUTER_API_KEY")
-                    or os.getenv("OPENAI_API_KEY")
-                    or os.getenv("GROQ_API_KEY")
-                    or os.getenv("TOGETHER_API_KEY")
-                    or os.getenv("GEMINI_API_KEY")
-                )
-                provider_name = os.getenv("G4F_PROVIDER", "").strip() or None
+                kwargs = {}
 
-                # Cap output where possible (many providers respect max_tokens).
+                # Some g4f providers require credentials (API key or .har). If the user provided
+                # one via env vars, pass it through (only if supported by this installed g4f).
                 try:
-                    max_tokens_env = os.getenv("AGENTLAB_MAX_TOKENS_OUT", os.getenv("G4F_MAX_TOKENS_OUT", ""))
-                    max_tokens = int(max_tokens_env) if max_tokens_env else 4096
-                except Exception:
-                    max_tokens = 4096
-
-                # By default, isolate g4f calls in a subprocess to avoid RAM growth during long runs.
-                isolate = os.getenv("AGENTLAB_G4F_ISOLATE", "1").strip().lower() not in ("0", "false", "no")
-
-                if isolate:
-                    answer = _g4f_call_isolated(
-                        model=model_str,
-                        messages=messages,
-                        timeout_s=float(timeout),
-                        provider_name=provider_name,
-                        api_key=api_key,
-                        max_tokens=max_tokens,
-                    )
-                else:
-                    kwargs = {}
-                    try:
-                        import inspect
-                        sig = inspect.signature(g4f.ChatCompletion.create)  # type: ignore
-                        if "api_key" in sig.parameters and api_key:
+                    import inspect
+                    sig = inspect.signature(g4f.ChatCompletion.create)  # type: ignore
+                    if "api_key" in sig.parameters:
+                        api_key = (
+                            os.getenv("OPENROUTER_API_KEY")
+                            or os.getenv("OPENAI_API_KEY")
+                            or os.getenv("GROQ_API_KEY")
+                            or os.getenv("TOGETHER_API_KEY")
+                            or os.getenv("GEMINI_API_KEY")
+                        )
+                        if api_key:
                             kwargs["api_key"] = api_key
-                        if "max_tokens" in sig.parameters and max_tokens:
-                            kwargs["max_tokens"] = max_tokens
-                        if "provider" in sig.parameters and provider_name:
-                            try:
-                                kwargs["provider"] = getattr(g4f.Provider, provider_name)  # type: ignore
-                            except Exception:
-                                pass
+                except Exception:
+                    pass
+
+                provider_name = os.getenv("G4F_PROVIDER", "").strip()
+                if provider_name:
+                    try:
+                        prov = getattr(g4f.Provider, provider_name)  # type: ignore
+                        kwargs["provider"] = prov
                     except Exception:
                         pass
-
-                    resp = g4f.ChatCompletion.create(
-                        model=model_str,
-                        messages=messages,
-                        timeout=int(max(1, timeout)),
-                        **kwargs,
-                    )
-                    answer = _g4f_to_text(resp)
+                resp = g4f.ChatCompletion.create(
+                    model=model_str,
+                    messages=messages,
+                    # g4f expects an integer timeout (seconds). Allow <5s for quick smoke tests,
+                    # but never pass 0.
+                    timeout=int(max(1, timeout)),
+                    **kwargs,
+                )
+                answer = _g4f_to_text(resp)
                 if isinstance(answer, str):
                     answer = answer.strip()
                 if answer:
@@ -436,47 +371,22 @@ def query_model(
                         model="o1-preview", messages=messages)
                 answer = completion.choices[0].message.content
 
-            # Token/cost accounting is optional and can be memory-heavy for large prompts.
-            # Disable by default for g4f (no reliable pricing anyway) and allow an env toggle.
             try:
-                disable_token_count = os.getenv("AGENTLAB_DISABLE_TOKEN_COUNT", "").strip().lower() in ("1", "true", "yes")
-                using_g4f = force_g4f or (g4f is not None and openai_api_key is None and anthropic_api_key is None and gemini_api_key is None)
-                if (not disable_token_count) and (not using_g4f) and tiktoken is not None:
-                    # Avoid huge transient allocations: fall back to a coarse estimate if text is very large.
-                    max_chars = int(os.getenv("AGENTLAB_TOKEN_COUNT_MAX_CHARS", "200000"))
-                    sp = system_prompt or ""
-                    pr = prompt or ""
-                    an = answer or ""
-                    if model_str not in TOKENS_IN:
-                        TOKENS_IN[model_str] = 0
-                        TOKENS_OUT[model_str] = 0
-
-                    if len(sp) + len(pr) <= max_chars:
-                        if model_str in ["o1-preview", "o1-mini", "claude-3.5-sonnet", "o1", "o3-mini"]:
-                            enc = tiktoken.encoding_for_model("gpt-4o")
-                        elif model_str in ["deepseek-chat"]:
-                            enc = tiktoken.encoding_for_model("cl100k_base")
-                        else:
-                            enc = tiktoken.encoding_for_model(model_str)
-                        TOKENS_IN[model_str] += len(enc.encode(sp + pr))
-                    else:
-                        # Very rough heuristic (~4 chars/token in practice for many English-like texts).
-                        TOKENS_IN[model_str] += int((len(sp) + len(pr)) / 4)
-
-                    if len(an) <= max_chars:
-                        try:
-                            enc_out = tiktoken.encoding_for_model(model_str)
-                        except Exception:
-                            enc_out = tiktoken.get_encoding("cl100k_base")
-                        TOKENS_OUT[model_str] += len(enc_out.encode(an))
-                    else:
-                        TOKENS_OUT[model_str] += int(len(an) / 4)
-
-                    if print_cost:
-                        print(f"Current experiment cost = ${curr_cost_est()}, ** Approximate values, may not reflect true cost")
-            except Exception as e:
+                if model_str in ["o1-preview", "o1-mini", "claude-3.5-sonnet", "o1", "o3-mini"]:
+                    encoding = tiktoken.encoding_for_model("gpt-4o")
+                elif model_str in ["deepseek-chat"]:
+                    encoding = tiktoken.encoding_for_model("cl100k_base")
+                else:
+                    encoding = tiktoken.encoding_for_model(model_str)
+                if model_str not in TOKENS_IN:
+                    TOKENS_IN[model_str] = 0
+                    TOKENS_OUT[model_str] = 0
+                TOKENS_IN[model_str] += len(encoding.encode(system_prompt + prompt))
+                TOKENS_OUT[model_str] += len(encoding.encode(answer))
                 if print_cost:
-                    print(f"Cost approximation has an error? {e}")
+                    print(f"Current experiment cost = ${curr_cost_est()}, ** Approximate values, may not reflect true cost")
+            except Exception as e:
+                if print_cost: print(f"Cost approximation has an error? {e}")
             return answer
         except Exception as e:
             # Fail fast on missing credentials (common with g4f providers that need api_key or .har)

@@ -41,6 +41,16 @@ class LaboratoryWorkflow:
         self.model_backbone = agent_model_backbone
         self.num_papers_lit_review = num_papers_lit_review
 
+        # ---------------- persistent memory ----------------
+        # If a backend OOMs and the process restarts, agents can reload their
+        # history from disk. We isolate per-workflow runs using a unique run_id.
+        # Prefer a stable run_id so a crashed run can be resumed by re-running
+        # with the same lab_index/paper_index (or by explicitly setting AGENTLAB_RUN_ID).
+        self.run_id = os.getenv("AGENTLAB_RUN_ID") or f"lab{lab_index}_paper{paper_index}"
+        self.memory_root = Path(self.lab_dir) / "memory" if self.lab_dir else Path("state_saves/json_memory")
+        os.environ["AGENTLAB_RUN_ID"] = self.run_id
+        os.environ["AGENTLAB_MEMORY_DIR"] = str(self.memory_root)
+
         self.print_cost = True
         self.review_override = True # should review be overridden?
         self.review_ovrd_steps = 0 # review steps so far
@@ -92,11 +102,46 @@ class LaboratoryWorkflow:
         self.save = True
         self.verbose = True
         self.reviewers = ReviewersAgent(model=self.model_backbone, notes=self.notes, openai_api_key=self.openai_api_key)
-        self.phd = PhDStudentAgent(model=self.model_backbone, notes=self.notes, max_steps=self.max_steps, openai_api_key=self.openai_api_key)
-        self.postdoc = PostdocAgent(model=self.model_backbone, notes=self.notes, max_steps=self.max_steps, openai_api_key=self.openai_api_key)
-        self.professor = ProfessorAgent(model=self.model_backbone, notes=self.notes, max_steps=self.max_steps, openai_api_key=self.openai_api_key)
-        self.ml_engineer = MLEngineerAgent(model=self.model_backbone, notes=self.notes, max_steps=self.max_steps, openai_api_key=self.openai_api_key)
-        self.sw_engineer = SWEngineerAgent(model=self.model_backbone, notes=self.notes, max_steps=self.max_steps, openai_api_key=self.openai_api_key)
+        self.phd = PhDStudentAgent(
+            model=self.model_backbone,
+            notes=self.notes,
+            max_steps=self.max_steps,
+            openai_api_key=self.openai_api_key,
+            memory_dir=self.memory_root,
+            run_id=self.run_id,
+        )
+        self.postdoc = PostdocAgent(
+            model=self.model_backbone,
+            notes=self.notes,
+            max_steps=self.max_steps,
+            openai_api_key=self.openai_api_key,
+            memory_dir=self.memory_root,
+            run_id=self.run_id,
+        )
+        self.professor = ProfessorAgent(
+            model=self.model_backbone,
+            notes=self.notes,
+            max_steps=self.max_steps,
+            openai_api_key=self.openai_api_key,
+            memory_dir=self.memory_root,
+            run_id=self.run_id,
+        )
+        self.ml_engineer = MLEngineerAgent(
+            model=self.model_backbone,
+            notes=self.notes,
+            max_steps=self.max_steps,
+            openai_api_key=self.openai_api_key,
+            memory_dir=self.memory_root,
+            run_id=self.run_id,
+        )
+        self.sw_engineer = SWEngineerAgent(
+            model=self.model_backbone,
+            notes=self.notes,
+            max_steps=self.max_steps,
+            openai_api_key=self.openai_api_key,
+            memory_dir=self.memory_root,
+            run_id=self.run_id,
+        )
 
 
     def set_model(self, model):
@@ -316,7 +361,18 @@ class LaboratoryWorkflow:
         experiment_notes = [_note["note"] for _note in self.ml_engineer.notes if "running experiments" in _note["phases"]]
         experiment_notes = f"Notes for the task objective: {experiment_notes}\n" if len(experiment_notes) > 0 else ""
         # instantiate mle-solver
-        solver = MLESolver(dataset_code=self.ml_engineer.dataset_code, notes=experiment_notes, insights=self.ml_engineer.lit_review_sum, max_steps=self.mlesolver_max_steps, plan=self.ml_engineer.plan, openai_api_key=self.openai_api_key, llm_str=self.model_backbone["running experiments"])
+        solver = MLESolver(
+            dataset_code=self.ml_engineer.dataset_code,
+            notes=experiment_notes,
+            insights=self.ml_engineer.lit_review_sum,
+            max_steps=self.mlesolver_max_steps,
+            plan=self.ml_engineer.plan,
+            openai_api_key=self.openai_api_key,
+            llm_str=self.model_backbone["running experiments"],
+            memory_dir=self.memory_root,
+            run_id=self.run_id,
+            solver_id=f"mlesolver_paper{self.paper_index}",
+        )
         # run initialization for solver
         solver.initial_solve()
         # run solver for N mle optimization steps

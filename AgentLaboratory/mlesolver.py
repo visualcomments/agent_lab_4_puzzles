@@ -9,6 +9,8 @@ from tools import *
 from inference import *
 from pathlib import Path
 
+from persistence import JsonStateStore, truncate_middle, compact_lines, utc_ts
+
 
 from contextlib import contextmanager
 import sys, os
@@ -201,7 +203,24 @@ def code_repair(code, error, ctype, REPAIR_LLM, openai_api_key=None):
 
 
 class MLESolver:
-    def __init__(self, dataset_code, openai_api_key=None, notes=None, max_steps=10, insights=None, plan=None, llm_str=None):
+    def __init__(
+        self,
+        dataset_code,
+        openai_api_key=None,
+        notes=None,
+        max_steps=10,
+        insights=None,
+        plan=None,
+        llm_str=None,
+        # Persistence
+        memory_dir: str | Path | None = None,
+        run_id: str | None = None,
+        solver_id: str = "mlesolver",
+        persist_history: bool = True,
+        # Prompt bounding
+        max_prompt_feedback_chars: int = 2500,
+        max_prompt_code_lines: int = 260,
+    ):
         self.supress_print = False
         if notes is None: self.notes = []
         else: self.notes = notes
@@ -222,6 +241,63 @@ class MLESolver:
         self.should_execute_code = True
         self.openai_api_key = openai_api_key
 
+        # ---------- persistence / bounded prompt ----------
+        self.persist_history = persist_history
+        self.max_prompt_feedback_chars = max_prompt_feedback_chars
+        self.max_prompt_code_lines = max_prompt_code_lines
+
+        self.run_id = run_id or os.getenv("AGENTLAB_RUN_ID") or "default"
+        base_dir = Path(memory_dir or os.getenv("AGENTLAB_MEMORY_DIR", "state_saves/json_memory"))
+        self.memory_dir = base_dir / self.run_id
+        self._store = JsonStateStore(
+            state_path=self.memory_dir / f"{solver_id}.state.json",
+            log_path=self.memory_dir / f"{solver_id}.history.jsonl",
+        )
+        if self.persist_history:
+            self._load_state_if_present()
+
+    def _load_state_if_present(self):
+        st = self._store.load()
+        if not st:
+            return
+        try:
+            if st.get("run_id") and st.get("run_id") != self.run_id:
+                return
+            # Restore only lightweight fields required to continue.
+            self.st_history = st.get("st_history", self.st_history) or self.st_history
+            self.best_codes = st.get("best_codes", None) or getattr(self, "best_codes", None)
+            self.code_lines = st.get("code_lines", self.code_lines)
+            self.prev_code_ret = st.get("prev_code_ret", self.prev_code_ret)
+            self.should_execute_code = st.get("should_execute_code", self.should_execute_code)
+            self.code_reflect = st.get("code_reflect", self.code_reflect)
+        except Exception:
+            return
+
+    def _save_state(self, *, event_type: str = "turn", meta: dict | None = None):
+        if not self.persist_history:
+            return
+        try:
+            state = {
+                "version": 1,
+                "run_id": self.run_id,
+                "solver": "MLESolver",
+                "updated_at": utc_ts(),
+                "st_history": self.st_history,
+                "best_codes": getattr(self, "best_codes", None),
+                "code_lines": self.code_lines,
+                "prev_code_ret": self.prev_code_ret,
+                "should_execute_code": self.should_execute_code,
+                "code_reflect": self.code_reflect,
+            }
+            self._store.save(state)
+            self._store.log({
+                "ts": utc_ts(),
+                "type": event_type,
+                "meta": meta or {},
+            })
+        except Exception:
+            return
+
     def initial_solve(self):
         """
         Initialize the solver and get an initial set of code and a return
@@ -240,6 +316,7 @@ class MLESolver:
         self.model = f"{self.llm_str}"
         self.commands = [Edit(), Replace()]
         self.prev_working_code = copy(self.code_lines)
+        self._save_state(event_type="init_done")
 
     @staticmethod
     def clean_text(text):
@@ -292,6 +369,7 @@ class MLESolver:
             cmd_str, code_lines, prev_code_ret, should_execute_code, score = self.process_command(model_resp)
             self.st_history.append([model_resp, prev_code_ret, code_lines, cmd_str])
             if len(self.st_history) > self.st_hist_len: self.st_history.pop(0)
+            self._save_state(event_type="turn", meta={"attempt": num_attempts})
             if score is not None:
                 if top_score is None:
                     best_pkg = copy(code_lines), copy(prev_code_ret), copy(should_execute_code), copy(model_resp), copy(cmd_str)
@@ -314,6 +392,7 @@ class MLESolver:
             self.best_codes.append((copy(self.code_lines), copy(top_score), self.prev_code_ret))
             # sort by score, to make sure lowest are removed in future
             self.best_codes.sort(key=lambda x: x[1], reverse=True)
+        self._save_state(event_type="solve_done", meta={"top_score": top_score})
         return model_resp, cmd_str
 
     def reflect_code(self):
@@ -409,13 +488,27 @@ class MLESolver:
         Well-formatted history string
         @return: (str) history string
         """
+        # IMPORTANT: keep this bounded. Long prompts can cause some providers to
+        # allocate very large buffers and crash the process.
         hist_str = ""
         for _hist in range(len(self.st_history)):
+            resp, env_fb, code_lines, cmd_out = self.st_history[_hist]
+            resp = truncate_middle(str(resp), 900)
+            cmd_out = truncate_middle(str(cmd_out), 900)
+            env_fb = truncate_middle(str(env_fb), self.max_prompt_feedback_chars)
+            # Show a numbered excerpt of the code.
+            try:
+                numbered = [f"{i} | {line}" for i, line in enumerate(code_lines or [])]
+            except Exception:
+                numbered = [str(code_lines)]
+            code_excerpt = compact_lines(numbered, max_lines=self.max_prompt_code_lines)
+
             hist_str += f"-------- History ({len(self.st_history)-_hist} steps ago) -----\n"
-            hist_str += f"Because of the following response: {self.st_history[_hist][0]}\n" if len(self.st_history[_hist][0]) > 0 else ""
-            hist_str += f"and the following COMMAND response output: {self.st_history[_hist][3]}\n"
-            hist_str += f"With the following code used: {'#'*20}\n{self.st_history[_hist][2]}\n{'#'*20}\n\n"
-            hist_str += f"The environment feedback and reflection was as follows: {self.st_history[_hist][1]}\n"
+            if resp:
+                hist_str += f"Model response (excerpt): {resp}\n"
+            hist_str += f"Command output: {cmd_out}\n"
+            hist_str += f"Code (excerpt):\n{'#'*20}\n{code_excerpt}\n{'#'*20}\n"
+            hist_str += f"Env feedback (excerpt): {env_fb}\n"
             hist_str += f"-------- End of history ({len(self.st_history)-_hist} steps ago) -------\n"
         return hist_str
 
@@ -488,18 +581,25 @@ class MLESolver:
         elif not self.should_execute_code:
             code_return = "No changes were made to the code."
             reflect_prompt = "Reflect on your future plans and next steps to improve the code."
-        reflection = self.reflection(reflect_prompt, code_str, code_return)
-        return f"Code return: {code_return}\n\nReflection: {reflection}"
+        reflection = self.reflection(reflect_prompt)
+        code_return_short = truncate_middle(str(code_return), self.max_prompt_feedback_chars)
+        reflection_short = truncate_middle(str(reflection), self.max_prompt_feedback_chars)
+        return f"Code return: {code_return_short}\n\nReflection: {reflection_short}"
 
-    def reflection(self, reflect_prompt, code_str, code_return):
+    def reflection(self, reflect_prompt):
         """
         Reflect on your future plans and next steps to improve the code
         @param reflect_prompt: (str) reflection prompt
         @param code_str: (str) code string
         @return: (str) reflection string
         """
-        refl = query_model(prompt=reflect_prompt, system_prompt=self.system_prompt(commands=False), model_str=f"{self.llm_str}", openai_api_key=self.openai_api_key)
-        return f"During the previous execution, the following code was run: \n\n{code_str}\n\nThis code returned the following: \n{code_return}\nThe following is your reflection from this feedback {refl}\n"
+        # Keep reflection concise (full code is already in reflect_prompt).
+        return query_model(
+            prompt=reflect_prompt,
+            system_prompt=self.system_prompt(commands=False),
+            model_str=f"{self.llm_str}",
+            openai_api_key=self.openai_api_key,
+        )
 
     def generate_dataset_descr_prompt(self):
         """

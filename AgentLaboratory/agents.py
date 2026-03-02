@@ -2,6 +2,11 @@ from utils import *
 from tools import *
 from inference import *
 import random, string
+import os
+from pathlib import Path
+from datetime import datetime
+
+from persistence import JsonStateStore, truncate_middle
 
 
 def extract_json_between_markers(llm_output):
@@ -202,7 +207,20 @@ class ReviewersAgent:
 
 
 class BaseAgent:
-    def __init__(self, model="gpt-4o-mini", notes=None, max_steps=100, openai_api_key=None):
+    def __init__(
+        self,
+        model="gpt-4o-mini",
+        notes=None,
+        max_steps=100,
+        openai_api_key=None,
+        # Persistence
+        memory_dir: str | Path | None = None,
+        run_id: str | None = None,
+        persist_history: bool = True,
+        # Prompt bounding (helps prevent RAM blowups on some backends)
+        max_prompt_history_chars: int = 12000,
+        max_history_entry_chars: int = 3500,
+    ):
         if notes is None: self.notes = []
         else: self.notes = notes
         self.max_steps = max_steps
@@ -224,8 +242,79 @@ class BaseAgent:
         self.prev_interpretation = str()
         self.openai_api_key = openai_api_key
 
+        # ---------- persistence / bounded context ----------
+        self.persist_history = persist_history
+        self.max_prompt_history_chars = max_prompt_history_chars
+        self.max_history_entry_chars = max_history_entry_chars
+
+        # Keep runs isolated so multiple experiments don't overwrite each other.
+        self.run_id = run_id or os.getenv("AGENTLAB_RUN_ID") or "default"
+        base_dir = Path(memory_dir or os.getenv("AGENTLAB_MEMORY_DIR", "state_saves/json_memory"))
+        self.memory_dir = base_dir / self.run_id
+        self._store = JsonStateStore(
+            state_path=self.memory_dir / f"{self.__class__.__name__}.state.json",
+            log_path=self.memory_dir / f"{self.__class__.__name__}.history.jsonl",
+        )
+        self.session_id = 0
+        if self.persist_history:
+            self._load_state_if_present()
+
         self.second_round = False
         self.max_hist_len = 15
+
+    # ---------------- persistence helpers ----------------
+
+    def _load_state_if_present(self):
+        st = self._store.load()
+        if not st:
+            return
+        try:
+            if st.get("run_id") and st.get("run_id") != self.run_id:
+                return
+            self.session_id = int(st.get("session_id", 0))
+            self.prev_comm = st.get("prev_comm", "") or ""
+            hist = st.get("history", [])
+            if isinstance(hist, list):
+                restored = []
+                for item in hist:
+                    if not isinstance(item, dict):
+                        continue
+                    restored.append((item.get("expires"), item.get("text", "")))
+                self.history = restored
+        except Exception:
+            # Corrupt state should never stop the run.
+            return
+
+    def _save_state(self, *, event_type: str = "turn", meta: dict | None = None):
+        if not self.persist_history:
+            return
+        try:
+            state = {
+                "version": 1,
+                "run_id": self.run_id,
+                "agent": self.__class__.__name__,
+                "session_id": self.session_id,
+                "prev_comm": self.prev_comm,
+                "max_hist_len": self.max_hist_len,
+                "history": [{"expires": h[0], "text": h[1]} for h in self.history],
+            }
+            self._store.save(state)
+            self._store.log({
+                "ts": datetime.utcnow().isoformat() + "Z",
+                "type": event_type,
+                "agent": self.__class__.__name__,
+                "session_id": self.session_id,
+                "meta": meta or {},
+            })
+        except Exception:
+            return
+
+    def _history_for_prompt(self) -> str:
+        """Bounded history string used in prompts to prevent runaway context."""
+        if not self.history:
+            return ""
+        history_str = "\n".join([_[1] for _ in self.history])
+        return truncate_middle(history_str, self.max_prompt_history_chars)
 
     def set_model_backbone(self, model):
         self.model = model
@@ -247,7 +336,7 @@ class BaseAgent:
     def inference(self, research_topic, phase, step, feedback="", temp=None):
         sys_prompt = f"""You are {self.role_description()} \nTask instructions: {self.phase_prompt(phase)}\n{self.command_descriptions(phase)}"""
         context = self.context(phase)
-        history_str = "\n".join([_[1] for _ in self.history])
+        history_str = self._history_for_prompt()
         phase_notes = [_note for _note in self.notes if phase in _note["phases"]]
         notes_str = f"Notes for the task objective: {phase_notes}\n" if len(phase_notes) > 0 else ""
         complete_str = str()
@@ -265,7 +354,10 @@ class BaseAgent:
         if feedback is not None and "```EXPIRATION" in feedback:
             steps_exp = int(feedback.split("\n")[0].replace("```EXPIRATION ", ""))
             feedback = extract_prompt(feedback, "EXPIRATION")
-        self.history.append((steps_exp, f"Step #{step}, Phase: {phase}, Feedback: {feedback}, Your response: {model_resp}"))
+        # Compact stored history to keep prompts and memory bounded.
+        _fb = truncate_middle(str(feedback), self.max_history_entry_chars)
+        _resp = truncate_middle(str(model_resp), self.max_history_entry_chars)
+        self.history.append((steps_exp, f"Step #{step}, Phase: {phase}, Feedback: {_fb}, Your response: {_resp}"))
         # remove histories that have expiration dates
         for _i in reversed(range(len(self.history))):
             if self.history[_i][0] is not None:
@@ -274,11 +366,14 @@ class BaseAgent:
                     self.history.pop(_i)
         if len(self.history) >= self.max_hist_len:
             self.history.pop(0)
+        self._save_state(event_type="turn", meta={"phase": phase, "step": step})
         return model_resp
 
     def reset(self):
         self.history.clear()  # Clear the deque
         self.prev_comm = ""
+        self.session_id += 1
+        self._save_state(event_type="reset")
 
     def context(self, phase):
         raise NotImplementedError("Subclasses should implement this method.")
@@ -297,13 +392,30 @@ class BaseAgent:
 
 
 class ProfessorAgent(BaseAgent):
-    def __init__(self, model="gpt4omini", notes=None, max_steps=100, openai_api_key=None):
-        super().__init__(model, notes, max_steps, openai_api_key)
+    def __init__(
+        self,
+        model="gpt4omini",
+        notes=None,
+        max_steps=100,
+        openai_api_key=None,
+        memory_dir: str | Path | None = None,
+        run_id: str | None = None,
+        persist_history: bool = True,
+    ):
+        super().__init__(
+            model,
+            notes,
+            max_steps,
+            openai_api_key,
+            memory_dir=memory_dir,
+            run_id=run_id,
+            persist_history=persist_history,
+        )
         self.phases = ["report writing"]
 
     def generate_readme(self):
         sys_prompt = f"""You are {self.role_description()} \n Here is the written paper \n{self.report}. Task instructions: Your goal is to integrate all of the knowledge, code, reports, and notes provided to you and generate a readme.md for a github repository."""
-        history_str = "\n".join([_[1] for _ in self.history])
+        history_str = self._history_for_prompt()
         prompt = (
             f"""History: {history_str}\n{'~' * 10}\n"""
             f"Please produce the readme below in markdown:\n")
@@ -363,8 +475,25 @@ class ProfessorAgent(BaseAgent):
 
 
 class PostdocAgent(BaseAgent):
-    def __init__(self, model="gpt4omini", notes=None, max_steps=100, openai_api_key=None):
-        super().__init__(model, notes, max_steps, openai_api_key)
+    def __init__(
+        self,
+        model="gpt4omini",
+        notes=None,
+        max_steps=100,
+        openai_api_key=None,
+        memory_dir: str | Path | None = None,
+        run_id: str | None = None,
+        persist_history: bool = True,
+    ):
+        super().__init__(
+            model,
+            notes,
+            max_steps,
+            openai_api_key,
+            memory_dir=memory_dir,
+            run_id=run_id,
+            persist_history=persist_history,
+        )
         self.phases = ["plan formulation", "results interpretation"]
 
     def context(self, phase):
@@ -439,8 +568,25 @@ class PostdocAgent(BaseAgent):
 
 
 class MLEngineerAgent(BaseAgent):
-    def __init__(self, model="gpt4omini", notes=None, max_steps=100, openai_api_key=None):
-        super().__init__(model, notes, max_steps, openai_api_key)
+    def __init__(
+        self,
+        model="gpt4omini",
+        notes=None,
+        max_steps=100,
+        openai_api_key=None,
+        memory_dir: str | Path | None = None,
+        run_id: str | None = None,
+        persist_history: bool = True,
+    ):
+        super().__init__(
+            model,
+            notes,
+            max_steps,
+            openai_api_key,
+            memory_dir=memory_dir,
+            run_id=run_id,
+            persist_history=persist_history,
+        )
         self.phases = [
             "data preparation",
             "running experiments",
@@ -505,8 +651,25 @@ class MLEngineerAgent(BaseAgent):
 
 
 class SWEngineerAgent(BaseAgent):
-    def __init__(self, model="gpt4omini", notes=None, max_steps=100, openai_api_key=None):
-        super().__init__(model, notes, max_steps, openai_api_key)
+    def __init__(
+        self,
+        model="gpt4omini",
+        notes=None,
+        max_steps=100,
+        openai_api_key=None,
+        memory_dir: str | Path | None = None,
+        run_id: str | None = None,
+        persist_history: bool = True,
+    ):
+        super().__init__(
+            model,
+            notes,
+            max_steps,
+            openai_api_key,
+            memory_dir=memory_dir,
+            run_id=run_id,
+            persist_history=persist_history,
+        )
         self.phases = [
             "data preparation",
         ]
@@ -561,8 +724,25 @@ class SWEngineerAgent(BaseAgent):
 
 
 class PhDStudentAgent(BaseAgent):
-    def __init__(self, model="gpt4omini", notes=None, max_steps=100, openai_api_key=None):
-        super().__init__(model, notes, max_steps, openai_api_key)
+    def __init__(
+        self,
+        model="gpt4omini",
+        notes=None,
+        max_steps=100,
+        openai_api_key=None,
+        memory_dir: str | Path | None = None,
+        run_id: str | None = None,
+        persist_history: bool = True,
+    ):
+        super().__init__(
+            model,
+            notes,
+            max_steps,
+            openai_api_key,
+            memory_dir=memory_dir,
+            run_id=run_id,
+            persist_history=persist_history,
+        )
         self.phases = [
             "literature review",
             "plan formulation",
@@ -620,7 +800,7 @@ class PhDStudentAgent(BaseAgent):
 
     def requirements_txt(self):
         sys_prompt = f"""You are {self.role_description()} \nTask instructions: Your goal is to integrate all of the knowledge, code, reports, and notes provided to you and generate a requirements.txt for a github repository for all of the code."""
-        history_str = "\n".join([_[1] for _ in self.history])
+        history_str = self._history_for_prompt()
         prompt = (
             f"""History: {history_str}\n{'~' * 10}\n"""
             f"Please produce the requirements.txt below in markdown:\n")
