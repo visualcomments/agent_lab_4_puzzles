@@ -1,13 +1,15 @@
-import PyPDF2
-import threading
-from app import *
 from agents import *
 from copy import copy
 from pathlib import Path
 from datetime import date
-from common_imports import *
 from mlesolver import MLESolver
+from agentrxiv_index import AgentRxivIndex
 import argparse, pickle, yaml
+import os
+import shutil
+import time
+import random
+import re
 
 GLOBAL_AGENTRXIV = None
 DEFAULT_LLM_BACKBONE = "o3-mini"
@@ -630,81 +632,67 @@ class LaboratoryWorkflow:
         return False
 
 class AgentRxiv:
-    def __init__(self, lab_index=0):
-        self.lab_index = lab_index
-        self.server_thread = None
-        self.initialize_server()
-        self.pdf_text = dict()
-        self.summaries = dict()
+    """AgentRxiv wrapper used by AgentLaboratory.
 
-    def initialize_server(self):
-        # Calculate the port dynamically
-        port = 5000 + self.lab_index
-        # Start the server on the computed port using a lambda to pass the port value
-        self.server_thread = threading.Thread(target=lambda: self.run_server(port))
-        self.server_thread.daemon = True
-        self.server_thread.start()
-        time.sleep(5)  # allow time for the server to start up
+    RAM-friendly implementation:
+    - No Flask server thread
+    - No local SentenceTransformer model in RAM
+    - Persistent on-disk index (SQLite FTS5) + optional remote embeddings for rerank
+    - Full PDF text stored as disk blobs (txt) and loaded only when explicitly requested
+    """
+
+    def __init__(self, lab_index: int = 0, memory_root: str | Path | None = None, openai_api_key: str | None = None):
+        self.lab_index = lab_index
+        # Put AgentRxiv artifacts under the workflow memory root, so runs are isolated.
+        mem_root = Path(memory_root or os.getenv("AGENTLAB_MEMORY_DIR", "state_saves/json_memory"))
+        base = mem_root / "agentrxiv"
+        self.index = AgentRxivIndex(
+            uploads_dir=Path("uploads"),
+            db_path=base / "agentrxiv.sqlite",
+            blob_dir=base / "blobs",
+            openai_api_key=openai_api_key or os.getenv("OPENAI_API_KEY"),
+            # embeddings are optional; keep default False for cost + simplicity.
+            enable_embeddings=(os.getenv("AGENTLAB_AGENTRXIV_EMBED", "0") == "1"),
+        )
 
     @staticmethod
-    def num_papers():
-        return len(os.listdir("uploads"))
-
-    def retrieve_full_text(self, arxiv_id):
+    def num_papers() -> int:
         try:
-            return self.pdf_text[arxiv_id]
+            return len(list(Path("uploads").glob("*.pdf")))
+        except Exception:
+            return 0
+
+    def retrieve_full_text(self, arxiv_id: str) -> str:
+        # Expected format: "AgentRxiv:ID_<int>"
+        try:
+            if isinstance(arxiv_id, str) and "ID_" in arxiv_id:
+                paper_id = int(arxiv_id.split("ID_")[-1])
+            else:
+                paper_id = int(arxiv_id)
+            return self.index.get_full_text(paper_id)
         except Exception:
             return "Paper ID not found?"
 
-    @staticmethod
-    def read_pdf_pypdf2(pdf_path):
-        with open(pdf_path, 'rb') as pdf_file:
-            reader = PyPDF2.PdfReader(pdf_file)
-            text = ''
-            for page_num in range(len(reader.pages)):
-                page = reader.pages[page_num]
-                text += page.extract_text()
-        return text
-
-    def search_agentrxiv(self, search_query, num_papers):
-        # Use the dynamic port here as well
-        url = f'http://127.0.0.1:{5000 + self.lab_index}/api/search?q={search_query}'
-        return_str = str()
+    def search_agentrxiv(self, search_query: str, num_papers: int) -> str:
         try:
-            with app.app_context():
-                update_papers_from_uploads()
-            response = requests.get(url)
-            response.raise_for_status()
-            data = response.json()
-            return_str += "Search Query:" + data['query']
-            return_str += "Results:"
-            for result in data['results'][:num_papers]:
-                arxiv_id = f"AgentRxiv:ID_{result['id']}"
-                if arxiv_id not in self.summaries:
-                    filename = Path(f'_tmp_{self.lab_index}.pdf')
-                    response = requests.get(result['pdf_url'])
-                    filename.write_bytes(response.content)
-                    self.pdf_text[arxiv_id] = self.read_pdf_pypdf2(f'_tmp_{self.lab_index}.pdf')
-                    self.summaries[arxiv_id] = query_model(
-                        prompt=self.pdf_text[arxiv_id],
-                        system_prompt="Please provide a 5 sentence summary of this paper.",
-                        openai_api_key=os.getenv('OPENAI_API_KEY'),
-                        model_str="gpt-4o-mini"
-                    )
-                return_str += f"Title: {result['filename']}"
-                return_str += f"Summary: {self.summaries[arxiv_id]}\n"
-                formatted_date = date.today().strftime("%d/%m/%Y")
+            results = self.index.search(
+                search_query,
+                k=num_papers,
+                openai_api_key=os.getenv("OPENAI_API_KEY"),
+                ensure_summaries=True,
+            )
+            return_str = f"Search Query: {search_query}\nResults:\n"
+            formatted_date = date.today().strftime("%d/%m/%Y")
+            for r in results:
+                return_str += f"Title: {r.filename}\n"
+                return_str += f"Summary: {r.summary}\n"
                 return_str += f"Publication Date: {formatted_date}\n"
-                return_str += f"arXiv paper ID: AgentRxiv:ID_{result['id']}"
-                return_str += "-" * 40
+                return_str += f"arXiv paper ID: AgentRxiv:ID_{r.paper_id}\n"
+                return_str += "-" * 40 + "\n"
+            return return_str
         except Exception as e:
             print(f"AgentRxiv Error: {e}")
-            return_str += f"Error: {e}"
-        return return_str
-
-    def run_server(self, port):
-        run_app(port=port)
-
+            return f"Error: {e}"
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="AgentLaboratory Research Workflow")
@@ -938,10 +926,6 @@ Advancements:
 - Run agent labs in parallel (asynch) 
 
 """
-
-
-
-
 
 
 
