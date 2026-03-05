@@ -40,10 +40,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 import importlib.util
 import json
 import os
 import shutil
+import zipfile
 import subprocess
 import sys
 import traceback
@@ -72,16 +74,82 @@ def _stage_done(title: str, t0: float) -> None:
 
 
 def _resolve_default_puzzles(spec: PipelineSpec) -> Path:
-    """If --puzzles is omitted, try competitions/<key>/data/test.csv."""
+    """If --puzzles is omitted, try to locate a bundled test.csv.
+
+    Resolution order:
+      1) competitions/<spec.key>/data/test.csv
+      2) competitions/<spec.competition>/data/test.csv
+
+    If not found, we additionally try to *bootstrap* the data folder from a
+    competition ZIP (Kaggle-style) if one is available locally. This is useful
+    on Colab / ephemeral environments where you only have downloaded
+    competition files as a .zip.
+
+    ZIP discovery order (first hit wins):
+      - competitions/<key>/data/source.zip
+      - competitions/<key>/data.zip
+      - competition_files/<key>.zip
+      - competition_files/<competition>.zip
+      - ./<key>.zip  (current working directory)
+      - ./<competition>.zip
+
+    If a ZIP is found, it is extracted into competitions/<key>/data/ and we
+    re-check for test.csv.
+
+    Notes:
+      - Expected ZIP layout: test.csv and sample_submission.csv at ZIP root
+        (common Kaggle pattern).
+    """
+    # 1) direct bundled paths
     candidate = ROOT / 'competitions' / spec.key / 'data' / 'test.csv'
     if candidate.exists():
         return candidate
+
     candidate = ROOT / 'competitions' / spec.competition / 'data' / 'test.csv'
     if candidate.exists():
         return candidate
+
+    # 2) try bootstrap from a locally available ZIP
+    data_dir = ROOT / 'competitions' / spec.key / 'data'
+    zip_candidates = [
+        ROOT / 'competitions' / spec.key / 'data' / 'source.zip',
+        ROOT / 'competitions' / spec.key / 'data.zip',
+        ROOT / 'competition_files' / f'{spec.key}.zip',
+        ROOT / 'competition_files' / f'{spec.competition}.zip',
+        Path.cwd() / f'{spec.key}.zip',
+        Path.cwd() / f'{spec.competition}.zip',
+    ]
+
+    # Also accept "slug*.zip" (e.g. "cayleypy-rapapport-m2(1).zip")
+    glob_candidates = []
+    for base_dir in [ROOT / 'competition_files', Path.cwd()]:
+        if base_dir.exists():
+            glob_candidates.extend(sorted(base_dir.glob(f"{spec.key}*.zip")))
+            if spec.competition != spec.key:
+                glob_candidates.extend(sorted(base_dir.glob(f"{spec.competition}*.zip")))
+
+    zip_path = next((p for p in itertools.chain(zip_candidates, glob_candidates) if p.exists()), None)
+    if zip_path is not None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extractall(data_dir)
+        except Exception as e:
+            raise RuntimeError(f"Failed to extract competition ZIP: {zip_path} ({e})") from e
+
+        candidate = data_dir / 'test.csv'
+        if candidate.exists():
+            return candidate
+
+    expected = ROOT / 'competitions' / spec.key / 'data' / 'test.csv'
     raise FileNotFoundError(
-        f"No puzzles CSV provided and no bundled test.csv found for '{spec.key}'. "
-        f"Expected: {ROOT/'competitions'/spec.key/'data'/'test.csv'}"
+        f"No puzzles CSV provided and no bundled test.csv found for '{spec.key}'.\n"
+        f"Expected: {expected}\n\n"
+        "How to fix:\n"
+        "  - Pass `--puzzles /path/to/test.csv`\n"
+        "  - OR place competition files in `competitions/<slug>/data/`\n"
+        "  - OR put a Kaggle-style ZIP with `test.csv` at repo root (./<slug>.zip)\n"
+        "    or into `competition_files/<slug>.zip` and re-run.\n"
     )
 
 
