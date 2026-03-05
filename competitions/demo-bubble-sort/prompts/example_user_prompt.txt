@@ -1,0 +1,35 @@
+You are improving / generating a solver module for a tiny demo puzzle called demo-bubble-sort.
+
+Task:
+Given an integer list `vector`, you must sort it in non-decreasing order using adjacent swaps only.
+
+Move representation:
+- A move is a string token "S{j}" (0-indexed), meaning swap vector[j] and vector[j+1].
+
+You MUST implement a file `solve_module.py` that contains:
+
+1) A function:
+    def solve(vector):
+        ...
+        return moves, sorted_array
+
+Where:
+- moves is a list[str] like ["S0","S1",...]
+- sorted_array is the result of applying those moves to the input
+- sorted_array must be sorted (non-decreasing) and be a permutation of the input.
+
+2) A CLI entrypoint so the script can be executed as:
+    python solve_module.py "[3,2,1]"
+and prints JSON to stdout:
+    {"moves": [...], "sorted_array": [...]}
+
+Constraints:
+- No external dependencies.
+- Must work for empty lists and single-element lists.
+- Keep it simple (bubble sort is fine). Optimize with early-stop if you want.
+
+The validator will:
+- run your script
+- parse JSON
+- apply your moves to the input
+- check sortedness and permutation equality.

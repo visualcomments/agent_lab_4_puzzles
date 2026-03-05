@@ -65,6 +65,17 @@ _PIPELINES: List[PipelineSpec] = [
         smoke_vector=[3, 1, 2, 5, 4],
     ),
 PipelineSpec(
+    key="demo-bubble-sort",
+    competition="demo-bubble-sort",
+    format_slug="format/moves-dot",
+    baseline_solver=_p("competitions", "demo-bubble-sort", "solve_module.py"),
+    validator=_p("competitions", "demo-bubble-sort", "validate_solve_output.py"),
+    prompt_file=_p("competitions", "demo-bubble-sort", "prompts", "example_user_prompt.txt"),
+    custom_prompts_file=_p("competitions", "demo-bubble-sort", "prompts", "custom_prompts_template.json"),
+    state_columns=["vector"],
+    smoke_vector=[3, 2, 1],
+),
+PipelineSpec(
         key="lrx-discover-math-gods-algorithm",
         competition="lrx-discover-math-gods-algorithm",
         format_slug="lrx-discover-math-gods-algorithm",

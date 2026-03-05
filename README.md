@@ -214,3 +214,32 @@ python pipeline_cli.py run \
 
 - Submission building shows a lightweight progress bar by default.
 - Disable it with `--no-progress`.
+
+
+## Demo: bubble sort sanity-check (g4f vs local)
+
+В репозитории есть мини-соревнование **demo-bubble-sort** — оно специально сделано, чтобы быстро проверить:
+
+- baseline (без LLM) генерирует корректный `submission.csv`
+- AgentLaboratory может сгенерировать решатель (и валидатор его примет)
+- одинаково работает режим `g4f:*` и `local:*` (локальная модель может использовать GPU)
+
+### Baseline (без LLM)
+
+```bash
+python pipeline_cli.py run --competition demo-bubble-sort --output submissions/demo-bubble-sort.csv --no-llm
+```
+
+### g4f
+
+```bash
+python pipeline_cli.py run --competition demo-bubble-sort --output submissions/demo-bubble-sort.csv --models gpt-4 --max-iters 3
+```
+
+### Local (GPU)
+
+```bash
+AGENTLAB_DEVICE=cuda AGENTLAB_USE_GPU=1 \
+python pipeline_cli.py run --competition demo-bubble-sort --output submissions/demo-bubble-sort.csv \
+  --models "local:Qwen/Qwen2.5-0.5B-Instruct" --max-iters 3
+```

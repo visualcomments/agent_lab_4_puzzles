@@ -1185,6 +1185,7 @@ def cmd_selftest(_: argparse.Namespace) -> None:
 
     # Test a few pipelines end-to-end
     to_test = [
+        "demo-bubble-sort",
         "lrx-sort",
         "cayleypy-rapapport-m2",
         "CayleyPy-pancake",
