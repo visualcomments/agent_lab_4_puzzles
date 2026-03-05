@@ -7,11 +7,6 @@ from pathlib import Path
 from datetime import datetime
 
 from persistence import JsonStateStore, truncate_middle
-from summarization import update_running_summary
-try:
-    from rag_memory import AgentRAGMemory  # optional, disk-backed long-term memory
-except Exception:  # pragma: no cover
-    AgentRAGMemory = None  # type: ignore
 
 
 def extract_json_between_markers(llm_output):
@@ -225,12 +220,6 @@ class BaseAgent:
         # Prompt bounding (helps prevent RAM blowups on some backends)
         max_prompt_history_chars: int = 12000,
         max_history_entry_chars: int = 3500,
-        # Running summary (fold older history into a compact summary)
-        enable_running_summary: bool = True,
-        summary_chunk_size: int = 5,
-        max_summary_chars: int = 6000,
-        max_summary_prompt_chars: int = 4000,
-        summary_model: str | None = None,
     ):
         if notes is None: self.notes = []
         else: self.notes = notes
@@ -253,14 +242,6 @@ class BaseAgent:
         self.prev_interpretation = str()
         self.openai_api_key = openai_api_key
 
-        # ---------- running summary ----------
-        self.enable_running_summary = enable_running_summary
-        self.summary_chunk_size = max(1, int(summary_chunk_size))
-        self.max_summary_chars = max(0, int(max_summary_chars))
-        self.max_summary_prompt_chars = max(0, int(max_summary_prompt_chars))
-        self.summary_model = summary_model
-        self.running_summary = ""
-
         # ---------- persistence / bounded context ----------
         self.persist_history = persist_history
         self.max_prompt_history_chars = max_prompt_history_chars
@@ -278,21 +259,6 @@ class BaseAgent:
         if self.persist_history:
             self._load_state_if_present()
 
-        # ---------- disk-backed RAG memory (optional) ----------
-        self.rag_memory = None
-        self.enable_rag_memory = os.getenv("AGENTLAB_RAG_MEMORY", "0") == "1"
-        if self.enable_rag_memory and AgentRAGMemory is not None:
-            try:
-                self.rag_memory = AgentRAGMemory(
-                    db_path=self.memory_dir / "rag_memory.sqlite",
-                    blob_dir=self.memory_dir / "rag_blobs",
-                    agent_name=self.__class__.__name__,
-                    openai_api_key=self.openai_api_key,
-                    enable_embeddings=(os.getenv("AGENTLAB_RAG_EMBED", "0") == "1"),
-                )
-            except Exception:
-                self.rag_memory = None
-
         self.second_round = False
         self.max_hist_len = 15
 
@@ -307,7 +273,6 @@ class BaseAgent:
                 return
             self.session_id = int(st.get("session_id", 0))
             self.prev_comm = st.get("prev_comm", "") or ""
-            self.running_summary = st.get("running_summary", "") or ""
             hist = st.get("history", [])
             if isinstance(hist, list):
                 restored = []
@@ -331,7 +296,6 @@ class BaseAgent:
                 "session_id": self.session_id,
                 "prev_comm": self.prev_comm,
                 "max_hist_len": self.max_hist_len,
-                "running_summary": self.running_summary,
                 "history": [{"expires": h[0], "text": h[1]} for h in self.history],
             }
             self._store.save(state)
@@ -346,50 +310,11 @@ class BaseAgent:
             return
 
     def _history_for_prompt(self) -> str:
-        """Bounded context string used in prompts.
-
-        Includes:
-        - a compact running summary of older turns
-        - the most recent turns in (truncated) detail
-
-        This is a common strategy to keep long conversations coherent while
-        respecting context limits.
-        """
-        summary = truncate_middle(self.running_summary or "", self.max_summary_prompt_chars)
-        history_str = "\n".join([_[1] for _ in self.history]) if self.history else ""
-        history_str = truncate_middle(history_str, self.max_prompt_history_chars)
-        if summary and history_str:
-            return f"Running summary (older turns):\n{summary}\n\nRecent turns:\n{history_str}"
-        if summary:
-            return f"Running summary (older turns):\n{summary}"
-        return history_str
-
-    def _fold_old_history_into_summary(self) -> None:
-        """Fold the oldest history entries into `running_summary`.
-
-        This runs when the detailed history grows beyond `max_hist_len`.
-        """
-        if not self.enable_running_summary:
-            # Hard drop (previous behavior)
-            while len(self.history) > self.max_hist_len:
-                self.history.pop(0)
-            return
-
-        # Fold in chunks so we don't summarize on every single turn.
-        while len(self.history) > self.max_hist_len:
-            chunk = self.history[: self.summary_chunk_size]
-            self.history = self.history[self.summary_chunk_size :]
-            chunk_items = [h[1] for h in chunk if h and h[1]]
-            model = self.summary_model or self.model
-            self.running_summary = update_running_summary(
-                model=model,
-                openai_api_key=self.openai_api_key,
-                existing_summary=self.running_summary,
-                chunk_items=chunk_items,
-                max_output_chars=self.max_summary_chars,
-            )
-            self.running_summary = truncate_middle(self.running_summary, self.max_summary_chars)
-        # Don't spam disk: folding is logged implicitly by the next save.
+        """Bounded history string used in prompts to prevent runaway context."""
+        if not self.history:
+            return ""
+        history_str = "\n".join([_[1] for _ in self.history])
+        return truncate_middle(history_str, self.max_prompt_history_chars)
 
     def set_model_backbone(self, model):
         self.model = model
@@ -412,21 +337,12 @@ class BaseAgent:
         sys_prompt = f"""You are {self.role_description()} \nTask instructions: {self.phase_prompt(phase)}\n{self.command_descriptions(phase)}"""
         context = self.context(phase)
         history_str = self._history_for_prompt()
-        rag_str = ""
-        if getattr(self, "rag_memory", None) is not None:
-            try:
-                rag_query = f"{research_topic}\nPhase: {phase}\nFeedback: {feedback}".strip()
-                rag_str = self.rag_memory.recall(query=rag_query, k=int(os.getenv("AGENTLAB_RAG_K", "6")))
-            except Exception:
-                rag_str = ""
         phase_notes = [_note for _note in self.notes if phase in _note["phases"]]
         notes_str = f"Notes for the task objective: {phase_notes}\n" if len(phase_notes) > 0 else ""
         complete_str = str()
         if step/(self.max_steps-1) > 0.7: complete_str = "You must finish this task and submit as soon as possible!"
         prompt = (
-            f"""{context}\n{'~' * 10}\nHistory: {history_str}
-{'~' * 10}
-Relevant memory (retrieved): {rag_str}\n{'~' * 10}\n"""
+            f"""{context}\n{'~' * 10}\nHistory: {history_str}\n{'~' * 10}\n"""
             f"Current Step #{step}, Phase: {phase}\n{complete_str}\n"
             f"[Objective] Your goal is to perform research on the following topic: {research_topic}\n"
             f"Feedback: {feedback}\nNotes: {notes_str}\nYour previous command was: {self.prev_comm}. Make sure your new output is very different.\nPlease produce a single command below:\n")
@@ -442,35 +358,20 @@ Relevant memory (retrieved): {rag_str}\n{'~' * 10}\n"""
         _fb = truncate_middle(str(feedback), self.max_history_entry_chars)
         _resp = truncate_middle(str(model_resp), self.max_history_entry_chars)
         self.history.append((steps_exp, f"Step #{step}, Phase: {phase}, Feedback: {_fb}, Your response: {_resp}"))
-        if getattr(self, "rag_memory", None) is not None:
-            try:
-                mem_key = f"{self.session_id}_{phase}_{step}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
-                self.rag_memory.remember_turn(
-                    key=mem_key,
-                    phase=phase,
-                    step=int(step),
-                    research_topic=str(research_topic),
-                    feedback=str(_fb),
-                    response=str(_resp),
-                )
-            except Exception:
-                pass
-
         # remove histories that have expiration dates
         for _i in reversed(range(len(self.history))):
             if self.history[_i][0] is not None:
                 self.history[_i] = (self.history[_i][0] - 1, self.history[_i][1])
                 if self.history[_i][0] < 0:
                     self.history.pop(_i)
-        if len(self.history) > self.max_hist_len:
-            self._fold_old_history_into_summary()
+        if len(self.history) >= self.max_hist_len:
+            self.history.pop(0)
         self._save_state(event_type="turn", meta={"phase": phase, "step": step})
         return model_resp
 
     def reset(self):
         self.history.clear()  # Clear the deque
         self.prev_comm = ""
-        self.running_summary = ""
         self.session_id += 1
         self._save_state(event_type="reset")
 
@@ -1013,5 +914,6 @@ class PhDStudentAgent(BaseAgent):
         return "Provided here is a literature review on this topic:\n" + "\n".join(
             f"arXiv ID: {_l['arxiv_id']}, Summary: {_l['summary']}"
             for _l in self.lit_review)
+
 
 

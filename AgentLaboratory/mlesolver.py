@@ -1,8 +1,7 @@
 import random
-import logging
-import warnings
 from copy import copy
 from copy import deepcopy
+from common_imports import *
 from abc import abstractmethod
 
 
@@ -11,7 +10,6 @@ from inference import *
 from pathlib import Path
 
 from persistence import JsonStateStore, truncate_middle, compact_lines, utc_ts
-from summarization import update_running_summary
 
 
 from contextlib import contextmanager
@@ -22,6 +20,7 @@ os.environ["JOBLIB_VERBOSITY"] = "0"
 logging.basicConfig(level=logging.WARNING)
 warnings.filterwarnings("ignore")
 warnings.simplefilter(action='ignore', category=FutureWarning)
+import logging
 logging.getLogger('sklearn.model_selection').setLevel(logging.WARNING)
 
 
@@ -221,12 +220,6 @@ class MLESolver:
         # Prompt bounding
         max_prompt_feedback_chars: int = 2500,
         max_prompt_code_lines: int = 260,
-        # Running summary (fold older iterations into a compact summary)
-        enable_running_summary: bool = True,
-        summary_chunk_size: int = 2,
-        max_summary_chars: int = 5000,
-        max_summary_prompt_chars: int = 2500,
-        summary_model: str | None = None,
     ):
         self.supress_print = False
         if notes is None: self.notes = []
@@ -247,14 +240,6 @@ class MLESolver:
         self.prev_code_ret = str()
         self.should_execute_code = True
         self.openai_api_key = openai_api_key
-
-        # ---------- running summary ----------
-        self.enable_running_summary = enable_running_summary
-        self.summary_chunk_size = max(1, int(summary_chunk_size))
-        self.max_summary_chars = max(0, int(max_summary_chars))
-        self.max_summary_prompt_chars = max(0, int(max_summary_prompt_chars))
-        self.summary_model = summary_model
-        self.running_summary = ""
 
         # ---------- persistence / bounded prompt ----------
         self.persist_history = persist_history
@@ -285,7 +270,6 @@ class MLESolver:
             self.prev_code_ret = st.get("prev_code_ret", self.prev_code_ret)
             self.should_execute_code = st.get("should_execute_code", self.should_execute_code)
             self.code_reflect = st.get("code_reflect", self.code_reflect)
-            self.running_summary = st.get("running_summary", self.running_summary) or self.running_summary
         except Exception:
             return
 
@@ -304,7 +288,6 @@ class MLESolver:
                 "prev_code_ret": self.prev_code_ret,
                 "should_execute_code": self.should_execute_code,
                 "code_reflect": self.code_reflect,
-                "running_summary": self.running_summary,
             }
             self._store.save(state)
             self._store.log({
@@ -314,37 +297,6 @@ class MLESolver:
             })
         except Exception:
             return
-
-    def _fold_old_history_into_summary(self) -> None:
-        if not self.enable_running_summary:
-            while len(self.st_history) > self.st_hist_len:
-                self.st_history.pop(0)
-            return
-        while len(self.st_history) > self.st_hist_len:
-            chunk = self.st_history[: self.summary_chunk_size]
-            self.st_history = self.st_history[self.summary_chunk_size :]
-            # Represent each older iteration compactly for summarization.
-            items = []
-            for resp, env_fb, code_lines, cmd_out in chunk:
-                items.append(
-                    "\n".join(
-                        [
-                            f"Command: {cmd_out}",
-                            f"Model response: {truncate_middle(str(resp), 1200)}",
-                            f"Env feedback: {truncate_middle(str(env_fb), 1200)}",
-                            "Code excerpt:\n" + compact_lines(str(code_lines).splitlines(), 60, 220),
-                        ]
-                    )
-                )
-            model = self.summary_model or self.model
-            self.running_summary = update_running_summary(
-                model=model,
-                openai_api_key=self.openai_api_key,
-                existing_summary=self.running_summary,
-                chunk_items=items,
-                max_output_chars=self.max_summary_chars,
-            )
-            self.running_summary = truncate_middle(self.running_summary, self.max_summary_chars)
 
     def initial_solve(self):
         """
@@ -416,8 +368,7 @@ class MLESolver:
             self.code_lines = copy(random.choice(self.best_codes)[0])
             cmd_str, code_lines, prev_code_ret, should_execute_code, score = self.process_command(model_resp)
             self.st_history.append([model_resp, prev_code_ret, code_lines, cmd_str])
-            if len(self.st_history) > self.st_hist_len:
-                self._fold_old_history_into_summary()
+            if len(self.st_history) > self.st_hist_len: self.st_history.pop(0)
             self._save_state(event_type="turn", meta={"attempt": num_attempts})
             if score is not None:
                 if top_score is None:
@@ -540,9 +491,6 @@ class MLESolver:
         # IMPORTANT: keep this bounded. Long prompts can cause some providers to
         # allocate very large buffers and crash the process.
         hist_str = ""
-        if self.running_summary:
-            summ = truncate_middle(self.running_summary, self.max_summary_prompt_chars)
-            hist_str += f"Running summary (older iterations):\n{summ}\n\n"
         for _hist in range(len(self.st_history)):
             resp, env_fb, code_lines, cmd_out = self.st_history[_hist]
             resp = truncate_middle(str(resp), 900)
@@ -712,5 +660,7 @@ class MLESolver:
         elif self.should_execute_code:
             return execute_code("\n".join(self.code_lines))
         return "Changes have not yet been made to the code."
+
+
 
 

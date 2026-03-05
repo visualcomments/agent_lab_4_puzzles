@@ -17,9 +17,43 @@ from sklearn.metrics.pairwise import linear_kernel
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 
+# Optional: lightweight HF dataset search via Hugging Face Hub API.
+# This avoids building a large local TF-IDF matrix in RAM.
+try:
+    from huggingface_hub import list_datasets
+except Exception:
+    list_datasets = None
+
+
+_HF_SEARCH_SINGLETON = None
+
+
+def get_hf_data_search():
+    """Singleton factory for HFDataSearch.
+
+    Why: HFDataSearch (local TF-IDF mode) can allocate a lot of RAM when building the
+    description matrix; creating it repeatedly inside loops causes RAM spikes.
+
+    Env:
+      - AGENTLAB_HF_SEARCH_MODE=hub|local (default: local)
+      - AGENTLAB_HF_LIKE_THR, AGENTLAB_HF_DWN_THR (optional)
+    """
+    global _HF_SEARCH_SINGLETON
+    if _HF_SEARCH_SINGLETON is None:
+        mode = os.getenv("AGENTLAB_HF_SEARCH_MODE", "local").strip().lower()
+        like_thr = int(os.getenv("AGENTLAB_HF_LIKE_THR", "3"))
+        dwn_thr = int(os.getenv("AGENTLAB_HF_DWN_THR", "50"))
+        _HF_SEARCH_SINGLETON = HFDataSearch(
+            like_thr=like_thr,
+            dwn_thr=dwn_thr,
+            use_hub_api=(mode == "hub"),
+        )
+    return _HF_SEARCH_SINGLETON
+
+
 
 class HFDataSearch:
-    def __init__(self, like_thr=3, dwn_thr=50) -> None:
+    def __init__(self, like_thr=3, dwn_thr=50, use_hub_api: bool = False) -> None:
         """
         Class for finding relevant huggingface datasets
         :param like_thr:
@@ -27,7 +61,31 @@ class HFDataSearch:
         """
         self.dwn_thr = dwn_thr
         self.like_thr = like_thr
-        self.ds = load_dataset("nkasmanoff/huggingface-datasets")["train"]
+
+        # Hub API mode: do not build a TF-IDF index in RAM.
+        self.use_hub_api = bool(use_hub_api) and (list_datasets is not None)
+        if self.use_hub_api:
+            self.ds = []
+            self.descriptions = []
+            self.likes = np.array([])
+            self.downloads = np.array([])
+            self.likes_norm = np.array([])
+            self.downloads_norm = np.array([])
+            self.vectorizer = None
+            self.description_vectors = None
+            return
+
+        # Local TF-IDF mode.
+        try:
+            self.ds = load_dataset("nkasmanoff/huggingface-datasets")["train"]
+        except Exception as e:
+            print(f"[HFDataSearch] Failed to load dataset index locally: {e}")
+            self.ds = []
+            self.descriptions = []
+            self.likes_norm = []
+            self.downloads_norm = []
+            self.description_vectors = None
+            return
 
         # Initialize lists to collect filtered data
         filtered_indices = []
@@ -74,8 +132,11 @@ class HFDataSearch:
         self.likes_norm = self._normalize(self.likes)
         self.downloads_norm = self._normalize(self.downloads)
 
-        # Vectorize the descriptions
-        self.vectorizer = TfidfVectorizer()
+        # Vectorize the descriptions.
+        # NOTE: dtype float32 reduces RAM; max_features can be capped via env.
+        max_features_env = os.getenv("AGENTLAB_HF_TFIDF_MAX_FEATURES", "")
+        max_features = int(max_features_env) if max_features_env.strip().isdigit() else None
+        self.vectorizer = TfidfVectorizer(max_features=max_features, dtype=np.float32)
         self.description_vectors = self.vectorizer.fit_transform(self.descriptions)
 
     def _normalize(self, arr):
@@ -95,6 +156,38 @@ class HFDataSearch:
         :param dwn_w: Weight for downloads.
         :return: List of top N dataset items.
         """
+        if self.use_hub_api:
+            if list_datasets is None:
+                print("[HFDataSearch] huggingface_hub is not available; cannot use hub mode.")
+                return []
+            try:
+                # Hub search returns DatasetInfo objects.
+                infos = list(list_datasets(search=query, limit=max(20, N)))
+            except Exception as e:
+                print(f"[HFDataSearch] Hub search failed: {e}")
+                return []
+
+            # Convert to dicts compatible with results_str().
+            out = []
+            for info in infos[:N]:
+                out.append(
+                    {
+                        "id": getattr(info, "id", None),
+                        "description": getattr(info, "description", None)
+                        or getattr(info, "cardData", None)
+                        or "",
+                        "likes": getattr(info, "likes", None),
+                        "downloads": getattr(info, "downloads", None),
+                        "has_test_set": None,
+                        "has_train_set": None,
+                        "test_download_size": None,
+                        "test_element_size": None,
+                        "train_download_size": None,
+                        "train_element_size": None,
+                    }
+                )
+            return out
+
         if not self.ds or self.description_vectors is None:
             print("No datasets available to search.")
             return []
@@ -162,16 +255,17 @@ class HFDataSearch:
         """
         result_strs = list()
         for result in results:
-            res_str = f"Dataset ID: {result['id']}\n"
-            res_str += f"Description: {result['description']}\n"
-            res_str += f"Likes: {result['likes']}\n"
-            res_str += f"Downloads: {result['downloads']}\n"
-            res_str += f"Has Testing Set: {result['has_test_set']}\n"
-            res_str += f"Has Training Set: {result['has_train_set']}\n"
-            res_str += f"Test Download Size: {result['test_download_size']}\n"
-            res_str += f"Test Dataset Size: {result['test_element_size']}\n"
-            res_str += f"Train Download Size: {result['train_download_size']}\n"
-            res_str += f"Train Dataset Size: {result['train_element_size']}\n"
+            # Be defensive: hub mode returns partial metadata.
+            res_str = f"Dataset ID: {result.get('id')}\n"
+            res_str += f"Description: {result.get('description', '')}\n"
+            res_str += f"Likes: {result.get('likes')}\n"
+            res_str += f"Downloads: {result.get('downloads')}\n"
+            res_str += f"Has Testing Set: {result.get('has_test_set')}\n"
+            res_str += f"Has Training Set: {result.get('has_train_set')}\n"
+            res_str += f"Test Download Size: {result.get('test_download_size')}\n"
+            res_str += f"Test Dataset Size: {result.get('test_element_size')}\n"
+            res_str += f"Train Download Size: {result.get('train_download_size')}\n"
+            res_str += f"Train Dataset Size: {result.get('train_element_size')}\n"
             result_strs.append(res_str)
         return result_strs
 
@@ -260,29 +354,36 @@ class ArxivSearch:
         return None
 
     def retrieve_full_paper_text(self, query, MAX_LEN=50000):
-        pdf_text = str()
+        # Stream / early-stop extraction to avoid building huge in-memory strings.
+        chunks = []
+        total = 0
         paper = next(arxiv.Client().results(arxiv.Search(id_list=[query])))
-        # Download the PDF to the PWD with a custom filename.
-        paper.download_pdf(filename="downloaded-paper.pdf")
-        # creating a pdf reader object
-        reader = PdfReader('downloaded-paper.pdf')
-        # Iterate over all the pages
-        for page_number, page in enumerate(reader.pages, start=1):
-            # Extract text from the page
-            try:
-                text = page.extract_text()
-            except Exception as e:
-                os.remove("downloaded-paper.pdf")
-                time.sleep(2.0)
-                return "EXTRACTION FAILED"
+        tmp_pdf = "downloaded-paper.pdf"
+        paper.download_pdf(filename=tmp_pdf)
+        try:
+            reader = PdfReader(tmp_pdf)
+            for page_number, page in enumerate(reader.pages, start=1):
+                try:
+                    text = page.extract_text()
+                except Exception:
+                    return "EXTRACTION FAILED"
 
-            # Do something with the text (e.g., print it)
-            pdf_text += f"--- Page {page_number} ---"
-            pdf_text += text
-            pdf_text += "\n"
-        os.remove("downloaded-paper.pdf")
-        time.sleep(2.0)
-        return pdf_text[:MAX_LEN]
+                block = f"--- Page {page_number} ---\n{text}\n"
+                remaining = MAX_LEN - total
+                if remaining <= 0:
+                    break
+                if len(block) > remaining:
+                    chunks.append(block[:remaining])
+                    break
+                chunks.append(block)
+                total += len(block)
+            return "".join(chunks)
+        finally:
+            try:
+                os.remove(tmp_pdf)
+            except Exception:
+                pass
+            time.sleep(2.0)
 
 
 # Set the non-interactive backend early in the module
@@ -310,16 +411,40 @@ def execute_code(code_str, timeout=600, MAX_LEN=1000):
         return "[CODE EXECUTION ERROR] pubmed Download took way too long. Program terminated"
     if "exit(" in code_str:
         return "[CODE EXECUTION ERROR] The exit() command is not allowed you must remove this."
-    output_queue = multiprocessing.Queue()
-    proc = multiprocessing.Process(target=worker_run_code, args=(code_str, output_queue))
-    proc.start()
-    proc.join(timeout)
-    if proc.is_alive():
-        proc.terminate()  # Forcefully kill the process
-        proc.join()
-        return (f"[CODE EXECUTION ERROR]: Code execution exceeded the timeout limit of {timeout} seconds. "
-                "You must reduce the time complexity of your code.")
-    else:
-        if not output_queue.empty(): output = output_queue.get()
-        else: output = ""
+    mp_mode = os.getenv("AGENTLAB_MP_START", "forkserver").strip().lower()
+    try:
+        ctx = multiprocessing.get_context(mp_mode)
+    except Exception:
+        # Safe fallback across platforms.
+        ctx = multiprocessing.get_context("spawn")
+
+    output_queue = ctx.Queue()
+    proc = ctx.Process(target=worker_run_code, args=(code_str, output_queue))
+
+    try:
+        proc.start()
+        proc.join(timeout)
+        if proc.is_alive():
+            proc.terminate()  # Forcefully kill the process
+            proc.join()
+            return (
+                f"[CODE EXECUTION ERROR]: Code execution exceeded the timeout limit of {timeout} seconds. "
+                "You must reduce the time complexity of your code."
+            )
+
+        if not output_queue.empty():
+            output = output_queue.get()
+        else:
+            output = ""
         return output
+    finally:
+        # Best-effort cleanup to avoid leaking resources.
+        try:
+            output_queue.close()
+            output_queue.join_thread()
+        except Exception:
+            pass
+        try:
+            proc.close()
+        except Exception:
+            pass

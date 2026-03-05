@@ -9,6 +9,31 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 
+
+def _resolve_device() -> str:
+    """Resolve device for embedding model.
+
+    Env:
+      - AGENTLAB_DEVICE: "cuda" | "cpu" (preferred)
+      - AGENTLAB_USE_GPU: "1" to prefer CUDA when available
+    """
+    dev = os.getenv("AGENTLAB_DEVICE", "").strip().lower()
+    prefer_gpu = os.getenv("AGENTLAB_USE_GPU", "0").strip() in {"1", "true", "yes"}
+    if dev in {"cuda", "cpu"}:
+        requested = dev
+    else:
+        requested = "cuda" if prefer_gpu else "cpu"
+
+    if requested == "cuda":
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return "cuda"
+        except Exception:
+            pass
+    return "cpu"
+
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your-secret-key'
 app.config['UPLOAD_FOLDER'] = 'uploads/'
@@ -36,11 +61,23 @@ def update_papers_from_uploads():
                         file_path = os.path.join(uploads_dir, filename)
                         extracted_text = ""
                         try:
-                            reader = PdfReader(file_path)
-                            for page in reader.pages:
-                                text = page.extract_text()
-                                if text:
-                                    extracted_text += text
+                                reader = PdfReader(file_path)
+                                max_chars = int(os.getenv("MAX_PDF_CHARS", "200000"))
+                                chunks = []
+                                total = 0
+                                for page in reader.pages:
+                                    text = page.extract_text()
+                                    if text:
+                                        remaining = max_chars - total
+                                        if remaining <= 0:
+                                            break
+                                        if len(text) > remaining:
+                                            chunks.append(text[:remaining])
+                                            total += remaining
+                                            break
+                                        chunks.append(text)
+                                        total += len(text)
+                                extracted_text = "".join(chunks)
                         except Exception as e:
                             flash(f'Error processing {filename}: {e}')
                             continue
@@ -51,6 +88,7 @@ def update_papers_from_uploads():
                         new_paper = Paper(filename=filename, text=extracted_text)
                         db.session.add(new_paper)
             db.session.commit()
+            _invalidate_embedding_cache()
             return
         except Exception as e:
             print("WEB SERVER LOAD EXCEPTION", e, str(e))
@@ -59,7 +97,34 @@ def update_papers_from_uploads():
     #raise Exception("FAILED TO UPDATE")
 
 # Load a pre-trained sentence transformer model
-model = SentenceTransformer('all-MiniLM-L6-v2')
+model = SentenceTransformer('all-MiniLM-L6-v2', device=_resolve_device())
+
+
+# Simple in-process cache to avoid re-encoding all documents on every query.
+_EMB_CACHE = {"paper_ids": None, "embeddings": None}
+
+
+def _invalidate_embedding_cache():
+    _EMB_CACHE["paper_ids"] = None
+    _EMB_CACHE["embeddings"] = None
+
+
+def _get_paper_embeddings(papers):
+    """Return (papers_with_text, embeddings) with caching + bounded batch size."""
+    papers_with_text = [p for p in papers if p.text]
+    paper_ids = tuple(p.id for p in papers_with_text)
+    if _EMB_CACHE["paper_ids"] == paper_ids and _EMB_CACHE["embeddings"] is not None:
+        return papers_with_text, _EMB_CACHE["embeddings"]
+
+    if not papers_with_text:
+        return [], None
+
+    paper_texts = [p.text for p in papers_with_text]
+    batch_size = int(os.getenv("EMB_BATCH", "16"))
+    embeddings = model.encode(paper_texts, batch_size=batch_size, show_progress_bar=False)
+    _EMB_CACHE["paper_ids"] = paper_ids
+    _EMB_CACHE["embeddings"] = embeddings
+    return papers_with_text, embeddings
 
 @app.route('/update', methods=['GET'])
 def update_on_demand():
@@ -89,15 +154,28 @@ def upload():
             extracted_text = ""
             try:
                 reader = PdfReader(file_path)
+                max_chars = int(os.getenv("MAX_PDF_CHARS", "200000"))
+                chunks = []
+                total = 0
                 for page in reader.pages:
                     text = page.extract_text()
                     if text:
-                        extracted_text += text
+                        remaining = max_chars - total
+                        if remaining <= 0:
+                            break
+                        if len(text) > remaining:
+                            chunks.append(text[:remaining])
+                            total += remaining
+                            break
+                        chunks.append(text)
+                        total += len(text)
+                extracted_text = "".join(chunks)
             except Exception as e:
                 flash(f'Error processing PDF: {e}')
             new_paper = Paper(filename=filename, text=extracted_text)
             db.session.add(new_paper)
             db.session.commit()
+            _invalidate_embedding_cache()
             flash('File uploaded and processed successfully!')
             return redirect(url_for('index'))
     return render_template('upload.html')
@@ -108,12 +186,11 @@ def search():
     if query:
         papers = Paper.query.all()
         query_embedding = model.encode([query])
-        paper_texts = [paper.text for paper in papers if paper.text]
-        if not paper_texts:
+        papers_with_text, paper_embeddings = _get_paper_embeddings(papers)
+        if not papers_with_text:
             return render_template('search.html', papers=[], query=query)
-        paper_embeddings = model.encode(paper_texts)
         similarities = cosine_similarity(query_embedding, paper_embeddings)[0]
-        papers_with_scores = list(zip([p for p in papers if p.text], similarities))
+        papers_with_scores = list(zip(papers_with_text, similarities))
         papers_sorted = sorted(papers_with_scores, key=lambda x: x[1], reverse=True)
         return render_template('search.html', papers=papers_sorted, query=query)
     return render_template('search.html', papers=[], query=query)
@@ -127,12 +204,11 @@ def api_search():
     if not papers:
         return jsonify({'query': query, 'results': []})
     query_embedding = model.encode([query])
-    paper_texts = [paper.text for paper in papers if paper.text]
-    if not paper_texts:
+    papers_with_text, paper_embeddings = _get_paper_embeddings(papers)
+    if not papers_with_text:
         return jsonify({'query': query, 'results': []})
-    paper_embeddings = model.encode(paper_texts)
     similarities = cosine_similarity(query_embedding, paper_embeddings)[0]
-    papers_with_scores = list(zip([p for p in papers if p.text], similarities))
+    papers_with_scores = list(zip(papers_with_text, similarities))
     papers_sorted = sorted(papers_with_scores, key=lambda x: x[1], reverse=True)
     results = []
     for paper, score in papers_sorted:

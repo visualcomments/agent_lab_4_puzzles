@@ -91,6 +91,24 @@ sudo apt install pdflatex
 To run Agent Laboratory in copilot mode, simply set the copilot-mode flag in your yaml config to `"true"`
 
 -----
+## Memory & GPU knobs (optional)
+
+If you run into RAM pressure / restarts, the repo supports a few opt-in runtime switches:
+
+- **Hugging Face dataset search mode** (reduces RAM spikes in `HFDataSearch`):
+  - `AGENTLAB_HF_SEARCH_MODE=hub` uses Hugging Face Hub search (no local TF-IDF matrix).
+  - `AGENTLAB_HF_SEARCH_MODE=local` keeps the original TF-IDF approach.
+  - Optional: cap TF-IDF size with `AGENTLAB_HF_TFIDF_MAX_FEATURES=50000`.
+
+- **Multiprocessing start method** (can reduce copy-on-write RSS growth on long runs):
+  - `AGENTLAB_MP_START=forkserver` (default), or `spawn`.
+
+- **Web UI embeddings (if you use `app.py`)**:
+  - `AGENTLAB_DEVICE=cuda` or `AGENTLAB_USE_GPU=1` to place the embedding model on GPU when available.
+  - `EMB_BATCH=16` controls the embedding batch size.
+  - `MAX_PDF_CHARS=200000` caps extracted PDF text length per document.
+
+-----
 ## Tips for better research outcomes
 
 
