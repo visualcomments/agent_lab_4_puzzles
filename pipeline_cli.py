@@ -73,6 +73,46 @@ def _stage_done(title: str, t0: float) -> None:
     print(f"[done] {title}  ({dt:.2f}s)", flush=True)
 
 
+def _gpu_diag_hint(selected_models: str) -> None:
+    """Print a short diagnostic about GPU usage.
+
+    Why this exists:
+    - Many users expect that selecting a remote model name (e.g. GPT-4 via g4f) uses the local GPU.
+      It does not: those requests go to provider endpoints.
+    - GPU is only used when running *local* compute (e.g., Transformers local inference) inside this runtime.
+    """
+    dev = (os.getenv("AGENTLAB_DEVICE") or "").strip()
+    use_gpu = (os.getenv("AGENTLAB_USE_GPU") or "").strip().lower() in {"1", "true", "yes", "on"}
+    if not dev and not use_gpu:
+        return
+
+    models = [m.strip() for m in (selected_models or "").split(",") if m.strip()]
+    has_local = any(m.startswith("local:") for m in models)
+
+    # Torch/CUDA availability (best effort)
+    try:
+        import torch  # type: ignore
+
+        cuda_ok = bool(torch.cuda.is_available())
+        n = int(torch.cuda.device_count()) if cuda_ok else 0
+        msg = f"[gpu] requested via env (AGENTLAB_DEVICE/AGENTLAB_USE_GPU). torch={getattr(torch,'__version__','?')} cuda={cuda_ok} devices={n}"
+        if cuda_ok and n > 0:
+            try:
+                msg += f" name={torch.cuda.get_device_name(0)}"
+            except Exception:
+                pass
+        print(msg)
+    except Exception:
+        print("[gpu] requested via env, but torch is not available in this environment.")
+
+    if not has_local:
+        print(
+            "[gpu] NOTE: your --models list contains no 'local:*' models. "
+            "g4f/OpenAI/Claude/Gemini backends run remotely, so local GPU memory will stay near 0. "
+            "If you want to actually use GPU, pass e.g. --models 'local:Qwen/Qwen2.5-0.5B-Instruct' (and ensure torch+transformers are installed)."
+        )
+
+
 def _resolve_default_puzzles(spec: PipelineSpec) -> Path:
     """If --puzzles is omitted, try to locate a bundled test.csv.
 
@@ -827,6 +867,8 @@ def cmd_generate_solver(args: argparse.Namespace) -> None:
         _validate_solver(out_path, spec.validator, spec.smoke_vector or [0, 1])
         return
 
+    _gpu_diag_hint(args.models)
+
     _run_agent_laboratory(
         prompt_file=prompt_file,
         out_path=out_path,
@@ -965,6 +1007,9 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     generated_dir = ROOT / "generated"
     generated_dir.mkdir(exist_ok=True)
+
+    # Helpful UX: explain when GPU will/won't be used.
+    _gpu_diag_hint(args.models)
 
     puzzles_csv = Path(args.puzzles) if args.puzzles else _resolve_default_puzzles(spec)
     out_csv = Path(args.output)
@@ -1213,7 +1258,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--out", required=True, help="Output path for generated solver")
     sp.add_argument("--prompt-file", default=None, help="Override user prompt file")
     sp.add_argument("--custom-prompts", default=None, help="Override AgentLaboratory custom prompts JSON")
-    sp.add_argument("--models", dest="models", default="gpt-4o-mini", help="Comma-separated g4f model list (passed to AgentLaboratory --models)")
+    sp.add_argument(
+        "--models",
+        dest="models",
+        default="gpt-4o-mini",
+        help=(
+            "Comma-separated model list (passed to AgentLaboratory --models). "
+            "Bare names use g4f backend (remote providers). "
+            "To use local GPU inference, pass items like 'local:<hf_model_id>'."
+        ),
+    )
     sp.add_argument("--llm", dest="models", default=None, help=argparse.SUPPRESS)
     sp.add_argument("--max-iters", type=int, default=8)
     sp.add_argument("--allow-baseline", action="store_true")
@@ -1249,7 +1303,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--output", required=True, help="Submission CSV output")
     sp.add_argument("--prompt-file", default=None, help="Override user prompt file")
     sp.add_argument("--custom-prompts", default=None, help="Override custom prompts JSON")
-    sp.add_argument("--models", dest="models", default="gpt-4o-mini", help="Comma-separated g4f model list (passed to AgentLaboratory --models)")
+    sp.add_argument(
+        "--models",
+        dest="models",
+        default="gpt-4o-mini",
+        help=(
+            "Comma-separated model list (passed to AgentLaboratory --models). "
+            "Bare names use g4f backend (remote providers). "
+            "To use local GPU inference, pass items like 'local:<hf_model_id>'."
+        ),
+    )
     sp.add_argument("--llm", dest="models", default=None, help=argparse.SUPPRESS)
     sp.add_argument("--max-iters", type=int, default=8)
     sp.add_argument("--allow-baseline", action="store_true")

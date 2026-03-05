@@ -2,6 +2,129 @@ import time
 import os
 import json
 
+# ------------------------------
+# Optional local (on-device) LLM
+# ------------------------------
+#
+# By default this repo uses g4f (provider endpoints) or API-backed models.
+# Those calls run remotely and will not use your local GPU.
+#
+# If you want *local* inference that can use CUDA, pass model strings like:
+#   local:Qwen/Qwen2.5-0.5B-Instruct
+#
+# This backend is intentionally lightweight and only activates when requested.
+
+_LOCAL_LM_CACHE = {}
+
+
+def _get_agentlab_device() -> str:
+    """Resolve the intended compute device for local inference."""
+    dev = (os.getenv("AGENTLAB_DEVICE") or "").strip()
+    if dev:
+        return dev
+    use_gpu = (os.getenv("AGENTLAB_USE_GPU") or "").strip()
+    if use_gpu.lower() in {"1", "true", "yes", "on"}:
+        try:
+            import torch  # type: ignore
+
+            if torch.cuda.is_available():
+                return "cuda"
+        except Exception:
+            pass
+    return "cpu"
+
+
+def _local_transformers_load(model_id: str):
+    """Load and cache a HF Transformers CausalLM model (lazy import)."""
+    key = (model_id, _get_agentlab_device())
+    if key in _LOCAL_LM_CACHE:
+        return _LOCAL_LM_CACHE[key]
+
+    try:
+        import torch  # type: ignore
+        from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore
+    except Exception as e:
+        raise ImportError(
+            "Local inference requires 'torch' and 'transformers'. "
+            "Install AgentLaboratory/requirements.txt (or at least torch+transformers+accelerate)."
+        ) from e
+
+    device = _get_agentlab_device()
+
+    tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+
+    # Use fp16 on CUDA when possible to reduce VRAM/RAM pressure.
+    torch_dtype = None
+    if device.startswith("cuda"):
+        torch_dtype = getattr(torch, "float16", None)
+
+    model_kwargs = {}
+    if torch_dtype is not None:
+        model_kwargs["torch_dtype"] = torch_dtype
+    if device.startswith("cuda"):
+        # Requires accelerate (included in AgentLaboratory requirements)
+        model_kwargs["device_map"] = "auto"
+
+    model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
+    model.eval()
+
+    _LOCAL_LM_CACHE[key] = (tok, model)
+    return tok, model
+
+
+def _local_transformers_chat(model_id: str, prompt: str, system_prompt: str, temp=None, timeout: float = 20.0) -> str:
+    """Run a small local chat completion with Transformers."""
+
+    tok, model = _local_transformers_load(model_id)
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt},
+    ]
+
+    if hasattr(tok, "apply_chat_template"):
+        text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    else:
+        text = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{prompt}\n\nASSISTANT:\n"
+
+    max_new_tokens = int(os.getenv("AGENTLAB_LOCAL_MAX_NEW_TOKENS", "768"))
+    temperature = float(os.getenv("AGENTLAB_LOCAL_TEMPERATURE", str(temp if temp is not None else 0.2)))
+
+    try:
+        import torch  # type: ignore
+
+        inputs = tok(text, return_tensors="pt")
+        # With device_map="auto", model spans devices; push inputs to the first param device.
+        try:
+            first_param = next(model.parameters())
+            inputs = {k: v.to(first_param.device) for k, v in inputs.items()}
+        except Exception:
+            pass
+
+        with torch.inference_mode():
+            out = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=(temperature > 0.0),
+                temperature=temperature,
+                pad_token_id=getattr(tok, "eos_token_id", None),
+                eos_token_id=getattr(tok, "eos_token_id", None),
+            )
+
+        gen = out[0]
+        prompt_len = inputs["input_ids"].shape[-1]
+        answer = tok.decode(gen[prompt_len:], skip_special_tokens=True).strip()
+        return answer
+    finally:
+        # Best-effort: free cached blocks (won't hurt on CPU).
+        try:
+            import torch  # type: ignore
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
 # Optional dependencies: keep g4f-only usage lightweight.
 try:
     import openai  # type: ignore
@@ -153,6 +276,14 @@ def query_model(
         if last_err is not None:
             raise last_err
         raise Exception("No model produced an answer (fallback list empty or all failed).")
+
+    # --- Local transformers backend ---
+    # Use: local:<hf_model_id>
+    if isinstance(model_str, str) and model_str.startswith("local:"):
+        model_id = model_str.split(":", 1)[1].strip() or os.getenv(
+            "AGENTLAB_LOCAL_MODEL", "Qwen/Qwen2.5-0.5B-Instruct"
+        )
+        return _local_transformers_chat(model_id, prompt, system_prompt, temp=temp, timeout=timeout)
 
     # If prefixed with 'g4f:' we force GPT4Free backend (no API key needed)
     force_g4f = isinstance(model_str, str) and model_str.startswith("g4f:")

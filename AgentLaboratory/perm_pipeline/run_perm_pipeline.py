@@ -48,7 +48,20 @@ def read_user_prompt(args) -> str:
     return args.user_prompt
 
 def make_model_fallback(models: List[str]) -> str:
-    return "|".join([f"g4f:{m.strip()}" for m in models if m.strip()])
+    # By default we treat bare model names as g4f:*.
+    # Advanced: allow explicit backends like:
+    #   local:<hf_model_id>
+    #   g4f:<model>
+    items: List[str] = []
+    for m in models:
+        s = (m or "").strip()
+        if not s:
+            continue
+        if ":" in s:
+            items.append(s)
+        else:
+            items.append(f"g4f:{s}")
+    return "|".join(items)
 
 def extract_python(resp: str) -> Optional[str]:
     m = RE_PY_BLOCK.search(resp or "")
@@ -66,8 +79,14 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--user-prompt", default="", help="User prompt (inline string).")
     p.add_argument("--user-prompt-file", default=None, help="Path to a text file with the user prompt.")
-    p.add_argument("--models", default=os.getenv("G4F_MODELS","").strip() or "gpt-4o-mini,command-r,aria",
-                   help="Comma-separated g4f model names. Tried in order.")
+    p.add_argument(
+        "--models",
+        default=os.getenv("G4F_MODELS", "").strip() or "gpt-4o-mini,command-r,aria",
+        help=(
+            "Comma-separated model list. Bare names use g4f backend (remote providers). "
+            "You can also pass explicit backends like local:<hf_model_id> to run Transformers locally (CUDA-supported)."
+        ),
+    )
     p.add_argument("--custom-prompts", default=None, help="Path to JSON overriding default system prompts.")
     p.add_argument("--out", default=str(Path.cwd() / "generated" / "solve_module.py"), help="Where to write the final solver.")
     p.add_argument("--max-iters", type=int, default=4, help="Max repair iterations.")
