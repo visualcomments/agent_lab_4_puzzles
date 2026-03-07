@@ -36,7 +36,7 @@ except Exception:  # pragma: no cover - tqdm is in requirements, this is just a 
 THIS_DIR = Path(__file__).resolve().parent
 AGENTLAB_ROOT = THIS_DIR.parent
 sys.path.insert(0, str(AGENTLAB_ROOT))
-from inference import query_model, MissingLLMCredentials  # type: ignore
+from inference import query_model, MissingLLMCredentials, _best_effort_release_memory  # type: ignore
 
 RE_PY_BLOCK = re.compile(r"```python\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 RE_ANY_BLOCK = re.compile(r"```(?:[a-zA-Z0-9_+-]+)?\s*(.*?)```", re.DOTALL)
@@ -143,6 +143,40 @@ def extract_python(resp: str) -> Optional[str]:
     if any(token in text for token in ("def solve", "import ", "from __future__", "if __name__")):
         return text
     return None
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)) or str(default))
+    except Exception:
+        return default
+
+
+
+def _clip_middle(text: str, max_chars: int) -> str:
+    marker = "\n...<trimmed>...\n"
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    keep_head = max_chars // 2
+    keep_tail = max_chars - keep_head - len(marker)
+    if keep_tail < 0:
+        keep_tail = 0
+    return text[:keep_head] + marker + text[-keep_tail:]
+
+
+def _effective_max_iters(requested: int, models: Sequence[str]) -> int:
+    allow_huge = os.getenv("AGENTLAB_ALLOW_HUGE_MAX_ITERS", "").strip().lower() in {"1", "true", "yes", "on"}
+    soft_cap = _env_int("AGENTLAB_REMOTE_MAX_ITERS_CAP", 128)
+    has_local = any(m.startswith("local:") for m in models)
+    if allow_huge or has_local or soft_cap <= 0 or requested <= soft_cap:
+        return requested
+    log_status(
+        f"[memory] Remote backends can slowly bloat notebook RAM on very large repair loops; capping --max-iters from {requested} to {soft_cap}. "
+        "Set AGENTLAB_ALLOW_HUGE_MAX_ITERS=1 or AGENTLAB_REMOTE_MAX_ITERS_CAP=0 to disable this guard.",
+        error=True,
+    )
+    return soft_cap
+
 
 
 def compile_python(code: str) -> Tuple[bool, str]:
@@ -259,6 +293,30 @@ if __name__ == \"__main__\":
 """
 
 
+def log_status(message: str, *, error: bool = False) -> None:
+    stream = sys.stderr if error else sys.stdout
+    if tqdm is not None:
+        tqdm.write(message, file=stream)
+    else:
+        print(message, file=stream)
+
+
+
+def _make_model_progress(total_models: int):
+    if total_models <= 0 or tqdm is None:
+        return None
+    return tqdm(
+        total=total_models,
+        desc="models",
+        unit="model",
+        dynamic_ncols=True,
+        leave=True,
+        position=0,
+        file=sys.stderr,
+    )
+
+
+
 def _make_iteration_progress(model: str, max_iters: int):
     if max_iters <= 0 or tqdm is None:
         return None
@@ -267,7 +325,8 @@ def _make_iteration_progress(model: str, max_iters: int):
         desc=f"fix {model}",
         unit="iter",
         dynamic_ncols=True,
-        leave=True,
+        leave=False,
+        position=1,
         file=sys.stderr,
     )
 
@@ -305,6 +364,9 @@ def try_generate_with_model(
         if valid:
             return True, f"{model}: coder output validated immediately"
 
+    max_code_chars = _env_int("AGENTLAB_MAX_CODE_PROMPT_CHARS", 24000)
+    max_report_chars = _env_int("AGENTLAB_MAX_FAILURE_REPORT_CHARS", 12000)
+
     current_code = code
     progress = _make_iteration_progress(model, max_iters)
     if progress is not None:
@@ -317,8 +379,8 @@ def try_generate_with_model(
 
             fix_prompt = (
                 f"USER TASK:\n{user_prompt}\n\n"
-                f"CURRENT CODE:\n```python\n{current_code}\n```\n\n"
-                f"FAILURE REPORT:\n{last_report}\n\n"
+                f"CURRENT CODE:\n```python\n{_clip_middle(current_code, max_code_chars)}\n```\n\n"
+                f"FAILURE REPORT:\n{_clip_middle(last_report, max_report_chars)}\n\n"
                 "Return a corrected full python file."
             )
             try:
@@ -339,17 +401,20 @@ def try_generate_with_model(
 
             if not ok:
                 last_report = f"Fix iteration {it} compile check failed.\n{compile_err}\n"
+                _best_effort_release_memory(clear_local_cache=False)
                 continue
 
             out_path.write_text(current_code, encoding="utf-8")
             valid, last_report = validate_solver_suite(validator_path, out_path, tests)
+            _best_effort_release_memory(clear_local_cache=False)
             if valid:
                 return True, f"{model}: validated after fixer iteration {it}"
     finally:
         if progress is not None:
             progress.close()
+        _best_effort_release_memory(clear_local_cache=False)
 
-    return False, f"{model}: failed validation after {max_iters} fixer iterations\n{last_report}"
+    return False, f"{model}: failed validation after {max_iters} fixer iterations\n{_clip_middle(last_report, max_report_chars)}"
 
 
 def main() -> None:
@@ -382,15 +447,16 @@ def main() -> None:
 
     user_prompt = read_user_prompt(args).strip()
     if not user_prompt:
-        print("[!] Empty user prompt. Provide --user-prompt or --user-prompt-file.", file=sys.stderr)
+        log_status("[!] Empty user prompt. Provide --user-prompt or --user-prompt-file.", error=True)
         sys.exit(2)
 
     prompts = load_prompts(args.custom_prompts)
     models = parse_models(args.models)
     if not models and not args.no_llm:
-        print("[!] No models configured. Pass --models or set G4F_MODELS.", file=sys.stderr)
+        log_status("[!] No models configured. Pass --models or set G4F_MODELS.", error=True)
         sys.exit(2)
     ordered_models = order_models_for_codegen(models)
+    args.max_iters = _effective_max_iters(args.max_iters, ordered_models)
 
     out_path = Path(args.out).resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -404,23 +470,23 @@ def main() -> None:
 
     if args.no_llm:
         out_path.write_text(baseline_code, encoding="utf-8")
-        print(f"[+] Wrote baseline solver to {out_path}")
+        log_status(f"[+] Wrote baseline solver to {out_path}")
         sys.exit(0)
 
     def _fallback_to_baseline(reason: str) -> None:
-        print(f"[!] {reason}", file=sys.stderr)
+        log_status(f"[!] {reason}", error=True)
         if args.strict:
             sys.exit(1)
         out_path.write_text(baseline_code, encoding="utf-8")
-        print("[!] Falling back to the offline baseline solver.", file=sys.stderr)
-        print(f"[+] Wrote baseline solver to {out_path}")
+        log_status("[!] Falling back to the offline baseline solver.", error=True)
+        log_status(f"[+] Wrote baseline solver to {out_path}")
         sys.exit(0)
 
     try:
         plan, planner_model = ask_first_nonempty(ordered_models, user_prompt, prompts["planner"])
         if not plan:
             plan = "(planner failed; proceeding without planner notes)"
-        print(f"[planner] selected model: {planner_model or 'none'}")
+        log_status(f"[planner] selected model: {planner_model or 'none'}")
     except MissingLLMCredentials as e:
         _fallback_to_baseline(
             "g4f provider requires credentials (api_key or .har). "
@@ -438,22 +504,35 @@ def main() -> None:
         [10, -1, 7, 3, 5],
     ]
 
-    for model in ordered_models:
-        print(f"[coder] trying model: {model}")
-        ok, report = try_generate_with_model(
-            model=model,
-            user_prompt=user_prompt,
-            plan=plan,
-            prompts=prompts,
-            out_path=out_path,
-            validator_path=validator_path,
-            tests=tests,
-            max_iters=args.max_iters,
-        )
-        if ok:
-            print(f"[+] {report}. Saved to {out_path}")
-            sys.exit(0)
-        print(f"[coder] {report}")
+
+    model_progress = _make_model_progress(len(ordered_models))
+    if model_progress is not None:
+        model_progress.set_postfix_str(f"model 0/{len(ordered_models)}")
+
+    try:
+        for idx, model in enumerate(ordered_models, start=1):
+            if model_progress is not None:
+                model_progress.set_postfix_str(f"model {idx}/{len(ordered_models)}: {model}")
+            log_status(f"[coder] trying model: {model}")
+            ok, report = try_generate_with_model(
+                model=model,
+                user_prompt=user_prompt,
+                plan=plan,
+                prompts=prompts,
+                out_path=out_path,
+                validator_path=validator_path,
+                tests=tests,
+                max_iters=args.max_iters,
+            )
+            if model_progress is not None:
+                model_progress.update(1)
+            if ok:
+                log_status(f"[+] {report}. Saved to {out_path}")
+                sys.exit(0)
+            log_status(f"[coder] {report}")
+    finally:
+        if model_progress is not None:
+            model_progress.close()
 
     _fallback_to_baseline("Failed to generate a locally validated solver with the configured models.")
 

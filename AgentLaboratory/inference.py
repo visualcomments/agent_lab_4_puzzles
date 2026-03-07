@@ -1,6 +1,12 @@
 import time
 import os
 import json
+import gc
+
+try:
+    import ctypes
+except Exception:
+    ctypes = None  # type: ignore
 
 # ------------------------------
 # Optional local (on-device) LLM
@@ -15,6 +21,43 @@ import json
 # This backend is intentionally lightweight and only activates when requested.
 
 _LOCAL_LM_CACHE = {}
+
+
+def _best_effort_release_memory(clear_local_cache: bool = False) -> None:
+    """Best-effort RAM/VRAM cleanup for long-running notebook/Colab sessions."""
+    if clear_local_cache:
+        try:
+            _LOCAL_LM_CACHE.clear()
+        except Exception:
+            pass
+
+    try:
+        gc.collect()
+    except Exception:
+        pass
+
+    try:
+        import torch  # type: ignore
+
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if ctypes is not None:
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+            if hasattr(libc, "malloc_trim"):
+                libc.malloc_trim(0)
+        except Exception:
+            pass
 
 
 def _get_agentlab_device() -> str:
@@ -58,7 +101,7 @@ def _local_transformers_load(model_id: str):
     if device.startswith("cuda"):
         torch_dtype = getattr(torch, "float16", None)
 
-    model_kwargs = {}
+    model_kwargs = {"low_cpu_mem_usage": True}
     if torch_dtype is not None:
         model_kwargs["torch_dtype"] = torch_dtype
     if device.startswith("cuda"):
@@ -90,6 +133,10 @@ def _local_transformers_chat(model_id: str, prompt: str, system_prompt: str, tem
     max_new_tokens = int(os.getenv("AGENTLAB_LOCAL_MAX_NEW_TOKENS", "768"))
     temperature = float(os.getenv("AGENTLAB_LOCAL_TEMPERATURE", str(temp if temp is not None else 0.2)))
 
+    inputs = None
+    out = None
+    gen = None
+    answer = ""
     try:
         import torch  # type: ignore
 
@@ -116,14 +163,8 @@ def _local_transformers_chat(model_id: str, prompt: str, system_prompt: str, tem
         answer = tok.decode(gen[prompt_len:], skip_special_tokens=True).strip()
         return answer
     finally:
-        # Best-effort: free cached blocks (won't hurt on CPU).
-        try:
-            import torch  # type: ignore
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+        del inputs, out, gen, messages, text, answer
+        _best_effort_release_memory(clear_local_cache=False)
 
 # Optional dependencies: keep g4f-only usage lightweight.
 try:
@@ -352,6 +393,7 @@ def query_model(
                 if isinstance(answer, str):
                     answer = answer.strip()
                 if answer:
+                    _best_effort_release_memory(clear_local_cache=False)
                     return answer
 
             if model_str == "gpt-4o-mini" or model_str == "gpt4omini" or model_str == "gpt-4omini" or model_str == "gpt4o-mini":
@@ -518,6 +560,7 @@ def query_model(
                     print(f"Current experiment cost = ${curr_cost_est()}, ** Approximate values, may not reflect true cost")
             except Exception as e:
                 if print_cost: print(f"Cost approximation has an error? {e}")
+            _best_effort_release_memory(clear_local_cache=False)
             return answer
         except Exception as e:
             # Fail fast on missing credentials (common with g4f providers that need api_key or .har)
@@ -537,6 +580,7 @@ def query_model(
                 backoff = 1.0
             time.sleep(backoff)
             continue
+    _best_effort_release_memory(clear_local_cache=False)
     raise Exception("Max retries: timeout")
 
 
