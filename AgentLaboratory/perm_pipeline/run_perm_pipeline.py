@@ -27,6 +27,11 @@ import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - tqdm is in requirements, this is just a safe fallback
+    tqdm = None  # type: ignore
+
 # Import AgentLaboratory inference (patched to support g4f:)
 THIS_DIR = Path(__file__).resolve().parent
 AGENTLAB_ROOT = THIS_DIR.parent
@@ -254,6 +259,19 @@ if __name__ == \"__main__\":
 """
 
 
+def _make_iteration_progress(model: str, max_iters: int):
+    if max_iters <= 0 or tqdm is None:
+        return None
+    return tqdm(
+        total=max_iters,
+        desc=f"fix {model}",
+        unit="iter",
+        dynamic_ncols=True,
+        leave=True,
+        file=sys.stderr,
+    )
+
+
 def try_generate_with_model(
     *,
     model: str,
@@ -288,34 +306,48 @@ def try_generate_with_model(
             return True, f"{model}: coder output validated immediately"
 
     current_code = code
-    for it in range(1, max_iters + 1):
-        fix_prompt = (
-            f"USER TASK:\n{user_prompt}\n\n"
-            f"CURRENT CODE:\n```python\n{current_code}\n```\n\n"
-            f"FAILURE REPORT:\n{last_report}\n\n"
-            "Return a corrected full python file."
-        )
-        try:
-            resp = query_model(model, fix_prompt, prompts["fixer"])
-        except MissingLLMCredentials as e:
-            return False, f"{model}: fixer credentials required ({e})"
-        except Exception as e:
-            return False, f"{model}: fixer failed ({e})"
+    progress = _make_iteration_progress(model, max_iters)
+    if progress is not None:
+        progress.set_postfix_str(f"iter 0/{max_iters}")
 
-        new_code = extract_python(resp or "")
-        if not new_code:
-            return False, f"{model}: fixer iteration {it} returned no python file"
+    try:
+        for it in range(1, max_iters + 1):
+            if progress is not None:
+                progress.set_postfix_str(f"iter {it}/{max_iters}")
 
-        ok, compile_err = compile_python(new_code)
-        current_code = new_code
-        if not ok:
-            last_report = f"Fix iteration {it} compile check failed.\n{compile_err}\n"
-            continue
+            fix_prompt = (
+                f"USER TASK:\n{user_prompt}\n\n"
+                f"CURRENT CODE:\n```python\n{current_code}\n```\n\n"
+                f"FAILURE REPORT:\n{last_report}\n\n"
+                "Return a corrected full python file."
+            )
+            try:
+                resp = query_model(model, fix_prompt, prompts["fixer"])
+            except MissingLLMCredentials as e:
+                return False, f"{model}: fixer credentials required ({e})"
+            except Exception as e:
+                return False, f"{model}: fixer failed ({e})"
 
-        out_path.write_text(current_code, encoding="utf-8")
-        valid, last_report = validate_solver_suite(validator_path, out_path, tests)
-        if valid:
-            return True, f"{model}: validated after fixer iteration {it}"
+            new_code = extract_python(resp or "")
+            if not new_code:
+                return False, f"{model}: fixer iteration {it} returned no python file"
+
+            ok, compile_err = compile_python(new_code)
+            current_code = new_code
+            if progress is not None:
+                progress.update(1)
+
+            if not ok:
+                last_report = f"Fix iteration {it} compile check failed.\n{compile_err}\n"
+                continue
+
+            out_path.write_text(current_code, encoding="utf-8")
+            valid, last_report = validate_solver_suite(validator_path, out_path, tests)
+            if valid:
+                return True, f"{model}: validated after fixer iteration {it}"
+    finally:
+        if progress is not None:
+            progress.close()
 
     return False, f"{model}: failed validation after {max_iters} fixer iterations\n{last_report}"
 
