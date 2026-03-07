@@ -123,3 +123,71 @@ def download_leaderboard(api, competition: str, path: str = ".", **kwargs) -> st
     os.makedirs(path, exist_ok=True)
     api.competition_leaderboard_download(competition, path=path)
     return os.path.join(path, "leaderboard.csv")
+
+
+def _submission_to_dict(s) -> dict:
+    d = {}
+    for k in dir(s):
+        if k.startswith('_'):
+            continue
+        try:
+            v = getattr(s, k)
+        except Exception:
+            continue
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            d[k] = v
+    alias_pairs = {
+        'publicScore': 'public_score',
+        'privateScore': 'private_score',
+        'errorDescription': 'error_description',
+        'errorDescriptionNullable': 'error_description',
+        'date': 'date',
+        'description': 'description',
+        'status': 'status',
+        'state': 'state',
+        'ref': 'ref',
+    }
+    for src, dst in alias_pairs.items():
+        if src in d and dst not in d:
+            d[dst] = d[src]
+    return d
+
+
+def latest_submission(api, competition: str) -> Optional[dict]:
+    try:
+        subs = list_submissions(api, competition) or []
+    except Exception:
+        return None
+    if not subs:
+        return None
+    return _submission_to_dict(subs[0])
+
+
+def wait_for_submission_result(api, competition: str, target_ref: str | int | None = None, wait_seconds: int = 45, poll_every: float = 3.0) -> Optional[dict]:
+    """Best-effort wait for the latest submission to get a score or an error.
+
+    Kaggle usually accepts the file immediately, then evaluates it asynchronously.
+    Polling recent submissions helps surface format/scoring errors that explain why
+    a submission does not appear on the leaderboard.
+    """
+    import time
+
+    deadline = time.time() + max(0, wait_seconds)
+    target_ref = str(target_ref) if target_ref is not None else None
+
+    last_seen = None
+    while True:
+        sub = latest_submission(api, competition)
+        if sub:
+            sid = sub.get('id') or sub.get('ref')
+            sid_str = str(sid) if sid is not None else None
+            if target_ref is None or sid_str == target_ref:
+                last_seen = sub
+                status = (sub.get('status') or sub.get('state') or '').lower()
+                has_score = (sub.get('public_score') not in (None, '', 'None')) or (sub.get('private_score') not in (None, '', 'None'))
+                has_error = sub.get('error_description') not in (None, '', 'None')
+                if has_score or has_error or status in {'complete', 'error', 'failed'}:
+                    return sub
+        if time.time() >= deadline:
+            return last_seen
+        time.sleep(max(0.5, poll_every))

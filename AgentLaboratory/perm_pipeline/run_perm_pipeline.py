@@ -256,9 +256,12 @@ def _clip_middle(text: str, max_chars: int) -> str:
 def _effective_max_iters(requested: int, models: Sequence[str]) -> int:
     if requested <= 0:
         return requested
+    # Unlimited by default: respect the user's --max-iters as-is.
+    # A positive AGENTLAB_REMOTE_MAX_ITERS_CAP can still be used as an optional,
+    # explicit safety cap for remote backends.
     if _is_truthy(os.getenv('AGENTLAB_ALLOW_HUGE_MAX_ITERS')):
         return requested
-    cap = _env_int('AGENTLAB_REMOTE_MAX_ITERS_CAP', 128)
+    cap = _env_int('AGENTLAB_REMOTE_MAX_ITERS_CAP', 0)
     if cap <= 0:
         return requested
     if any(_is_remote_model(model) for model in models):
@@ -562,8 +565,8 @@ def main() -> None:
 
     if args.max_iters != requested_max_iters:
         log_status(
-            f"[memory] Remote backends can slowly bloat notebook RAM on very large repair loops; capping --max-iters from {requested_max_iters} to {args.max_iters}. "
-            'Disable the cap with AGENTLAB_ALLOW_HUGE_MAX_ITERS=1 or AGENTLAB_REMOTE_MAX_ITERS_CAP=0.'
+            f"[memory] Applying explicit AGENTLAB_REMOTE_MAX_ITERS_CAP to remote repair loop: --max-iters {requested_max_iters} -> {args.max_iters}. "
+            'Set AGENTLAB_ALLOW_HUGE_MAX_ITERS=1 or AGENTLAB_REMOTE_MAX_ITERS_CAP=0 to disable this optional cap.'
         )
 
     if args.no_llm:

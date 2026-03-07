@@ -34,9 +34,12 @@ def test_rank_models_prefers_stronger_code_models():
     assert ranked[0] == 'g4f:gpt-4o-mini'
 
 
-def test_effective_max_iters_can_be_disabled_with_env(monkeypatch):
+def test_effective_max_iters_is_unlimited_by_default_and_optional_cap_can_be_enabled(monkeypatch):
     monkeypatch.delenv('AGENTLAB_ALLOW_HUGE_MAX_ITERS', raising=False)
     monkeypatch.delenv('AGENTLAB_REMOTE_MAX_ITERS_CAP', raising=False)
+    assert rpp._effective_max_iters(1000, ['g4f:gpt-4']) == 1000
+
+    monkeypatch.setenv('AGENTLAB_REMOTE_MAX_ITERS_CAP', '128')
     assert rpp._effective_max_iters(1000, ['g4f:gpt-4']) == 128
 
     monkeypatch.setenv('AGENTLAB_ALLOW_HUGE_MAX_ITERS', '1')

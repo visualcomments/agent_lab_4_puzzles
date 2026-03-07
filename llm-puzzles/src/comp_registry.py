@@ -125,41 +125,43 @@ REGISTRY: Dict[str, CompConfig] = {
     "cayleypy-transposons": FORMAT_INITIAL_STATE_ID_PATH,
     "cayleypy-glushkov": FORMAT_INITIAL_STATE_ID_PATH,
 
-    # Pancake has id/permutation/solution schema (same family as RapaportM2).
+    # Current Kaggle competition pages for Pancake / Glushkov / RapaportM2
+    # describe the submission file as initial_state_id + path, while the
+    # downloaded test.csv still uses `id` as the puzzle identifier. So we keep
+    # reading `id` from test.csv, but write it under `initial_state_id` in the
+    # submission file.
     "CayleyPy-pancake": CompConfig(
         slug="CayleyPy-pancake",
-        submission_headers=["id", "permutation", "solution"],
-        header_keys=["id", "permutation", "moves"],
+        submission_headers=["initial_state_id", "path"],
+        header_keys=["id", "moves"],
         puzzles_id_field="id",
-        moves_key="solution",
+        moves_key="path",
         move_joiner=".",
     ),
     "cayleypy-pancake": CompConfig(
         slug="cayleypy-pancake",
-        submission_headers=["id", "permutation", "solution"],
-        header_keys=["id", "permutation", "moves"],
+        submission_headers=["initial_state_id", "path"],
+        header_keys=["id", "moves"],
         puzzles_id_field="id",
-        moves_key="solution",
+        moves_key="path",
         move_joiner=".",
     ),
 
-    # Glushkov also uses id/permutation/solution.
     "cayleypy-glushkov": CompConfig(
         slug="cayleypy-glushkov",
-        submission_headers=["id", "permutation", "solution"],
-        header_keys=["id", "permutation", "moves"],
+        submission_headers=["initial_state_id", "path"],
+        header_keys=["id", "moves"],
         puzzles_id_field="id",
-        moves_key="solution",
+        moves_key="path",
         move_joiner=".",
     ),
 
-    # RapaportM2 has a different submission schema (echoes the permutation)
     "cayleypy-rapapport-m2": CompConfig(
         slug="cayleypy-rapapport-m2",
-        submission_headers=["id", "permutation", "solution"],
-        header_keys=["id", "permutation", "moves"],
+        submission_headers=["initial_state_id", "path"],
+        header_keys=["id", "moves"],
         puzzles_id_field="id",
-        moves_key="solution",
+        moves_key="path",
         move_joiner=".",
     ),
 }

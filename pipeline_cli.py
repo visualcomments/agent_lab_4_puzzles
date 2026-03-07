@@ -433,18 +433,12 @@ def _kaggle_submit(
     if submit_via in {'auto', 'api'}:
         try:
             _ensure_llm_puzzles_on_path()
-            from src.kaggle_utils import ensure_auth, submit_file, latest_scored_submission
+            from src.kaggle_utils import ensure_auth, submit_file
 
             api = ensure_auth(kaggle_json_path=kaggle_json, config_dir=kaggle_config_dir)
             print(f"[kaggle] submitting via API: competition={competition} file={submission_csv}", flush=True)
             submit_file(api, competition=competition, filepath=str(submission_csv), message=message)
-
-            scored = latest_scored_submission(api, competition)
-            if scored:
-                ps = scored.get('public_score')
-                prs = scored.get('private_score')
-                sid = scored.get('id') or scored.get('ref')
-                print(f"[kaggle] latest scored submission: id={sid} public={ps} private={prs}", flush=True)
+            _poll_kaggle_submission_status(competition, kaggle_json, kaggle_config_dir)
             return
         except Exception as e:
             if submit_via == 'api':
@@ -461,9 +455,26 @@ def _kaggle_submit(
         except Exception as e:
             print(f"[kaggle] could not prepare kaggle.json for CLI: {e}", flush=True)
 
-    cmd = ['kaggle', 'competitions', 'submit', '-c', competition, '-f', str(submission_csv), '-m', message]
-    print('[kaggle] ' + ' '.join(cmd), flush=True)
-    subprocess.check_call(cmd, env=env)
+    # Prefer the current official CLI syntax first; retry the legacy `-c` form
+    # for environments that still ship the older kaggle package/CLI wrapper.
+    cli_attempts = [
+        _preferred_kaggle_cli_submit_cmd(competition, submission_csv, message),
+        _legacy_kaggle_cli_submit_cmd(competition, submission_csv, message),
+    ]
+    last_error: Exception | None = None
+    for idx, cmd in enumerate(cli_attempts, 1):
+        print('[kaggle] ' + ' '.join(cmd), flush=True)
+        try:
+            subprocess.check_call(cmd, env=env)
+            _poll_kaggle_submission_status(competition, kaggle_json, kaggle_config_dir)
+            return
+        except Exception as e:
+            last_error = e
+            if idx == len(cli_attempts):
+                break
+            print(f"[kaggle] CLI submit attempt {idx} failed, retrying with compatibility syntax: {e}", flush=True)
+    assert last_error is not None
+    raise last_error
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +572,57 @@ def _ensure_llm_puzzles_on_path() -> None:
     lp_dir = ROOT / "llm-puzzles"
     if str(lp_dir) not in sys.path:
         sys.path.insert(0, str(lp_dir))
+
+
+def _legacy_kaggle_cli_submit_cmd(competition: str, submission_csv: Path, message: str) -> list[str]:
+    return ['kaggle', 'competitions', 'submit', '-c', competition, '-f', str(submission_csv), '-m', message]
+
+
+def _preferred_kaggle_cli_submit_cmd(competition: str, submission_csv: Path, message: str) -> list[str]:
+    # Current official kaggle-cli docs use a positional competition argument for
+    # `competitions submit`, unlike some older community examples that used `-c`.
+    return ['kaggle', 'competitions', 'submit', competition, '-f', str(submission_csv), '-m', message]
+
+
+def _poll_kaggle_submission_status(competition: str, kaggle_json: str | None, kaggle_config_dir: str | None, wait_seconds: int = 45) -> None:
+    """Best-effort polling of the latest Kaggle submission status.
+
+    This helps catch the case where upload succeeded but Kaggle later marks the
+    submission as a format/scoring error, which would explain why nothing shows
+    on the leaderboard.
+    """
+    try:
+        _ensure_llm_puzzles_on_path()
+        from src.kaggle_utils import ensure_auth, latest_submission, wait_for_submission_result
+
+        api = ensure_auth(kaggle_json_path=kaggle_json, config_dir=kaggle_config_dir)
+        sub = latest_submission(api, competition)
+        if not sub:
+            print('[kaggle] WARNING: could not retrieve latest submission status after upload.', flush=True)
+            return
+
+        sid = sub.get('id') or sub.get('ref') or '?'
+        status = sub.get('status') or sub.get('state') or 'unknown'
+        print(f"[kaggle] latest submission right after upload: id={sid} status={status}", flush=True)
+
+        final_sub = wait_for_submission_result(api, competition, target_ref=sid, wait_seconds=wait_seconds)
+        if not final_sub:
+            print('[kaggle] submission accepted by upload step; scoring is still pending.', flush=True)
+            return
+
+        sid = final_sub.get('id') or final_sub.get('ref') or '?'
+        status = final_sub.get('status') or final_sub.get('state') or 'unknown'
+        ps = final_sub.get('public_score')
+        prs = final_sub.get('private_score')
+        err = final_sub.get('error_description') or final_sub.get('errorDescription')
+        msg = f"[kaggle] submission status: id={sid} status={status}"
+        if ps not in (None, '', 'None') or prs not in (None, '', 'None'):
+            msg += f" public={ps} private={prs}"
+        if err not in (None, '', 'None'):
+            msg += f" error={err}"
+        print(msg, flush=True)
+    except Exception as e:
+        print(f"[kaggle] WARNING: could not poll submission status: {e}", flush=True)
 
 
 def _build_submission(
