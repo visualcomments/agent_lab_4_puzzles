@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -152,6 +153,94 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _is_truthy(value: Optional[str]) -> bool:
+    return (value or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def _is_remote_model(model: str) -> bool:
+    return not (model or '').strip().startswith('local:')
+
+
+def _use_remote_subprocess_isolation(model: str) -> bool:
+    if not _is_remote_model(model):
+        return False
+    return not ((os.getenv('AGENTLAB_REMOTE_SUBPROCESS', '1') or '').strip().lower() in {'0', 'false', 'no', 'off'})
+
+
+def _query_model_stable(
+    model: str,
+    prompt: str,
+    system_prompt: str,
+    *,
+    tries: int = 5,
+    timeout: float = 20.0,
+    temp: Optional[float] = None,
+    print_cost: bool = False,
+    version: str = '1.5',
+) -> str:
+    if not _use_remote_subprocess_isolation(model):
+        return query_model(model, prompt, system_prompt, tries=tries, timeout=timeout, temp=temp, print_cost=print_cost, version=version)
+
+    worker_path = THIS_DIR / 'query_model_worker.py'
+    if not worker_path.exists():
+        return query_model(model, prompt, system_prompt, tries=tries, timeout=timeout, temp=temp, print_cost=print_cost, version=version)
+
+    with tempfile.TemporaryDirectory(prefix='agentlab_query_') as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        prompt_file = tmpdir_path / 'prompt.txt'
+        system_file = tmpdir_path / 'system.txt'
+        out_json = tmpdir_path / 'result.json'
+        prompt_file.write_text(prompt, encoding='utf-8')
+        system_file.write_text(system_prompt, encoding='utf-8')
+
+        cmd = [
+            sys.executable,
+            str(worker_path),
+            '--model',
+            model,
+            '--prompt-file',
+            str(prompt_file),
+            '--system-file',
+            str(system_file),
+            '--out-json',
+            str(out_json),
+            '--tries',
+            str(int(tries)),
+            '--timeout',
+            str(float(timeout)),
+            '--version',
+            str(version),
+        ]
+        if print_cost:
+            cmd.append('--print-cost')
+        if temp is not None:
+            cmd.extend(['--temp', str(temp)])
+
+        env = dict(os.environ)
+        env['AGENTLAB_REMOTE_SUBPROCESS'] = '0'
+        proc_timeout = max(30, int(float(timeout)) + 15)
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=proc_timeout)
+
+        if not out_json.exists():
+            stderr = (proc.stderr or proc.stdout or '').strip()
+            raise RuntimeError(f'{model}: remote worker did not produce a result file. {stderr}'.strip())
+
+        try:
+            payload = json.loads(out_json.read_text(encoding='utf-8'))
+        except Exception as e:
+            stderr = (proc.stderr or proc.stdout or '').strip()
+            raise RuntimeError(f'{model}: failed to parse remote worker output ({e}). {stderr}'.strip()) from e
+
+        if payload.get('ok'):
+            answer = payload.get('answer', '')
+            return answer if isinstance(answer, str) else ''
+
+        error = str(payload.get('error', '') or '').strip()
+        error_type = str(payload.get('error_type', '') or '').strip()
+        if error_type == 'MissingLLMCredentials':
+            raise MissingLLMCredentials(error or 'credentials required')
+        raise RuntimeError(error or f'{model}: remote worker failed')
+
 
 def _clip_middle(text: str, max_chars: int) -> str:
     marker = "\n...<trimmed>...\n"
@@ -165,17 +254,16 @@ def _clip_middle(text: str, max_chars: int) -> str:
 
 
 def _effective_max_iters(requested: int, models: Sequence[str]) -> int:
-    allow_huge = os.getenv("AGENTLAB_ALLOW_HUGE_MAX_ITERS", "").strip().lower() in {"1", "true", "yes", "on"}
-    soft_cap = _env_int("AGENTLAB_REMOTE_MAX_ITERS_CAP", 128)
-    has_local = any(m.startswith("local:") for m in models)
-    if allow_huge or has_local or soft_cap <= 0 or requested <= soft_cap:
+    if requested <= 0:
         return requested
-    log_status(
-        f"[memory] Remote backends can slowly bloat notebook RAM on very large repair loops; capping --max-iters from {requested} to {soft_cap}. "
-        "Set AGENTLAB_ALLOW_HUGE_MAX_ITERS=1 or AGENTLAB_REMOTE_MAX_ITERS_CAP=0 to disable this guard.",
-        error=True,
-    )
-    return soft_cap
+    if _is_truthy(os.getenv('AGENTLAB_ALLOW_HUGE_MAX_ITERS')):
+        return requested
+    cap = _env_int('AGENTLAB_REMOTE_MAX_ITERS_CAP', 128)
+    if cap <= 0:
+        return requested
+    if any(_is_remote_model(model) for model in models):
+        return min(requested, cap)
+    return requested
 
 
 
@@ -216,7 +304,7 @@ def probe_model_for_codegen(model: str) -> Tuple[bool, str]:
     )
     system = "You are checking whether you can follow strict code-only output requirements."
     try:
-        resp = query_model(model, prompt, system, tries=1, timeout=12.0, print_cost=False)
+        resp = _query_model_stable(model, prompt, system, tries=1, timeout=12.0, print_cost=False)
     except MissingLLMCredentials:
         return False, "credentials required"
     except Exception as e:
@@ -262,7 +350,7 @@ def ask_first_nonempty(models: Sequence[str], prompt: str, system_prompt: str) -
     last_error: Optional[Exception] = None
     for model in models:
         try:
-            resp = query_model(model, prompt, system_prompt)
+            resp = _query_model_stable(model, prompt, system_prompt)
             if isinstance(resp, str) and resp.strip():
                 return resp.strip(), model
         except MissingLLMCredentials as e:
@@ -345,7 +433,7 @@ def try_generate_with_model(
     coder_prompt = f"USER TASK:\n{user_prompt}\n\nPLANNER NOTES:\n{plan}\n\nNow write the solver file."
 
     try:
-        resp = query_model(model, coder_prompt, prompts["coder"])
+        resp = _query_model_stable(model, coder_prompt, prompts["coder"])
     except MissingLLMCredentials as e:
         return False, f"{model}: credentials required ({e})"
     except Exception as e:
@@ -384,7 +472,7 @@ def try_generate_with_model(
                 "Return a corrected full python file."
             )
             try:
-                resp = query_model(model, fix_prompt, prompts["fixer"])
+                resp = _query_model_stable(model, fix_prompt, prompts["fixer"])
             except MissingLLMCredentials as e:
                 return False, f"{model}: fixer credentials required ({e})"
             except Exception as e:
@@ -456,6 +544,7 @@ def main() -> None:
         log_status("[!] No models configured. Pass --models or set G4F_MODELS.", error=True)
         sys.exit(2)
     ordered_models = order_models_for_codegen(models)
+    requested_max_iters = args.max_iters
     args.max_iters = _effective_max_iters(args.max_iters, ordered_models)
 
     out_path = Path(args.out).resolve()
@@ -467,6 +556,15 @@ def main() -> None:
         baseline_code = baseline_path.read_text(encoding="utf-8")
     else:
         baseline_code = make_baseline_stub()
+
+    if any(_use_remote_subprocess_isolation(model) for model in ordered_models):
+        log_status('[memory] Remote LLM queries run in isolated subprocesses to keep notebook RAM stable.')
+
+    if args.max_iters != requested_max_iters:
+        log_status(
+            f"[memory] Remote backends can slowly bloat notebook RAM on very large repair loops; capping --max-iters from {requested_max_iters} to {args.max_iters}. "
+            'Disable the cap with AGENTLAB_ALLOW_HUGE_MAX_ITERS=1 or AGENTLAB_REMOTE_MAX_ITERS_CAP=0.'
+        )
 
     if args.no_llm:
         out_path.write_text(baseline_code, encoding="utf-8")
