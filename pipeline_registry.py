@@ -154,7 +154,7 @@ PipelineSpec(
             "custom_prompts_template.json",
         ),
         state_columns=["initial_state", "permutation", "vector"],
-        smoke_vector=[0, 1, 2, 3],
+        smoke_vector=list(range(12)),
     ),
     PipelineSpec(
         key="cayleypy-christophers-jewel",

@@ -125,9 +125,33 @@ REGISTRY: Dict[str, CompConfig] = {
     "cayleypy-transposons": FORMAT_INITIAL_STATE_ID_PATH,
     "cayleypy-glushkov": FORMAT_INITIAL_STATE_ID_PATH,
 
-    # Pancake has a capitalized Kaggle slug; keep both keys
-    "CayleyPy-pancake": FORMAT_INITIAL_STATE_ID_PATH,
-    "cayleypy-pancake": FORMAT_INITIAL_STATE_ID_PATH,
+    # Pancake has id/permutation/solution schema (same family as RapaportM2).
+    "CayleyPy-pancake": CompConfig(
+        slug="CayleyPy-pancake",
+        submission_headers=["id", "permutation", "solution"],
+        header_keys=["id", "permutation", "moves"],
+        puzzles_id_field="id",
+        moves_key="solution",
+        move_joiner=".",
+    ),
+    "cayleypy-pancake": CompConfig(
+        slug="cayleypy-pancake",
+        submission_headers=["id", "permutation", "solution"],
+        header_keys=["id", "permutation", "moves"],
+        puzzles_id_field="id",
+        moves_key="solution",
+        move_joiner=".",
+    ),
+
+    # Glushkov also uses id/permutation/solution.
+    "cayleypy-glushkov": CompConfig(
+        slug="cayleypy-glushkov",
+        submission_headers=["id", "permutation", "solution"],
+        header_keys=["id", "permutation", "moves"],
+        puzzles_id_field="id",
+        moves_key="solution",
+        move_joiner=".",
+    ),
 
     # RapaportM2 has a different submission schema (echoes the permutation)
     "cayleypy-rapapport-m2": CompConfig(
