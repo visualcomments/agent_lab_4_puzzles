@@ -6,7 +6,9 @@ import os
 from pathlib import Path
 from datetime import datetime
 
-from persistence import JsonStateStore, truncate_middle
+from persistence import JsonStateStore, truncate_middle, ensure_dir
+import time
+import uuid
 
 
 def extract_json_between_markers(llm_output):
@@ -206,6 +208,22 @@ class ReviewersAgent:
         return f"Reviewer #1:\n{review_1}, \nReviewer #2:\n{review_2}, \nReviewer #3:\n{review_3}"
 
 
+_ARTIFACT_ATTRS = {
+    "plan",
+    "report",
+    "prev_report",
+    "exp_results",
+    "dataset_code",
+    "results_code",
+    "lit_review_sum",
+    "interpretation",
+    "prev_exp_results",
+    "reviewer_response",
+    "prev_results_code",
+    "prev_interpretation",
+}
+
+
 class BaseAgent:
     def __init__(
         self,
@@ -251,6 +269,9 @@ class BaseAgent:
         self.run_id = run_id or os.getenv("AGENTLAB_RUN_ID") or "default"
         base_dir = Path(memory_dir or os.getenv("AGENTLAB_MEMORY_DIR", "state_saves/json_memory"))
         self.memory_dir = base_dir / self.run_id
+        self._artifact_spill_chars = int(os.getenv("AGENTLAB_ARTIFACT_SPILL_CHARS", "12000") or "12000")
+        self._artifact_paths = {}
+        self._artifact_dir = self.memory_dir / self.__class__.__name__ / "artifacts"
         self._store = JsonStateStore(
             state_path=self.memory_dir / f"{self.__class__.__name__}.state.json",
             log_path=self.memory_dir / f"{self.__class__.__name__}.history.jsonl",
@@ -264,6 +285,36 @@ class BaseAgent:
 
     # ---------------- persistence helpers ----------------
 
+    def __setattr__(self, name, value):
+        if name in _ARTIFACT_ATTRS and isinstance(value, str):
+            spill_chars = int(getattr(self, "_artifact_spill_chars", 0) or 0)
+            artifact_dir = getattr(self, "_artifact_dir", None)
+            if spill_chars > 0 and artifact_dir is not None and len(value) > spill_chars:
+                try:
+                    ensure_dir(Path(artifact_dir))
+                    file_name = f"{name}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}.txt"
+                    path = Path(artifact_dir) / file_name
+                    path.write_text(value, encoding="utf-8")
+                    paths = object.__getattribute__(self, "__dict__").setdefault("_artifact_paths", {})
+                    paths[name] = str(path)
+                    value = truncate_middle(value, min(spill_chars, 4000))
+                except Exception:
+                    pass
+            elif "_artifact_paths" in object.__getattribute__(self, "__dict__"):
+                object.__getattribute__(self, "__dict__").get("_artifact_paths", {}).pop(name, None)
+        object.__setattr__(self, name, value)
+
+    def __getattribute__(self, name):
+        if name in _ARTIFACT_ATTRS:
+            d = object.__getattribute__(self, "__dict__")
+            p = d.get("_artifact_paths", {}).get(name)
+            if p:
+                try:
+                    return Path(p).read_text(encoding="utf-8")
+                except Exception:
+                    d.get("_artifact_paths", {}).pop(name, None)
+        return object.__getattribute__(self, name)
+
     def _load_state_if_present(self):
         st = self._store.load()
         if not st:
@@ -273,6 +324,9 @@ class BaseAgent:
                 return
             self.session_id = int(st.get("session_id", 0))
             self.prev_comm = st.get("prev_comm", "") or ""
+            artifact_paths = st.get("artifact_paths", {})
+            if isinstance(artifact_paths, dict):
+                self._artifact_paths = {k: v for k, v in artifact_paths.items() if isinstance(k, str) and isinstance(v, str)}
             hist = st.get("history", [])
             if isinstance(hist, list):
                 restored = []
@@ -296,6 +350,7 @@ class BaseAgent:
                 "session_id": self.session_id,
                 "prev_comm": self.prev_comm,
                 "max_hist_len": self.max_hist_len,
+                "artifact_paths": dict(self._artifact_paths),
                 "history": [{"expires": h[0], "text": h[1]} for h in self.history],
             }
             self._store.save(state)

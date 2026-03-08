@@ -1,14 +1,38 @@
-import PyPDF2
+import argparse
+import os
+import pickle
+import random
+import re
 import threading
-from agents import *
+import time
 from copy import copy
-from pathlib import Path
 from datetime import date
-from common_imports import *
-from mlesolver import MLESolver
-import argparse, pickle, yaml
+from pathlib import Path
+
+import requests
+import yaml
+
+os.environ.setdefault("AGENTLAB_HEAVY_IMPORTS", "0")
+
+from agents import *
 
 GLOBAL_AGENTRXIV = None
+
+
+def _load_pypdf2():
+    import PyPDF2
+    return PyPDF2
+
+
+def _ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _safe_file_stem(text: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "_", text or "item")
+    return cleaned[:80] or "item"
+
+
 DEFAULT_LLM_BACKBONE = "o3-mini"
 RESEARCH_DIR_PATH = "MATH_research_dir"
 
@@ -16,7 +40,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 class LaboratoryWorkflow:
-    def __init__(self, research_topic, openai_api_key, max_steps=100, num_papers_lit_review=5, agent_model_backbone=f"{DEFAULT_LLM_BACKBONE}", notes=list(), human_in_loop_flag=None, compile_pdf=True, mlesolver_max_steps=3, papersolver_max_steps=5, paper_index=0, except_if_fail=False, parallelized=False, lab_dir=None, lab_index=0, agentRxiv=False, agentrxiv_papers=5):
+    def __init__(self, research_topic, openai_api_key, max_steps=100, num_papers_lit_review=5, agent_model_backbone=f"{DEFAULT_LLM_BACKBONE}", notes=None, human_in_loop_flag=None, compile_pdf=True, mlesolver_max_steps=3, papersolver_max_steps=5, paper_index=0, except_if_fail=False, parallelized=False, lab_dir=None, lab_index=0, agentRxiv=False, agentrxiv_papers=5):
         """
         Initialize laboratory workflow
         @param research_topic: (str) description of research idea to explore
@@ -28,7 +52,7 @@ class LaboratoryWorkflow:
         self.agentRxiv = agentRxiv
         self.max_prev_papers = 10
         self.parallelized = parallelized
-        self.notes = notes
+        self.notes = notes or []
         self.lab_dir = lab_dir
         self.lab_index = lab_index
         self.max_steps = max_steps
@@ -360,6 +384,8 @@ class LaboratoryWorkflow:
         experiment_notes = [_note["note"] for _note in self.ml_engineer.notes if "running experiments" in _note["phases"]]
         experiment_notes = f"Notes for the task objective: {experiment_notes}\n" if len(experiment_notes) > 0 else ""
         # instantiate mle-solver
+        from mlesolver import MLESolver
+
         solver = MLESolver(
             dataset_code=self.ml_engineer.dataset_code,
             notes=experiment_notes,
@@ -633,9 +659,9 @@ class AgentRxiv:
     def __init__(self, lab_index=0):
         self.lab_index = lab_index
         self.server_thread = None
+        self.cache_dir = Path(os.getenv("AGENTLAB_AGENTRXIV_CACHE_DIR", "state_saves/agentrxiv_cache")) / f"lab{lab_index}"
+        _ensure_dir(self.cache_dir)
         self.initialize_server()
-        self.pdf_text = dict()
-        self.summaries = dict()
 
     def initialize_server(self):
         # Calculate the port dynamically
@@ -651,13 +677,17 @@ class AgentRxiv:
         return len(os.listdir("uploads"))
 
     def retrieve_full_text(self, arxiv_id):
-        try:
-            return self.pdf_text[arxiv_id]
-        except Exception:
-            return "Paper ID not found?"
+        path = self.cache_dir / f"{_safe_file_stem(arxiv_id)}.txt"
+        if path.exists():
+            try:
+                return path.read_text(encoding="utf-8")
+            except Exception:
+                pass
+        return "Paper ID not found?"
 
     @staticmethod
     def read_pdf_pypdf2(pdf_path):
+        PyPDF2 = _load_pypdf2()
         with open(pdf_path, 'rb') as pdf_file:
             reader = PyPDF2.PdfReader(pdf_file)
             text = ''

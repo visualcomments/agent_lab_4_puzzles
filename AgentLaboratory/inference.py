@@ -344,36 +344,50 @@ except Exception:
     OpenAI = None  # type: ignore
 
 try:
-    import tiktoken  # type: ignore
-    encoding = tiktoken.get_encoding("cl100k_base")
-except Exception:
-    tiktoken = None  # type: ignore
-    encoding = None
-
-try:
     import anthropic  # type: ignore
 except Exception:
     anthropic = None  # type: ignore
 
 genai = None  # type: ignore
+_TIKTOKEN_UNAVAILABLE = False
+_G4F_MODULE = None
+_G4F_IMPORT_ERROR = None
 
-# g4f (GPT4Free) backend (optional)
-try:
-    import g4f  # type: ignore
-except Exception:
-    g4f = None
-    # Optional vendor fallback: if this repo contains a bundled gpt4free checkout at ../gpt4free
+
+def _load_g4f_module():
+    global _G4F_MODULE, _G4F_IMPORT_ERROR
+    if _G4F_MODULE is not None:
+        return _G4F_MODULE
+    if _G4F_IMPORT_ERROR is not None:
+        return None
     try:
-        import sys
-        from pathlib import Path
-
-        _ROOT = Path(__file__).resolve().parents[1]
-        _VENDOR = _ROOT / "gpt4free"
-        if _VENDOR.exists():
-            sys.path.insert(0, str(_VENDOR))
-            import g4f  # type: ignore
+        import g4f  # type: ignore
+        _G4F_MODULE = g4f
+        return _G4F_MODULE
     except Exception:
-        g4f = None
+        try:
+            _ROOT = Path(__file__).resolve().parents[1]
+            _VENDOR = _ROOT / "gpt4free"
+            if _VENDOR.exists() and str(_VENDOR) not in sys.path:
+                sys.path.insert(0, str(_VENDOR))
+            import g4f  # type: ignore
+            _G4F_MODULE = g4f
+            return _G4F_MODULE
+        except Exception as exc:
+            _G4F_IMPORT_ERROR = exc
+            return None
+
+
+def _get_tiktoken_module():
+    global _TIKTOKEN_UNAVAILABLE
+    if _TIKTOKEN_UNAVAILABLE:
+        return None
+    try:
+        import tiktoken  # type: ignore
+        return tiktoken
+    except Exception:
+        _TIKTOKEN_UNAVAILABLE = True
+        return None
 
 
 def _chunk_to_text(chunk) -> str:
@@ -413,17 +427,28 @@ def _chunk_to_text(chunk) -> str:
     return ""
 
 
-def _g4f_to_text(resp, *, max_chars: int | None = None) -> str:
-    """g4f may return a string or an iterator (stream). Convert to string safely."""
+def _g4f_to_text(resp, *, max_chars: int | None = None, stop_at_python_fence: bool = False) -> str:
+    """g4f may return a string or an iterator (stream). Convert to string safely.
+
+    For codegen workloads we optionally stop right after a completed ```python fenced
+    block arrives, which avoids reading long trailing explanations into RAM.
+    """
     if isinstance(resp, str):
-        if max_chars is not None and max_chars > 0:
-            return resp[:max_chars]
-        return resp
+        text = resp[:max_chars] if (max_chars is not None and max_chars > 0) else resp
+        if stop_at_python_fence:
+            text = _trim_after_python_fence(text)
+        return text
     if resp is None or not hasattr(resp, "__iter__"):
-        return _chunk_to_text(resp)
+        text = _chunk_to_text(resp)
+        if max_chars is not None and max_chars > 0:
+            text = text[:max_chars]
+        if stop_at_python_fence:
+            text = _trim_after_python_fence(text)
+        return text
 
     buf = io.StringIO()
     size = 0
+    window = ""
     try:
         for ch in resp:
             txt = _chunk_to_text(ch)
@@ -434,14 +459,41 @@ def _g4f_to_text(resp, *, max_chars: int | None = None) -> str:
                 if remaining <= 0:
                     break
                 if len(txt) > remaining:
-                    buf.write(txt[:remaining])
-                    size += remaining
-                    break
+                    txt = txt[:remaining]
             buf.write(txt)
             size += len(txt)
-        return buf.getvalue()
+            if stop_at_python_fence:
+                window = (window + txt)[-4096:]
+                lowered = window.lower()
+                open_idx = lowered.find("```python")
+                if open_idx != -1:
+                    close_idx = lowered.rfind("```")
+                    if close_idx > open_idx:
+                        break
+            if max_chars is not None and max_chars > 0 and size >= max_chars:
+                break
+        text = buf.getvalue()
+        if stop_at_python_fence:
+            return _trim_after_python_fence(text)
+        return text
     except Exception:
-        return buf.getvalue()
+        text = buf.getvalue()
+        if stop_at_python_fence:
+            return _trim_after_python_fence(text)
+        return text
+
+
+def _trim_after_python_fence(text: str) -> str:
+    if not text:
+        return text
+    lowered = text.lower()
+    open_idx = lowered.find("```python")
+    if open_idx == -1:
+        return text
+    close_idx = lowered.find("```", open_idx + len("```python"))
+    if close_idx == -1:
+        return text
+    return text[: close_idx + 3]
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
@@ -461,13 +513,14 @@ def _use_remote_subprocess_isolation(model_str: str | None) -> bool:
     return _env_truthy("AGENTLAB_REMOTE_SUBPROCESS", default=True)
 
 
-def _g4f_supports_stream_flag() -> bool:
-    if g4f is None:
+def _g4f_supports_stream_flag(g4f_mod=None) -> bool:
+    g4f_mod = g4f_mod or _load_g4f_module()
+    if g4f_mod is None:
         return False
     try:
         import inspect
 
-        sig = inspect.signature(g4f.ChatCompletion.create)  # type: ignore[attr-defined]
+        sig = inspect.signature(g4f_mod.ChatCompletion.create)  # type: ignore[attr-defined]
         if "stream" in sig.parameters:
             return True
         return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
@@ -475,14 +528,34 @@ def _g4f_supports_stream_flag() -> bool:
         return True
 
 
-def _should_count_tokens(using_g4f_backend: bool) -> bool:
-    if tiktoken is None:
+def _should_count_tokens(using_g4f_backend: bool, *, total_text_chars: int = 0) -> bool:
+    if _get_tiktoken_module() is None:
         return False
     if _env_truthy("AGENTLAB_DISABLE_TOKEN_COUNT", default=False):
         return False
     if using_g4f_backend and not _env_truthy("AGENTLAB_ENABLE_TOKEN_COUNT_FOR_G4F", default=False):
         return False
+    max_chars = _env_int("AGENTLAB_TOKEN_COUNT_MAX_CHARS", 12000)
+    if max_chars > 0 and total_text_chars > max_chars:
+        return False
     return True
+
+
+def _tiktoken_encoding_for_model(model_str: str):
+    tiktoken_mod = _get_tiktoken_module()
+    if tiktoken_mod is None:
+        return None
+    if model_str in ["o1-preview", "o1-mini", "claude-3.5-sonnet", "o1", "o3-mini"]:
+        return tiktoken_mod.encoding_for_model("gpt-4o")
+    if model_str in ["deepseek-chat"]:
+        return tiktoken_mod.get_encoding("cl100k_base")
+    try:
+        return tiktoken_mod.encoding_for_model(model_str)
+    except Exception:
+        try:
+            return tiktoken_mod.get_encoding("cl100k_base")
+        except Exception:
+            return None
 
 
 def query_model_stable(
@@ -601,8 +674,6 @@ def _looks_like_missing_auth(err: Exception) -> bool:
 TOKENS_IN = dict()
 TOKENS_OUT = dict()
 
-if encoding is None and tiktoken is not None:
-    encoding = tiktoken.get_encoding("cl100k_base")
 
 def curr_cost_est():
     costmap_in = {
@@ -696,7 +767,8 @@ def query_model(
     if anthropic_api_key is not None and anthropic is None:
         raise ImportError("anthropic package is required for Claude-backed models")
     # Gemini SDK is imported lazily only if a Gemini model is actually requested.
-    if openai_api_key is None and anthropic_api_key is None and gemini_api_key is None and g4f is None:
+    g4f_mod = _load_g4f_module()
+    if openai_api_key is None and anthropic_api_key is None and gemini_api_key is None and g4f_mod is None:
         raise Exception("No API key provided and g4f is not available in query_model")
     if openai_api_key is not None:
         openai.api_key = openai_api_key
@@ -707,7 +779,7 @@ def query_model(
         os.environ["GEMINI_API_KEY"] = gemini_api_key
     for _ in range(tries):
         try:            # --- g4f backend ---
-            if force_g4f or (g4f is not None and openai_api_key is None and anthropic_api_key is None and gemini_api_key is None):
+            if force_g4f or (g4f_mod is not None and openai_api_key is None and anthropic_api_key is None and gemini_api_key is None):
                 messages = [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt},
@@ -718,7 +790,7 @@ def query_model(
                 # one via env vars, pass it through (only if supported by this installed g4f).
                 try:
                     import inspect
-                    sig = inspect.signature(g4f.ChatCompletion.create)  # type: ignore
+                    sig = inspect.signature(g4f_mod.ChatCompletion.create)  # type: ignore
                     if "api_key" in sig.parameters:
                         api_key = (
                             os.getenv("OPENROUTER_API_KEY")
@@ -735,14 +807,15 @@ def query_model(
                 provider_name = os.getenv("G4F_PROVIDER", "").strip()
                 if provider_name:
                     try:
-                        prov = getattr(g4f.Provider, provider_name)  # type: ignore
+                        prov = getattr(g4f_mod.Provider, provider_name)  # type: ignore
                         kwargs["provider"] = prov
                     except Exception:
                         pass
-                if _g4f_supports_stream_flag():
+                if _g4f_supports_stream_flag(g4f_mod):
                     kwargs["stream"] = True
                 max_resp_chars = int(os.getenv("AGENTLAB_MAX_RESPONSE_CHARS", "60000") or "60000")
-                resp = g4f.ChatCompletion.create(
+                stop_at_python_fence = _env_truthy("AGENTLAB_G4F_STOP_AT_PYTHON_FENCE", default=False)
+                resp = g4f_mod.ChatCompletion.create(
                     model=model_str,
                     messages=messages,
                     # g4f expects an integer timeout (seconds). Allow <5s for quick smoke tests,
@@ -750,7 +823,7 @@ def query_model(
                     timeout=int(max(1, timeout)),
                     **kwargs,
                 )
-                answer = _g4f_to_text(resp, max_chars=max_resp_chars)
+                answer = _g4f_to_text(resp, max_chars=max_resp_chars, stop_at_python_fence=stop_at_python_fence)
                 if isinstance(answer, str):
                     answer = answer.strip()
                 if answer:
@@ -906,21 +979,18 @@ def query_model(
                 answer = completion.choices[0].message.content
 
             try:
-                using_g4f_backend = bool(force_g4f or (g4f is not None and openai_api_key is None and anthropic_api_key is None and gemini_api_key is None))
-                if _should_count_tokens(using_g4f_backend):
-                    if model_str in ["o1-preview", "o1-mini", "claude-3.5-sonnet", "o1", "o3-mini"]:
-                        encoding = tiktoken.encoding_for_model("gpt-4o")
-                    elif model_str in ["deepseek-chat"]:
-                        encoding = tiktoken.encoding_for_model("cl100k_base")
-                    else:
-                        encoding = tiktoken.encoding_for_model(model_str)
-                    if model_str not in TOKENS_IN:
-                        TOKENS_IN[model_str] = 0
-                        TOKENS_OUT[model_str] = 0
-                    TOKENS_IN[model_str] += len(encoding.encode(system_prompt + prompt))
-                    TOKENS_OUT[model_str] += len(encoding.encode(answer))
-                    if print_cost:
-                        print(f"Current experiment cost = ${curr_cost_est()}, ** Approximate values, may not reflect true cost")
+                using_g4f_backend = bool(force_g4f or (g4f_mod is not None and openai_api_key is None and anthropic_api_key is None and gemini_api_key is None))
+                total_text_chars = len(system_prompt or "") + len(prompt or "") + len(answer or "")
+                if _should_count_tokens(using_g4f_backend, total_text_chars=total_text_chars):
+                    encoding = _tiktoken_encoding_for_model(model_str)
+                    if encoding is not None:
+                        if model_str not in TOKENS_IN:
+                            TOKENS_IN[model_str] = 0
+                            TOKENS_OUT[model_str] = 0
+                        TOKENS_IN[model_str] += len(encoding.encode(system_prompt + prompt))
+                        TOKENS_OUT[model_str] += len(encoding.encode(answer))
+                        if print_cost:
+                            print(f"Current experiment cost = ${curr_cost_est()}, ** Approximate values, may not reflect true cost")
                 elif print_cost and using_g4f_backend:
                     print("Token counting skipped for g4f low-RAM mode. Set AGENTLAB_ENABLE_TOKEN_COUNT_FOR_G4F=1 to enable.")
             except Exception as e:

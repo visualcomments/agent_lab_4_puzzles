@@ -34,3 +34,49 @@ def test_query_model_stable_uses_worker_result(monkeypatch):
 def test_callllm_iter_to_text_bounds_stream():
     out = CallLLM._iter_to_text(iter(["123", "456", "789"]), max_chars=7)
     assert out == "1234567"
+
+
+
+def test_g4f_to_text_stops_after_python_fence():
+    chunks = iter(["prefix\n```python\n", "def solve(vec):\n    return [], vec\n", "```\nignore me forever"])
+    out = inference._g4f_to_text(chunks, max_chars=1000, stop_at_python_fence=True)
+    assert "ignore me forever" not in out
+    assert out.rstrip().endswith("```")
+
+
+def test_base_agent_spills_large_artifacts(tmp_path, monkeypatch):
+    import types
+    import sys as _sys
+    import json as _json
+    import re as _re
+    from datetime import datetime as _datetime
+
+    fake_utils = types.ModuleType("utils")
+    fake_utils.json = _json
+    fake_utils.re = _re
+    fake_tools = types.ModuleType("tools")
+
+    monkeypatch.setitem(_sys.modules, "utils", fake_utils)
+    monkeypatch.setitem(_sys.modules, "tools", fake_tools)
+    from agents import BaseAgent
+
+    class DemoAgent(BaseAgent):
+        def context(self, phase):
+            return ""
+        def phase_prompt(self, phase):
+            return ""
+        def role_description(self):
+            return "demo"
+        def command_descriptions(self, phase):
+            return ""
+        def example_command(self, phase):
+            return ""
+
+    import os
+    os.environ["AGENTLAB_ARTIFACT_SPILL_CHARS"] = "20"
+    agent = DemoAgent(memory_dir=tmp_path, run_id="t")
+    big = "A" * 200
+    agent.report = big
+    assert agent.report == big
+    assert agent._artifact_paths.get("report")
+    assert Path(agent._artifact_paths["report"]).exists()

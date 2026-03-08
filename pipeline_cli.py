@@ -1072,6 +1072,21 @@ def _build_submission(
 # ---------------------------------------------------------------------------
 
 
+def _memory_env_for_codegen(models: str) -> dict[str, str]:
+    env: dict[str, str] = {}
+    normalized = [m.strip().lower() for m in (models or "").split(",") if m.strip()]
+    has_remote = any(not m.startswith("local:") for m in normalized)
+    if has_remote:
+        env.setdefault("AGENTLAB_REMOTE_SUBPROCESS", os.getenv("AGENTLAB_REMOTE_SUBPROCESS", "1"))
+        env.setdefault("AGENTLAB_DISABLE_TOKEN_COUNT", os.getenv("AGENTLAB_DISABLE_TOKEN_COUNT", "1"))
+        env.setdefault("AGENTLAB_MAX_RESPONSE_CHARS", os.getenv("AGENTLAB_MAX_RESPONSE_CHARS", "40000"))
+        env.setdefault("AGENTLAB_G4F_STOP_AT_PYTHON_FENCE", os.getenv("AGENTLAB_G4F_STOP_AT_PYTHON_FENCE", "1"))
+        env.setdefault("AGENTLAB_ARTIFACT_SPILL_CHARS", os.getenv("AGENTLAB_ARTIFACT_SPILL_CHARS", "8000"))
+        env.setdefault("AGENTLAB_HEAVY_IMPORTS", os.getenv("AGENTLAB_HEAVY_IMPORTS", "0"))
+        env.setdefault("MALLOC_ARENA_MAX", os.getenv("MALLOC_ARENA_MAX", "2"))
+    return env
+
+
 def _run_agent_laboratory(
     *,
     prompt_file: Path,
@@ -1113,8 +1128,12 @@ def _run_agent_laboratory(
     if custom_prompts:
         cmd.extend(["--custom-prompts", str(custom_prompts)])
 
+    env = os.environ.copy()
+    env.update(_memory_env_for_codegen(llm))
     print("[agentlab] " + " ".join(cmd))
-    subprocess.check_call(cmd, cwd=str(ROOT))
+    if env:
+        print("[agentlab] low-RAM env: " + ", ".join(f"{k}={env[k]}" for k in sorted(_memory_env_for_codegen(llm).keys())))
+    subprocess.check_call(cmd, cwd=str(ROOT), env=env)
 
 
 # ---------------------------------------------------------------------------
