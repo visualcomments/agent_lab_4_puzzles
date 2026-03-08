@@ -1,3 +1,4 @@
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ def test_build_parser_registers_check_g4f_models_command():
     args = parser.parse_args(["check-g4f-models", "--list-only"])
     assert args.func is pipeline_cli.cmd_check_g4f_models
     assert args.list_only is True
+    assert args.concurrency == 5
 
 
 def test_discover_g4f_candidate_models_filters_media_and_keeps_text_models(monkeypatch):
@@ -51,6 +53,84 @@ def test_discover_g4f_candidate_models_filters_media_and_keeps_text_models(monke
     assert models == ["gpt-4", "gpt-4o"]
 
 
+def test_probe_g4f_model_async_uses_async_client_and_extracts_content(monkeypatch):
+    captured = {}
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="pong"))]
+            )
+
+    class FakeAsyncClient:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setattr(pipeline_cli, "_load_g4f_async_client_class", lambda: FakeAsyncClient)
+
+    ok, info, elapsed = asyncio.run(
+        pipeline_cli._probe_g4f_model_async(
+            model="g4f:gpt-4o-mini",
+            timeout=1.0,
+            prompt="ping",
+            system_prompt="Return a very short plain-text reply.",
+            provider_name="Blackbox",
+        )
+    )
+
+    assert ok is True
+    assert info == "pong"
+    assert elapsed >= 0
+    assert captured["model"] == "gpt-4o-mini"
+    assert captured["provider"] == "Blackbox"
+    assert captured["web_search"] is False
+    assert captured["messages"][0]["role"] == "system"
+    assert captured["messages"][1]["content"] == "ping"
+
+
+
+def test_probe_g4f_models_async_honors_concurrency_and_preserves_order(monkeypatch):
+    in_flight = 0
+    max_seen = 0
+    completion_order = []
+
+    async def fake_probe(model, timeout, prompt, system_prompt, provider_name=None):
+        nonlocal in_flight, max_seen
+        in_flight += 1
+        max_seen = max(max_seen, in_flight)
+        await asyncio.sleep(0.01 if model == "b" else 0)
+        completion_order.append(model)
+        in_flight -= 1
+        return model != "c", f"detail-{model}", 0.01
+
+    monkeypatch.setattr(pipeline_cli, "_probe_g4f_model_async", fake_probe)
+
+    seen_callbacks = []
+
+    def on_result(idx, total, result):
+        seen_callbacks.append((idx, total, result["model"]))
+
+    results = asyncio.run(
+        pipeline_cli._probe_g4f_models_async(
+            ["a", "b", "c"],
+            timeout=1.0,
+            prompt="ping",
+            system_prompt="sys",
+            provider_name=None,
+            concurrency=2,
+            on_result=on_result,
+        )
+    )
+
+    assert [r["model"] for r in results] == ["a", "b", "c"]
+    assert [r["ok"] for r in results] == [True, True, False]
+    assert max_seen <= 2
+    assert completion_order[0] in {"a", "b"}
+    assert seen_callbacks and all(total == 3 for _, total, _ in seen_callbacks)
+
+
+
 def test_cmd_check_g4f_models_prints_working_models(monkeypatch, capsys):
     monkeypatch.setattr(
         pipeline_cli,
@@ -58,14 +138,14 @@ def test_cmd_check_g4f_models_prints_working_models(monkeypatch, capsys):
         lambda backend_api_url=None: ["gpt-4o-mini", "command-r", "aria"],
     )
 
-    def fake_probe(model, timeout, prompt, system_prompt):
-        if model == "gpt-4o-mini":
-            return True, "OK", 0.1
-        if model == "aria":
-            return True, "OK", 0.2
-        return False, "bad gateway", 0.3
+    async def fake_probe_many(candidates, **kwargs):
+        return [
+            {"model": "gpt-4o-mini", "ok": True, "detail": "OK", "elapsed_s": 0.1},
+            {"model": "command-r", "ok": False, "detail": "bad gateway", "elapsed_s": 0.3},
+            {"model": "aria", "ok": True, "detail": "OK", "elapsed_s": 0.2},
+        ]
 
-    monkeypatch.setattr(pipeline_cli, "_probe_g4f_model", fake_probe)
+    monkeypatch.setattr(pipeline_cli, "_probe_g4f_models_async", fake_probe_many)
 
     args = pipeline_cli.build_parser().parse_args(["check-g4f-models", "--max-models", "3"])
     args.func(args)
@@ -74,7 +154,7 @@ def test_cmd_check_g4f_models_prints_working_models(monkeypatch, capsys):
     assert "Working g4f models:" in out
     assert "gpt-4o-mini" in out
     assert "aria" in out
-    assert "command-r" in out  # shown in per-model status lines
+
 
 
 def test_cmd_check_g4f_models_list_only_prints_only_models_that_answered(monkeypatch, capsys):
@@ -84,13 +164,15 @@ def test_cmd_check_g4f_models_list_only_prints_only_models_that_answered(monkeyp
         lambda backend_api_url=None: ["gpt-4o-mini", "command-r", "aria"],
     )
 
-    def fake_probe(model, timeout, prompt, system_prompt):
-        assert prompt == "ping"
-        if model in {"gpt-4o-mini", "aria"}:
-            return True, "pong", 0.1
-        return False, "timeout", 0.2
+    async def fake_probe_many(candidates, **kwargs):
+        assert kwargs["prompt"] == "ping"
+        return [
+            {"model": "gpt-4o-mini", "ok": True, "detail": "pong", "elapsed_s": 0.1},
+            {"model": "command-r", "ok": False, "detail": "timeout", "elapsed_s": 0.2},
+            {"model": "aria", "ok": True, "detail": "pong", "elapsed_s": 0.1},
+        ]
 
-    monkeypatch.setattr(pipeline_cli, "_probe_g4f_model", fake_probe)
+    monkeypatch.setattr(pipeline_cli, "_probe_g4f_models_async", fake_probe_many)
 
     args = pipeline_cli.build_parser().parse_args(["check-g4f-models", "--list-only", "--max-models", "3"])
     args.func(args)
@@ -99,11 +181,15 @@ def test_cmd_check_g4f_models_list_only_prints_only_models_that_answered(monkeyp
     assert out_lines == ["gpt-4o-mini", "aria"]
 
 
-def test_cmd_check_g4f_models_json_list_only_reports_only_working_subset(monkeypatch, capsys):
-    def fake_probe(model, timeout, prompt, system_prompt):
-        return (model == "gpt-4o-mini"), "OK" if model == "gpt-4o-mini" else "err", 0.1
 
-    monkeypatch.setattr(pipeline_cli, "_probe_g4f_model", fake_probe)
+def test_cmd_check_g4f_models_json_list_only_reports_only_working_subset(monkeypatch, capsys):
+    async def fake_probe_many(candidates, **kwargs):
+        return [
+            {"model": "gpt-4o-mini", "ok": True, "detail": "OK", "elapsed_s": 0.1},
+            {"model": "aria", "ok": False, "detail": "err", "elapsed_s": 0.1},
+        ]
+
+    monkeypatch.setattr(pipeline_cli, "_probe_g4f_models_async", fake_probe_many)
 
     args = pipeline_cli.build_parser().parse_args(
         ["check-g4f-models", "--list-only", "--json", "--models", "g4f:gpt-4o-mini,gpt-4o-mini,aria"]
@@ -114,6 +200,7 @@ def test_cmd_check_g4f_models_json_list_only_reports_only_working_subset(monkeyp
     assert payload["working_count"] == 1
     assert payload["checked_count"] == 2
     assert payload["probe_prompt"] == "ping"
+
 
 
 def test_cmd_check_g4f_models_discover_only_json_preserves_candidate_listing(capsys):

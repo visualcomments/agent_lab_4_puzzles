@@ -1,0 +1,29 @@
+Validation run for async g4f model checks
+=========================================
+
+1) Python compile
+   Command:
+     python -m py_compile pipeline_cli.py tests_test_g4f_model_check.py
+   Result:
+     OK
+
+2) Unit tests
+   Command:
+     pytest -q tests_test_g4f_model_check.py
+   Result:
+     8 passed
+
+3) CLI smoke: discover-only JSON
+   Command:
+     python pipeline_cli.py check-g4f-models --discover-only --json --models g4f:gpt-4o-mini,gpt-4o-mini,aria
+   Result:
+     discovered_models = ["gpt-4o-mini", "aria"]
+
+4) Live async probe smoke (environment-dependent)
+   Command:
+     python pipeline_cli.py check-g4f-models --models gpt-4o-mini --timeout 8
+   Result:
+     Command completed without crashing.
+     Current environment returned provider/auth-related failure detail:
+     "har_and_cookies dir is not readable"
+     This confirms the async probe path executes and reports per-model failures cleanly.

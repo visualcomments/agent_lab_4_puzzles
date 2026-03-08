@@ -83,6 +83,17 @@ pip install -r requirements-full.txt
 
 ---
 
+
+### Проверка g4f-моделей
+
+Команда `check-g4f-models` использует `g4f.client.AsyncClient` и запускает probe-запросы конкурентно через `asyncio`, поэтому список `--list-only` содержит только модели, которые действительно ответили на тестовый prompt.
+
+```bash
+python pipeline_cli.py check-g4f-models --list-only
+python pipeline_cli.py check-g4f-models --timeout 12 --concurrency 5
+python pipeline_cli.py check-g4f-models --discover-only
+```
+
 ## 3) Команды `pipeline_cli.py`
 
 Посмотреть список команд:

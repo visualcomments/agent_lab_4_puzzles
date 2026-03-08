@@ -39,6 +39,7 @@ python pipeline_cli.py generate-solver \
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import itertools
 import importlib
@@ -245,26 +246,62 @@ def _discover_g4f_candidate_models(backend_api_url: Optional[str] = None) -> Lis
     return sorted(deduped, key=lambda s: (preferred.get(s, 9999), s.lower()))
 
 
-def _probe_g4f_model(model: str, timeout: float, prompt: str, system_prompt: str) -> Tuple[bool, str, float]:
-    agentlab_dir = ROOT / "AgentLaboratory"
-    if str(agentlab_dir) not in sys.path:
-        sys.path.insert(0, str(agentlab_dir))
-    from inference import query_model_stable  # type: ignore  # lazy import to keep startup light
+def _load_g4f_async_client_class():
+    tried: List[str] = []
+    for base in _iter_g4f_repo_roots():
+        if str(base) not in sys.path:
+            sys.path.insert(0, str(base))
+        try:
+            module = importlib.import_module("g4f.client")
+            return getattr(module, "AsyncClient")
+        except Exception as exc:
+            tried.append(f"{base}: {exc}")
+            continue
+    try:
+        module = importlib.import_module("g4f.client")
+        return getattr(module, "AsyncClient")
+    except Exception as exc:  # pragma: no cover - surfaced in CLI only
+        tried.append(f"site-packages: {exc}")
+    joined = "; ".join(tried) if tried else "g4f.client import failed"
+    raise RuntimeError(
+        "g4f AsyncClient is not available. Install g4f or use the bundled ./gpt4free checkout. "
+        f"Tried: {joined}"
+    )
 
+
+async def _probe_g4f_model_async(
+    model: str,
+    timeout: float,
+    prompt: str,
+    system_prompt: str,
+    provider_name: Optional[str] = None,
+) -> Tuple[bool, str, float]:
+    AsyncClient = _load_g4f_async_client_class()
     normalized = _normalize_g4f_model_name(model)
     started = time.time()
+    client = AsyncClient()
+    messages = []
+    if str(system_prompt or "").strip():
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
     try:
-        answer = query_model_stable(
-            model_str=f"g4f:{normalized}",
-            prompt=prompt,
-            system_prompt=system_prompt,
-            tries=1,
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=normalized,
+                provider=(provider_name or None),
+                messages=messages,
+                web_search=False,
+            ),
             timeout=timeout,
-            temp=0.0,
-            print_cost=False,
         )
         elapsed = time.time() - started
-        txt = str(answer or "").strip()
+        txt = ""
+        choices = getattr(response, "choices", None) or []
+        if choices:
+            message = getattr(choices[0], "message", None)
+            txt = str(getattr(message, "content", "") or "").strip()
+        if not txt:
+            txt = str(response or "").strip()
         if not txt:
             return False, "empty response", elapsed
         preview = txt.replace("\n", " ")[:80]
@@ -272,6 +309,54 @@ def _probe_g4f_model(model: str, timeout: float, prompt: str, system_prompt: str
     except Exception as exc:
         elapsed = time.time() - started
         return False, str(exc), elapsed
+
+
+async def _probe_g4f_models_async(
+    candidates: Sequence[str],
+    *,
+    timeout: float,
+    prompt: str,
+    system_prompt: str,
+    provider_name: Optional[str] = None,
+    concurrency: int = 5,
+    on_result: Optional[Callable[[int, int, Dict[str, Any]], None]] = None,
+) -> List[Dict[str, Any]]:
+    total = len(candidates)
+    if total == 0:
+        return []
+    sem = asyncio.Semaphore(max(1, int(concurrency or 1)))
+    results: List[Optional[Dict[str, Any]]] = [None] * total
+
+    async def run_one(index: int, model: str) -> Tuple[int, Dict[str, Any]]:
+        async with sem:
+            ok, info, elapsed = await _probe_g4f_model_async(
+                model=model,
+                timeout=timeout,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                provider_name=provider_name,
+            )
+            result = {
+                "model": model,
+                "ok": ok,
+                "detail": info,
+                "elapsed_s": round(elapsed, 3),
+            }
+            return index, result
+
+    tasks = [asyncio.create_task(run_one(idx, model)) for idx, model in enumerate(candidates)]
+    try:
+        for future in asyncio.as_completed(tasks):
+            index, result = await future
+            results[index] = result
+            if on_result is not None:
+                on_result(index + 1, total, result)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+    return [r for r in results if r is not None]
 
 
 def cmd_check_g4f_models(args: argparse.Namespace) -> None:
@@ -307,29 +392,30 @@ def cmd_check_g4f_models(args: argparse.Namespace) -> None:
                 print(name)
         return
 
-    results = []
-    working: List[str] = []
     if not args.list_only:
-        print(f"[g4f-check] checking {len(candidates)} model(s) with prompt={args.prompt!r}...")
-    for idx, model in enumerate(candidates, start=1):
-        ok, info, elapsed = _probe_g4f_model(
-            model=model,
+        print(
+            f"[g4f-check] checking {len(candidates)} model(s) with prompt={args.prompt!r} "
+            f"using AsyncClient concurrency={args.concurrency}..."
+        )
+
+    def _on_result(idx: int, total: int, result: Dict[str, Any]) -> None:
+        if args.list_only:
+            return
+        status = "OK" if result.get("ok") else "FAIL"
+        print(f"[{idx}/{total}] {result['model']}: {status} ({result['elapsed_s']:.2f}s) {result['detail']}")
+
+    results = asyncio.run(
+        _probe_g4f_models_async(
+            candidates,
             timeout=float(args.timeout),
             prompt=args.prompt,
             system_prompt=args.system_prompt,
+            provider_name=provider_name or None,
+            concurrency=int(args.concurrency),
+            on_result=_on_result,
         )
-        result = {
-            "model": model,
-            "ok": ok,
-            "detail": info,
-            "elapsed_s": round(elapsed, 3),
-        }
-        results.append(result)
-        if ok:
-            working.append(model)
-        if not args.list_only:
-            status = "OK" if ok else "FAIL"
-            print(f"[{idx}/{len(candidates)}] {model}: {status} ({elapsed:.2f}s) {info}")
+    )
+    working: List[str] = [str(r["model"]) for r in results if r.get("ok")]
 
     payload = {
         "provider": provider_name or None,
@@ -1623,6 +1709,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--competition", required=True, help="Competition slug / pipeline key")
     sp.add_argument("--format", default=None, help="Override llm-puzzles format slug (for inspection)")
     sp.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    sp.add_argument("--concurrency", type=int, default=5, help="Maximum number of concurrent AsyncClient probes")
     sp.set_defaults(func=cmd_show_pipeline)
 
     sp = sub.add_parser("generate-solver", help="Generate/repair a solver with AgentLaboratory")
@@ -1717,6 +1804,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--list-only", action="store_true", help="Probe models but print only the models that returned a non-empty answer")
     sp.add_argument("--discover-only", action="store_true", help="Only list discovered candidate models without probing them")
     sp.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    sp.add_argument("--concurrency", type=int, default=5, help="Maximum number of concurrent AsyncClient probes")
     sp.set_defaults(func=cmd_check_g4f_models)
 
     sp = sub.add_parser("selftest", help="Offline smoke tests")

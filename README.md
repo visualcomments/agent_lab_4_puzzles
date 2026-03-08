@@ -65,11 +65,11 @@ python pipeline_cli.py show-pipeline --competition <slug>
 ### Проверка g4f-моделей
 
 ```bash
-# Проверить модели запросом ping и вывести только те, которые реально ответили
+# Проверить модели асинхронным ping-probe через g4f AsyncClient
 python pipeline_cli.py check-g4f-models --list-only
 
-# То же, но с подробным статусом по каждой проверенной модели
-python pipeline_cli.py check-g4f-models --timeout 12
+# То же, но с подробным статусом и ограничением конкуренции
+python pipeline_cli.py check-g4f-models --timeout 12 --concurrency 5
 
 # Проверить свой белый список
 python pipeline_cli.py check-g4f-models --models gpt-4o-mini,command-r,aria
