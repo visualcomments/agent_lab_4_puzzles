@@ -33,6 +33,11 @@ try:
 except Exception:  # pragma: no cover - tqdm is in requirements, this is just a safe fallback
     tqdm = None  # type: ignore
 
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover - optional runtime dependency
+    psutil = None  # type: ignore
+
 # Import AgentLaboratory inference (patched to support g4f:)
 THIS_DIR = Path(__file__).resolve().parent
 AGENTLAB_ROOT = THIS_DIR.parent
@@ -153,10 +158,6 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _is_truthy(value: Optional[str]) -> bool:
-    return (value or '').strip().lower() in {'1', 'true', 'yes', 'on'}
-
-
 def _is_remote_model(model: str) -> bool:
     return not (model or '').strip().startswith('local:')
 
@@ -165,6 +166,49 @@ def _use_remote_subprocess_isolation(model: str) -> bool:
     if not _is_remote_model(model):
         return False
     return not ((os.getenv('AGENTLAB_REMOTE_SUBPROCESS', '1') or '').strip().lower() in {'0', 'false', 'no', 'off'})
+
+
+def _current_rss_mb() -> Optional[float]:
+    if psutil is None:
+        return None
+    try:
+        return float(psutil.Process().memory_info().rss) / (1024.0 * 1024.0)
+    except Exception:
+        return None
+
+
+
+def _system_total_mb() -> Optional[float]:
+    if psutil is None:
+        return None
+    try:
+        return float(psutil.virtual_memory().total) / (1024.0 * 1024.0)
+    except Exception:
+        return None
+
+
+
+def _default_max_rss_mb() -> int:
+    explicit = os.getenv('AGENTLAB_MAX_RSS_MB')
+    if explicit not in {None, ''}:
+        return _env_int('AGENTLAB_MAX_RSS_MB', 0)
+    total_mb = _system_total_mb()
+    if total_mb is None:
+        return 0
+    if _is_colab_env():
+        return max(1024, int(total_mb * 0.72))
+    return 0
+
+
+
+def _memory_limit_exceeded() -> Tuple[bool, Optional[float], int]:
+    limit_mb = _default_max_rss_mb()
+    if limit_mb <= 0:
+        return False, _current_rss_mb(), limit_mb
+    rss_mb = _current_rss_mb()
+    if rss_mb is None:
+        return False, None, limit_mb
+    return rss_mb >= float(limit_mb), rss_mb, limit_mb
 
 
 def _query_model_stable(
@@ -253,20 +297,16 @@ def _clip_middle(text: str, max_chars: int) -> str:
     return text[:keep_head] + marker + text[-keep_tail:]
 
 
-def _effective_max_iters(requested: int, models: Sequence[str]) -> int:
-    if requested <= 0:
-        return requested
-    # Unlimited by default: respect the user's --max-iters as-is.
-    # A positive AGENTLAB_REMOTE_MAX_ITERS_CAP can still be used as an optional,
-    # explicit safety cap for remote backends.
-    if _is_truthy(os.getenv('AGENTLAB_ALLOW_HUGE_MAX_ITERS')):
-        return requested
-    cap = _env_int('AGENTLAB_REMOTE_MAX_ITERS_CAP', 0)
-    if cap <= 0:
-        return requested
-    if any(_is_remote_model(model) for model in models):
-        return min(requested, cap)
-    return requested
+def _is_colab_env() -> bool:
+    return any(
+        key in os.environ
+        for key in (
+            "COLAB_GPU",
+            "COLAB_RELEASE_TAG",
+            "COLAB_BACKEND_VERSION",
+            "GCE_METADATA_TIMEOUT",
+        )
+    )
 
 
 
@@ -459,6 +499,14 @@ def try_generate_with_model(
     max_report_chars = _env_int("AGENTLAB_MAX_FAILURE_REPORT_CHARS", 12000)
 
     current_code = code
+    exceeded, rss_mb, limit_mb = _memory_limit_exceeded()
+    if exceeded:
+        _best_effort_release_memory(clear_local_cache=False)
+        return False, (
+            f"{model}: aborting before fixer loop because RSS {rss_mb:.1f} MB reached the configured limit "
+            f"{limit_mb} MB. Reduce --max-iters or raise AGENTLAB_MAX_RSS_MB."
+        )
+
     progress = _make_iteration_progress(model, max_iters)
     if progress is not None:
         progress.set_postfix_str(f"iter 0/{max_iters}")
@@ -467,6 +515,12 @@ def try_generate_with_model(
         for it in range(1, max_iters + 1):
             if progress is not None:
                 progress.set_postfix_str(f"iter {it}/{max_iters}")
+            exceeded, rss_mb, limit_mb = _memory_limit_exceeded()
+            if exceeded:
+                return False, (
+                    f"{model}: stopped fixer loop at iteration {it} because RSS {rss_mb:.1f} MB reached "
+                    f"the configured limit {limit_mb} MB. Reduce --max-iters or raise AGENTLAB_MAX_RSS_MB."
+                )
 
             fix_prompt = (
                 f"USER TASK:\n{user_prompt}\n\n"
@@ -498,8 +552,14 @@ def try_generate_with_model(
             out_path.write_text(current_code, encoding="utf-8")
             valid, last_report = validate_solver_suite(validator_path, out_path, tests)
             _best_effort_release_memory(clear_local_cache=False)
+            exceeded, rss_mb, limit_mb = _memory_limit_exceeded()
             if valid:
                 return True, f"{model}: validated after fixer iteration {it}"
+            if exceeded:
+                return False, (
+                    f"{model}: stopping after validation step {it} because RSS {rss_mb:.1f} MB reached "
+                    f"the configured limit {limit_mb} MB."
+                )
     finally:
         if progress is not None:
             progress.close()
@@ -547,8 +607,6 @@ def main() -> None:
         log_status("[!] No models configured. Pass --models or set G4F_MODELS.", error=True)
         sys.exit(2)
     ordered_models = order_models_for_codegen(models)
-    requested_max_iters = args.max_iters
-    args.max_iters = _effective_max_iters(args.max_iters, ordered_models)
 
     out_path = Path(args.out).resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -563,10 +621,11 @@ def main() -> None:
     if any(_use_remote_subprocess_isolation(model) for model in ordered_models):
         log_status('[memory] Remote LLM queries run in isolated subprocesses to keep notebook RAM stable.')
 
-    if args.max_iters != requested_max_iters:
+    memory_cap_mb = _default_max_rss_mb()
+    if memory_cap_mb > 0:
         log_status(
-            f"[memory] Applying explicit AGENTLAB_REMOTE_MAX_ITERS_CAP to remote repair loop: --max-iters {requested_max_iters} -> {args.max_iters}. "
-            'Set AGENTLAB_ALLOW_HUGE_MAX_ITERS=1 or AGENTLAB_REMOTE_MAX_ITERS_CAP=0 to disable this optional cap.'
+            f"[memory] RSS guard is enabled at ~{memory_cap_mb} MB. "
+            "Set AGENTLAB_MAX_RSS_MB=0 to disable or choose a larger value."
         )
 
     if args.no_llm:

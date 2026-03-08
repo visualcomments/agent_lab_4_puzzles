@@ -34,20 +34,22 @@ def test_rank_models_prefers_stronger_code_models():
     assert ranked[0] == 'g4f:gpt-4o-mini'
 
 
-def test_effective_max_iters_is_unlimited_by_default_and_optional_cap_can_be_enabled(monkeypatch):
-    monkeypatch.delenv('AGENTLAB_ALLOW_HUGE_MAX_ITERS', raising=False)
-    monkeypatch.delenv('AGENTLAB_REMOTE_MAX_ITERS_CAP', raising=False)
-    assert rpp._effective_max_iters(1000, ['g4f:gpt-4']) == 1000
+def test_default_max_rss_mb_is_disabled_outside_explicit_or_colab(monkeypatch):
+    monkeypatch.delenv('AGENTLAB_MAX_RSS_MB', raising=False)
+    monkeypatch.delenv('COLAB_GPU', raising=False)
+    monkeypatch.delenv('COLAB_RELEASE_TAG', raising=False)
+    monkeypatch.setattr(rpp, '_system_total_mb', lambda: 10000.0)
+    assert rpp._default_max_rss_mb() == 0
 
-    monkeypatch.setenv('AGENTLAB_REMOTE_MAX_ITERS_CAP', '128')
-    assert rpp._effective_max_iters(1000, ['g4f:gpt-4']) == 128
 
-    monkeypatch.setenv('AGENTLAB_ALLOW_HUGE_MAX_ITERS', '1')
-    assert rpp._effective_max_iters(1000, ['g4f:gpt-4']) == 1000
+def test_default_max_rss_mb_uses_explicit_env_or_colab_default(monkeypatch):
+    monkeypatch.setenv('AGENTLAB_MAX_RSS_MB', '4096')
+    assert rpp._default_max_rss_mb() == 4096
 
-    monkeypatch.delenv('AGENTLAB_ALLOW_HUGE_MAX_ITERS', raising=False)
-    monkeypatch.setenv('AGENTLAB_REMOTE_MAX_ITERS_CAP', '0')
-    assert rpp._effective_max_iters(1000, ['g4f:gpt-4']) == 1000
+    monkeypatch.delenv('AGENTLAB_MAX_RSS_MB', raising=False)
+    monkeypatch.setenv('COLAB_GPU', '1')
+    monkeypatch.setattr(rpp, '_system_total_mb', lambda: 10000.0)
+    assert rpp._default_max_rss_mb() == 7200
 
 
 def test_query_model_stable_uses_worker_result(monkeypatch, tmp_path):

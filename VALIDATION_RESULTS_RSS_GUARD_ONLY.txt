@@ -1,0 +1,24 @@
+Validation summary for RSS-guard-only repository
+
+1) Python bytecode compilation
+   Command:
+   python -m py_compile AgentLaboratory/perm_pipeline/run_perm_pipeline.py tests_test_codegen_pipeline.py pipeline_cli.py
+   Result: OK
+
+2) Targeted tests: codegen pipeline
+   Command:
+   python -m pytest -q tests_test_codegen_pipeline.py -q
+   Result: 7 passed
+
+3) Regression subset
+   Command:
+   python -m pytest -q tests_test_submission_pipeline.py tests_test_g4f_model_check.py tests_test_low_ram_optimizations.py tests_test_local_model_optimizations.py
+   Result: 18 passed in 14.06s
+
+Total verified tests: 25 passed
+
+Behavior change checked manually in code:
+- RSS guard remains enabled via AGENTLAB_MAX_RSS_MB / Colab default
+- remote max-iters auto-cap code path removed
+- AGENTLAB_REMOTE_MAX_ITERS_CAP removed
+- AGENTLAB_ALLOW_HUGE_MAX_ITERS removed
