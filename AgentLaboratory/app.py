@@ -5,7 +5,6 @@ from werkzeug.utils import secure_filename
 import os
 from PyPDF2 import PdfReader
 from flask_sqlalchemy import SQLAlchemy
-from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 
@@ -96,35 +95,58 @@ def update_papers_from_uploads():
     return
     #raise Exception("FAILED TO UPDATE")
 
-# Load a pre-trained sentence transformer model
-model = SentenceTransformer('all-MiniLM-L6-v2', device=_resolve_device())
+_EMBED_MODEL = None
 
 
-# Simple in-process cache to avoid re-encoding all documents on every query.
-_EMB_CACHE = {"paper_ids": None, "embeddings": None}
+def _get_embedding_model():
+    global _EMBED_MODEL
+    if _EMBED_MODEL is None:
+        from sentence_transformers import SentenceTransformer
+
+        _EMBED_MODEL = SentenceTransformer('all-MiniLM-L6-v2', device=_resolve_device())
+    return _EMBED_MODEL
 
 
 def _invalidate_embedding_cache():
-    _EMB_CACHE["paper_ids"] = None
-    _EMB_CACHE["embeddings"] = None
+    return None
 
 
-def _get_paper_embeddings(papers):
-    """Return (papers_with_text, embeddings) with caching + bounded batch size."""
-    papers_with_text = [p for p in papers if p.text]
-    paper_ids = tuple(p.id for p in papers_with_text)
-    if _EMB_CACHE["paper_ids"] == paper_ids and _EMB_CACHE["embeddings"] is not None:
-        return papers_with_text, _EMB_CACHE["embeddings"]
+def _iter_papers_with_text(batch_docs: int = 128):
+    query = Paper.query.filter(Paper.text.isnot(None)).order_by(Paper.id.asc())
+    for paper in query.yield_per(batch_docs):
+        if paper.text:
+            yield paper
 
-    if not papers_with_text:
-        return [], None
 
-    paper_texts = [p.text for p in papers_with_text]
+def _search_papers_topk(query_text: str, *, top_k: int = 50):
+    embed_model = _get_embedding_model()
+    query_embedding = embed_model.encode([query_text], show_progress_bar=False)
     batch_size = int(os.getenv("EMB_BATCH", "16"))
-    embeddings = model.encode(paper_texts, batch_size=batch_size, show_progress_bar=False)
-    _EMB_CACHE["paper_ids"] = paper_ids
-    _EMB_CACHE["embeddings"] = embeddings
-    return papers_with_text, embeddings
+    batch_docs = int(os.getenv("SEARCH_DOC_BATCH", "64"))
+    top_k = max(1, int(os.getenv("SEARCH_TOP_K", str(top_k))))
+
+    scored = []
+    batch = []
+    for paper in _iter_papers_with_text(batch_docs=batch_docs):
+        batch.append(paper)
+        if len(batch) >= batch_docs:
+            texts = [p.text for p in batch]
+            embeddings = embed_model.encode(texts, batch_size=batch_size, show_progress_bar=False)
+            sims = cosine_similarity(query_embedding, embeddings)[0]
+            for paper_item, score in zip(batch, sims):
+                scored.append((paper_item, float(score)))
+            del batch
+            batch = []
+
+    if batch:
+        texts = [p.text for p in batch]
+        embeddings = embed_model.encode(texts, batch_size=batch_size, show_progress_bar=False)
+        sims = cosine_similarity(query_embedding, embeddings)[0]
+        for paper_item, score in zip(batch, sims):
+            scored.append((paper_item, float(score)))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:top_k]
 
 @app.route('/update', methods=['GET'])
 def update_on_demand():
@@ -184,14 +206,7 @@ def upload():
 def search():
     query = request.args.get('q', '')
     if query:
-        papers = Paper.query.all()
-        query_embedding = model.encode([query])
-        papers_with_text, paper_embeddings = _get_paper_embeddings(papers)
-        if not papers_with_text:
-            return render_template('search.html', papers=[], query=query)
-        similarities = cosine_similarity(query_embedding, paper_embeddings)[0]
-        papers_with_scores = list(zip(papers_with_text, similarities))
-        papers_sorted = sorted(papers_with_scores, key=lambda x: x[1], reverse=True)
+        papers_sorted = _search_papers_topk(query)
         return render_template('search.html', papers=papers_sorted, query=query)
     return render_template('search.html', papers=[], query=query)
 
@@ -200,16 +215,9 @@ def api_search():
     query = request.args.get('q', '')
     if not query:
         return jsonify({'error': 'No query provided'}), 400
-    papers = Paper.query.all()
-    if not papers:
+    papers_sorted = _search_papers_topk(query)
+    if not papers_sorted:
         return jsonify({'query': query, 'results': []})
-    query_embedding = model.encode([query])
-    papers_with_text, paper_embeddings = _get_paper_embeddings(papers)
-    if not papers_with_text:
-        return jsonify({'query': query, 'results': []})
-    similarities = cosine_similarity(query_embedding, paper_embeddings)[0]
-    papers_with_scores = list(zip(papers_with_text, similarities))
-    papers_sorted = sorted(papers_with_scores, key=lambda x: x[1], reverse=True)
     results = []
     for paper, score in papers_sorted:
         pdf_url = url_for('uploaded_file', filename=paper.filename, _external=True)

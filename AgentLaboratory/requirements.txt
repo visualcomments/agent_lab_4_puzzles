@@ -133,3 +133,6 @@ yarl==1.18.0
 zipp==3.21.0
 google-generativeai
 PyPDF2
+Flask
+Flask-SQLAlchemy
+sentence-transformers

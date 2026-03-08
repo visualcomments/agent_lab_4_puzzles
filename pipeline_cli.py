@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import csv
 import itertools
+import importlib
 import importlib.util
 import json
 import os
@@ -52,7 +53,9 @@ import traceback
 from datetime import datetime
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from urllib.error import URLError
+from urllib.request import urlopen
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from pipeline_registry import PipelineSpec, get_pipeline, list_pipelines
 
@@ -112,6 +115,302 @@ def _gpu_diag_hint(selected_models: str) -> None:
             "If you want to actually use GPU, pass e.g. --models 'local:Qwen/Qwen2.5-0.5B-Instruct' (and ensure torch+transformers are installed)."
         )
 
+def _normalize_g4f_model_name(model: str) -> str:
+    raw = str(model or "").strip()
+    if raw.lower().startswith("g4f:"):
+        raw = raw.split(":", 1)[1].strip()
+    return raw
+
+
+def _dedupe_keep_order(items: Iterable[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for item in items:
+        s = _normalize_g4f_model_name(item)
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _iter_g4f_repo_roots() -> Iterable[Path]:
+    candidates = [ROOT / "gpt4free", ROOT]
+    for cand in candidates:
+        if cand.exists():
+            yield cand
+
+
+def _load_g4f_models_module():
+    tried: List[str] = []
+    for base in _iter_g4f_repo_roots():
+        if str(base) not in sys.path:
+            sys.path.insert(0, str(base))
+        try:
+            return importlib.import_module("g4f.models")
+        except Exception as exc:
+            tried.append(f"{base}: {exc}")
+            continue
+    try:
+        return importlib.import_module("g4f.models")
+    except Exception as exc:  # pragma: no cover - surfaced in CLI only
+        tried.append(f"site-packages: {exc}")
+    joined = "; ".join(tried) if tried else "g4f.models import failed"
+    raise RuntimeError(
+        "g4f.models is not available. Install g4f or use the bundled ./gpt4free checkout. "
+        f"Tried: {joined}"
+    )
+
+
+def _fetch_g4f_backend_models(backend_api_url: str, timeout: float = 15.0) -> List[str]:
+    url = backend_api_url.rstrip("/") + "/backend-api/v2/models"
+    try:
+        with urlopen(url, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except URLError as exc:
+        raise RuntimeError(f"failed to load {url}: {exc}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"invalid JSON from {url}: {exc}") from exc
+
+    if isinstance(payload, dict):
+        items = payload.get("data")
+        if items is None:
+            items = payload.get("models")
+    else:
+        items = payload
+
+    names: List[str] = []
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, str):
+                names.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            name = item.get("id") or item.get("name") or item.get("model")
+            if isinstance(name, str):
+                names.append(name)
+    return _dedupe_keep_order(names)
+
+
+def _discover_g4f_candidate_models(backend_api_url: Optional[str] = None) -> List[str]:
+    if backend_api_url:
+        return _fetch_g4f_backend_models(backend_api_url)
+
+    gm = _load_g4f_models_module()
+    model_registry = getattr(gm, "ModelRegistry", None)
+    image_cls = getattr(gm, "ImageModel", tuple())
+    audio_cls = getattr(gm, "AudioModel", tuple())
+    video_cls = getattr(gm, "VideoModel", tuple())
+
+    names: List[str] = []
+    if model_registry is not None and hasattr(model_registry, "all_models"):
+        try:
+            all_models = model_registry.all_models()
+            for name, model in all_models.items():
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                if isinstance(model, (image_cls, audio_cls, video_cls)):
+                    continue
+                names.append(name.strip())
+        except Exception:
+            names = []
+
+    if not names:
+        raw_all = getattr(gm, "__all__", [])
+        if callable(raw_all):
+            try:
+                raw_all = raw_all()
+            except Exception:
+                raw_all = []
+        for item in raw_all or []:
+            if isinstance(item, str) and item.strip():
+                low = item.lower()
+                if any(tag in low for tag in ("image", "audio", "video")):
+                    continue
+                names.append(item.strip())
+
+    preferred = {
+        "gpt-4o-mini": 0,
+        "gpt-4": 1,
+        "gpt-4o": 2,
+        "claude-3.5-sonnet": 3,
+        "claude-3-haiku": 4,
+        "command-r": 5,
+        "command-r-plus": 6,
+        "deepseek-chat": 7,
+        "aria": 8,
+    }
+    deduped = _dedupe_keep_order(names)
+    return sorted(deduped, key=lambda s: (preferred.get(s, 9999), s.lower()))
+
+
+def _probe_g4f_model(model: str, timeout: float, prompt: str, system_prompt: str) -> Tuple[bool, str, float]:
+    agentlab_dir = ROOT / "AgentLaboratory"
+    if str(agentlab_dir) not in sys.path:
+        sys.path.insert(0, str(agentlab_dir))
+    from inference import query_model_stable  # type: ignore  # lazy import to keep startup light
+
+    normalized = _normalize_g4f_model_name(model)
+    started = time.time()
+    try:
+        answer = query_model_stable(
+            model_str=f"g4f:{normalized}",
+            prompt=prompt,
+            system_prompt=system_prompt,
+            tries=1,
+            timeout=timeout,
+            temp=0.0,
+            print_cost=False,
+        )
+        elapsed = time.time() - started
+        txt = str(answer or "").strip()
+        if not txt:
+            return False, "empty response", elapsed
+        preview = txt.replace("\n", " ")[:80]
+        return True, preview, elapsed
+    except Exception as exc:
+        elapsed = time.time() - started
+        return False, str(exc), elapsed
+
+
+def cmd_check_g4f_models(args: argparse.Namespace) -> None:
+    provider_name = (args.provider or "").strip()
+    if provider_name:
+        os.environ["G4F_PROVIDER"] = provider_name
+
+    if args.models:
+        candidates = _dedupe_keep_order(args.models.split(","))
+    else:
+        candidates = _discover_g4f_candidate_models(getattr(args, "backend_api_url", None))
+
+    if args.max_models is not None and args.max_models > 0:
+        candidates = candidates[: args.max_models]
+
+    if not candidates:
+        raise SystemExit("No g4f models found to check.")
+
+    if args.list_only:
+        payload = {
+            "provider": provider_name or None,
+            "source": "backend-api" if getattr(args, "backend_api_url", None) else "registry",
+            "models": candidates,
+            "count": len(candidates),
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            print(f"Discovered {len(candidates)} g4f models:")
+            for name in candidates:
+                print(name)
+        return
+
+    results = []
+    working: List[str] = []
+    print(f"[g4f-check] checking {len(candidates)} model(s)...")
+    for idx, model in enumerate(candidates, start=1):
+        ok, info, elapsed = _probe_g4f_model(
+            model=model,
+            timeout=float(args.timeout),
+            prompt=args.prompt,
+            system_prompt=args.system_prompt,
+        )
+        result = {
+            "model": model,
+            "ok": ok,
+            "detail": info,
+            "elapsed_s": round(elapsed, 3),
+        }
+        results.append(result)
+        if ok:
+            working.append(model)
+        status = "OK" if ok else "FAIL"
+        print(f"[{idx}/{len(candidates)}] {model}: {status} ({elapsed:.2f}s) {info}")
+
+    payload = {
+        "provider": provider_name or None,
+        "source": "backend-api" if getattr(args, "backend_api_url", None) else "registry",
+        "working_models": working,
+        "working_count": len(working),
+        "checked_count": len(candidates),
+        "results": results,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print("\nWorking g4f models:")
+        if working:
+            for name in working:
+                print(name)
+        else:
+            print("<none>")
+
+
+def _resolve_competition_zip(spec: PipelineSpec) -> Optional[Path]:
+    """Locate a competition ZIP bundled with the repo or placed next to the run.
+
+    The uploaded competition archives are treated as the source of truth for
+    test.csv/sample_submission.csv when present, because they reflect the exact
+    submission schema used by the competition.
+    """
+    zip_candidates = [
+        ROOT / "competitions" / spec.key / "data" / "source.zip",
+        ROOT / "competitions" / spec.key / "data.zip",
+        ROOT / "competition_files" / f"{spec.key}.zip",
+        ROOT / "competition_files" / f"{spec.competition}.zip",
+        Path.cwd() / f"{spec.key}.zip",
+        Path.cwd() / f"{spec.competition}.zip",
+    ]
+
+    glob_candidates = []
+    for base_dir in [ROOT / "competition_files", Path.cwd()]:
+        if base_dir.exists():
+            glob_candidates.extend(sorted(base_dir.glob(f"{spec.key}*.zip")))
+            if spec.competition != spec.key:
+                glob_candidates.extend(sorted(base_dir.glob(f"{spec.competition}*.zip")))
+
+    return next((p for p in itertools.chain(zip_candidates, glob_candidates) if p.exists()), None)
+
+
+def _extract_named_member_from_zip(zip_path: Path, member_name: str, out_path: Path) -> Optional[Path]:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as zf:
+        member = next((n for n in zf.namelist() if Path(n).name == member_name), None)
+        if member is None:
+            return None
+        with zf.open(member) as src, out_path.open("wb") as dst:
+            shutil.copyfileobj(src, dst)
+    return out_path
+
+
+def _prefer_sample_submission_from_zip(spec: PipelineSpec) -> Optional[Path]:
+    """Materialize sample_submission.csv from the competition ZIP when available.
+
+    This keeps the local schema in sync with the actual competition bundle and
+    avoids stale checked-in samples.
+    """
+    zip_path = _resolve_competition_zip(spec)
+    if zip_path is None:
+        return None
+    target = ROOT / "competitions" / spec.key / "data" / "sample_submission.csv"
+    try:
+        return _extract_named_member_from_zip(zip_path, "sample_submission.csv", target)
+    except Exception:
+        return None
+
+
+def _infer_format_slug_from_sample(sample_submission_csv: Path) -> Optional[str]:
+    """Infer submission format from sample_submission.csv header."""
+    header, _ = _read_csv_header_and_ids(sample_submission_csv)
+    mapping = {
+        ("initial_state_id", "path"): "format/initial_state_id+path",
+        ("id", "permutation", "solution"): "format/id+permutation+solution",
+        ("id", "moves"): "format/moves-dot",
+        ("permutation", "solution"): "lrx-discover-math-gods-algorithm",
+        ("n", "solution"): "lrx-oeis-a-186783-brainstorm-math-conjecture",
+    }
+    return mapping.get(tuple(header))
+
 
 def _resolve_default_puzzles(spec: PipelineSpec) -> Path:
     """If --puzzles is omitted, try to locate a bundled test.csv.
@@ -151,24 +450,7 @@ def _resolve_default_puzzles(spec: PipelineSpec) -> Path:
 
     # 2) try bootstrap from a locally available ZIP
     data_dir = ROOT / 'competitions' / spec.key / 'data'
-    zip_candidates = [
-        ROOT / 'competitions' / spec.key / 'data' / 'source.zip',
-        ROOT / 'competitions' / spec.key / 'data.zip',
-        ROOT / 'competition_files' / f'{spec.key}.zip',
-        ROOT / 'competition_files' / f'{spec.competition}.zip',
-        Path.cwd() / f'{spec.key}.zip',
-        Path.cwd() / f'{spec.competition}.zip',
-    ]
-
-    # Also accept "slug*.zip" (e.g. "cayleypy-rapapport-m2(1).zip")
-    glob_candidates = []
-    for base_dir in [ROOT / 'competition_files', Path.cwd()]:
-        if base_dir.exists():
-            glob_candidates.extend(sorted(base_dir.glob(f"{spec.key}*.zip")))
-            if spec.competition != spec.key:
-                glob_candidates.extend(sorted(base_dir.glob(f"{spec.competition}*.zip")))
-
-    zip_path = next((p for p in itertools.chain(zip_candidates, glob_candidates) if p.exists()), None)
+    zip_path = _resolve_competition_zip(spec)
     if zip_path is not None:
         data_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -194,7 +476,11 @@ def _resolve_default_puzzles(spec: PipelineSpec) -> Path:
 
 
 def _resolve_sample_submission(spec: PipelineSpec) -> Optional[Path]:
-    """Try to locate bundled sample_submission.csv for the given pipeline."""
+    """Locate sample_submission.csv, preferring the competition ZIP when present."""
+    from_zip = _prefer_sample_submission_from_zip(spec)
+    if from_zip is not None and from_zip.exists():
+        return from_zip
+
     candidates = [
         ROOT / 'competitions' / spec.key / 'data' / 'sample_submission.csv',
         ROOT / 'competitions' / spec.competition / 'data' / 'sample_submission.csv',
@@ -655,7 +941,19 @@ def _build_submission(
         # Allow solve() to directly return moves list / string.
         return out  # type: ignore[return-value]
 
-    print(f"[submit] Building submission for format={competition_format_slug}")
+    resolved_format_slug = competition_format_slug
+    sample_submission_csv = _resolve_sample_submission(spec)
+    if sample_submission_csv is not None:
+        inferred = _infer_format_slug_from_sample(sample_submission_csv)
+        if inferred and inferred != competition_format_slug:
+            print(
+                f"[submit] overriding format from {competition_format_slug} -> {inferred} "
+                f"based on sample_submission header in {sample_submission_csv}",
+                flush=True,
+            )
+            resolved_format_slug = inferred
+
+    print(f"[submit] Building submission for format={resolved_format_slug}")
     print(f"         puzzles={puzzles_csv}")
     print(f"         output={out_csv}")
 
@@ -664,7 +962,7 @@ def _build_submission(
     lp_build_submission(
         puzzles_csv=str(puzzles_csv),
         output_csv=str(out_csv),
-        competition=competition_format_slug,
+        competition=resolved_format_slug,
         solver=row_solver,
         max_rows=max_rows,
         progress=(not no_progress),
@@ -1396,6 +1694,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--run-log", default=None, help="Path to run_log.json (default: <output_dir>/run_log.json)")
     sp.add_argument("--no-run-log", action="store_true", help="Disable writing run_log.json")
     sp.set_defaults(func=cmd_run)
+
+    sp = sub.add_parser("check-g4f-models", help="Probe g4f chat models and print the working subset")
+    sp.add_argument("--models", default=None, help="Optional comma-separated candidate list. If omitted, auto-discovers text models from g4f registry or backend API.")
+    sp.add_argument("--provider", default=None, help="Optional g4f provider name (same as G4F_PROVIDER).")
+    sp.add_argument("--backend-api-url", default=None, help="Optional base URL of a running g4f backend API; model list is fetched from /backend-api/v2/models.")
+    sp.add_argument("--timeout", type=float, default=12.0, help="Per-model probe timeout in seconds")
+    sp.add_argument("--max-models", type=int, default=None, help="Optional cap on number of models to check")
+    sp.add_argument("--prompt", default="Reply with exactly OK", help="Probe user prompt")
+    sp.add_argument("--system-prompt", default="Return a very short plain-text reply.", help="Probe system prompt")
+    sp.add_argument("--list-only", action="store_true", help="Only list discovered models without probing them")
+    sp.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    sp.set_defaults(func=cmd_check_g4f_models)
 
     sp = sub.add_parser("selftest", help="Offline smoke tests")
     sp.set_defaults(func=cmd_selftest)

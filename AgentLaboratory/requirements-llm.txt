@@ -1,0 +1,11 @@
+# Minimal low-RAM dependencies for the g4f / remote-LLM orchestration path
+g4f[slim]
+requests
+httpx
+psutil
+PyYAML
+pydantic
+tqdm
+openai
+anthropic
+PyPDF2

@@ -1,0 +1,100 @@
+[
+  {
+    "ts": "2026-03-08T16:01:40.180283",
+    "cmd": "run",
+    "pipeline": "cayleypy-pancake",
+    "competition": "CayleyPy-pancake",
+    "format": "format/id+permutation+solution",
+    "puzzles_csv": "/mnt/data/workrepo_fix/competitions/cayleypy-pancake/data/test.csv",
+    "output_csv": "submissions/submission.csv",
+    "solver": "/mnt/data/workrepo_fix/generated/solve_cayleypy-pancake_20260308_160140.py",
+    "args": {
+      "no_llm": true,
+      "models": "gpt-4o-mini",
+      "max_iters": 100,
+      "vector_col": null,
+      "max_rows": null,
+      "submit": false,
+      "submit_via": "auto",
+      "submit_competition": null
+    },
+    "stages": {
+      "generate_solver": {
+        "start": 1772985700.186205,
+        "end": 1772985700.1885564,
+        "seconds": 0.002351522445678711
+      },
+      "validate_solver": {
+        "start": 1772985700.188615,
+        "end": 1772985705.1956797,
+        "seconds": 5.007064580917358
+      },
+      "build_submission": {
+        "start": 1772985705.1958752,
+        "end": 1772985705.876294,
+        "seconds": 0.6804187297821045
+      },
+      "schema_check": {
+        "start": 1772985705.883518,
+        "end": 1772985705.9049337,
+        "seconds": 0.02141571044921875
+      }
+    },
+    "schema": {
+      "sample": "/mnt/data/workrepo_fix/competitions/cayleypy-pancake/data/sample_submission.csv",
+      "columns": [
+        "id",
+        "permutation",
+        "solution"
+      ],
+      "rows": 2405,
+      "unique_ids": 2405,
+      "duplicate_ids": 0
+    },
+    "status": "ok",
+    "files": {
+      "puzzles_csv": {
+        "path": "/mnt/data/workrepo_fix/competitions/cayleypy-pancake/data/test.csv",
+        "exists": true,
+        "bytes": 277002,
+        "mtime": "2026-03-07T22:36:05",
+        "columns": [
+          "id",
+          "n",
+          "permutation"
+        ],
+        "rows": 2405
+      },
+      "output_csv": {
+        "path": "submissions/submission.csv",
+        "exists": true,
+        "bytes": 858207,
+        "mtime": "2026-03-08T16:01:45.875903",
+        "columns": [
+          "id",
+          "permutation",
+          "solution"
+        ],
+        "rows": 2405
+      },
+      "solver": {
+        "path": "/mnt/data/workrepo_fix/generated/solve_cayleypy-pancake_20260308_160140.py",
+        "exists": true,
+        "bytes": 2328,
+        "mtime": "2026-03-08T16:01:40.187184"
+      },
+      "sample_submission_csv": {
+        "path": "/mnt/data/workrepo_fix/competitions/cayleypy-pancake/data/sample_submission.csv",
+        "exists": true,
+        "bytes": 293653,
+        "mtime": "2026-03-08T16:01:45.883157",
+        "columns": [
+          "id",
+          "permutation",
+          "solution"
+        ],
+        "rows": 2405
+      }
+    }
+  }
+]

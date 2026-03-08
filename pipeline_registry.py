@@ -100,7 +100,7 @@ PipelineSpec(
         PipelineSpec(
         key="cayleypy-rapapport-m2",
         competition="cayleypy-rapapport-m2",
-        format_slug="cayleypy-rapapport-m2",
+        format_slug="format/id+permutation+solution",
         baseline_solver=_p("competitions", "cayleypy-rapapport-m2", "solve_module.py"),
         validator=_p("competitions", "cayleypy-rapapport-m2", "validate_solve_output.py"),
         prompt_file=_p("competitions", "cayleypy-rapapport-m2", "prompts", "user_prompt.txt"),
@@ -111,7 +111,7 @@ PipelineSpec(
     PipelineSpec(
         key="cayleypy-pancake",
         competition="CayleyPy-pancake",
-        format_slug="CayleyPy-pancake",
+        format_slug="format/id+permutation+solution",
         baseline_solver=_p("competitions", "cayleypy-pancake", "solve_module.py"),
         validator=_p("competitions", "cayleypy-pancake", "validate_solve_output.py"),
         prompt_file=_p("competitions", "cayleypy-pancake", "prompts", "user_prompt.txt"),
@@ -122,7 +122,7 @@ PipelineSpec(
     PipelineSpec(
         key="cayleypy-glushkov",
         competition="cayleypy-glushkov",
-        format_slug="cayleypy-glushkov",
+        format_slug="format/id+permutation+solution",
         baseline_solver=_p("competitions", "cayleypy-glushkov", "solve_module.py"),
         validator=_p("competitions", "cayleypy-glushkov", "validate_solve_output.py"),
         prompt_file=_p("competitions", "cayleypy-glushkov", "prompts", "user_prompt.txt"),

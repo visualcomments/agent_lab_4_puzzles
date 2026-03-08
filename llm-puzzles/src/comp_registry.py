@@ -63,6 +63,16 @@ class CompConfig:
 DEFAULT = CompConfig(slug="generic-id-moves")
 
 # Common formats
+
+FORMAT_ID_PERMUTATION_SOLUTION = CompConfig(
+    slug="format/id+permutation+solution",
+    submission_headers=["id", "permutation", "solution"],
+    header_keys=["id", "permutation", "moves"],
+    puzzles_id_field="id",
+    moves_key="solution",
+    move_joiner=".",
+)
+
 FORMAT_INITIAL_STATE_ID_PATH = CompConfig(
     slug="format/initial_state_id+path",
     submission_headers=["initial_state_id", "path"],
@@ -76,6 +86,7 @@ FORMAT_INITIAL_STATE_ID_PATH = CompConfig(
 REGISTRY: Dict[str, CompConfig] = {
     # Generic format slugs
     "format/initial_state_id+path": FORMAT_INITIAL_STATE_ID_PATH,
+    "format/id+permutation+solution": FORMAT_ID_PERMUTATION_SOLUTION,
     "format/moves-dot": CompConfig(
         slug="format/moves-dot",
         submission_headers=["id", "moves"],
@@ -125,45 +136,14 @@ REGISTRY: Dict[str, CompConfig] = {
     "cayleypy-transposons": FORMAT_INITIAL_STATE_ID_PATH,
     "cayleypy-glushkov": FORMAT_INITIAL_STATE_ID_PATH,
 
-    # Current Kaggle competition pages for Pancake / Glushkov / RapaportM2
-    # describe the submission file as initial_state_id + path, while the
-    # downloaded test.csv still uses `id` as the puzzle identifier. So we keep
-    # reading `id` from test.csv, but write it under `initial_state_id` in the
-    # submission file.
-    "CayleyPy-pancake": CompConfig(
-        slug="CayleyPy-pancake",
-        submission_headers=["initial_state_id", "path"],
-        header_keys=["id", "moves"],
-        puzzles_id_field="id",
-        moves_key="path",
-        move_joiner=".",
-    ),
-    "cayleypy-pancake": CompConfig(
-        slug="cayleypy-pancake",
-        submission_headers=["initial_state_id", "path"],
-        header_keys=["id", "moves"],
-        puzzles_id_field="id",
-        moves_key="path",
-        move_joiner=".",
-    ),
-
-    "cayleypy-glushkov": CompConfig(
-        slug="cayleypy-glushkov",
-        submission_headers=["initial_state_id", "path"],
-        header_keys=["id", "moves"],
-        puzzles_id_field="id",
-        moves_key="path",
-        move_joiner=".",
-    ),
-
-    "cayleypy-rapapport-m2": CompConfig(
-        slug="cayleypy-rapapport-m2",
-        submission_headers=["initial_state_id", "path"],
-        header_keys=["id", "moves"],
-        puzzles_id_field="id",
-        moves_key="path",
-        move_joiner=".",
-    ),
+    # Pancake / Glushkov / RapaportM2 competition bundles in this repository
+    # use Kaggle sample submissions with columns: id, permutation, solution.
+    # The solver still produces just the move sequence; the adapter copies the
+    # original permutation column through to the submission automatically.
+    "CayleyPy-pancake": FORMAT_ID_PERMUTATION_SOLUTION,
+    "cayleypy-pancake": FORMAT_ID_PERMUTATION_SOLUTION,
+    "cayleypy-glushkov": FORMAT_ID_PERMUTATION_SOLUTION,
+    "cayleypy-rapapport-m2": FORMAT_ID_PERMUTATION_SOLUTION,
 }
 
 

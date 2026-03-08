@@ -1,5 +1,6 @@
 import ast
 import importlib
+import io
 import json
 import os
 import queue
@@ -107,20 +108,33 @@ def _chunk_to_text(chunk) -> str:
     return ""
 
 
-def _iter_to_text(resp) -> str:
+def _iter_to_text(resp, *, max_chars: int | None = None) -> str:
     if isinstance(resp, str):
+        if max_chars is not None and max_chars > 0:
+            return resp[:max_chars]
         return resp
-    if resp is not None and hasattr(resp, "__iter__"):
-        try:
-            parts = []
-            for ch in resp:
-                txt = _chunk_to_text(ch)
-                if txt:
-                    parts.append(txt)
-            return "".join(parts)
-        except Exception:
-            return ""
-    return _chunk_to_text(resp)
+    if resp is None or not hasattr(resp, "__iter__"):
+        return _chunk_to_text(resp)
+    buf = io.StringIO()
+    size = 0
+    try:
+        for ch in resp:
+            txt = _chunk_to_text(ch)
+            if not txt:
+                continue
+            if max_chars is not None and max_chars > 0:
+                remaining = max_chars - size
+                if remaining <= 0:
+                    break
+                if len(txt) > remaining:
+                    buf.write(txt[:remaining])
+                    size += remaining
+                    break
+            buf.write(txt)
+            size += len(txt)
+        return buf.getvalue()
+    except Exception:
+        return buf.getvalue()
 
 
 def _extract_python_candidate(text: str) -> str:
@@ -211,8 +225,9 @@ def quick_selfcheck(
                 messages=[{"role": "user", "content": prompt}],
                 provider=provider,
                 timeout=timeout,
+                stream=True,
             )
-            text = _iter_to_text(resp)
+            text = _iter_to_text(resp, max_chars=int(os.getenv("LLM_PUZZLES_MAX_RESPONSE_CHARS", "60000") or "60000"))
             if not isinstance(text, str) or not text.strip():
                 continue
             if mode == "code":
@@ -330,8 +345,9 @@ def llm_query(model: str, prompt: str, retries_config: Dict, config: Dict, progr
                 messages=[{"role": "user", "content": prompt}],
                 provider=provider,
                 timeout=request_timeout,
+                stream=True,
             )
-            text = _iter_to_text(resp)
+            text = _iter_to_text(resp, max_chars=int(os.getenv("LLM_PUZZLES_MAX_RESPONSE_CHARS", "60000") or "60000"))
             if isinstance(text, str) and text.strip():
                 return text.strip()
         except Exception:

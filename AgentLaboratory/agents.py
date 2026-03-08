@@ -144,7 +144,7 @@ def get_score(outlined_plan, latex, reward_model_llm, reviewer_type=None, attemp
                       "You are an AI researcher who is reviewing a paper that was submitted to a prestigious ML venue. "
                       f"Be critical and cautious in your decision. {reviewer_type}\n"
                   ) + neurips_form
-            scoring = query_model(
+            scoring = query_model_stable(
                 model_str=f"{reward_model_llm}",
                 system_prompt=sys,
                 openai_api_key=openai_api_key,
@@ -330,7 +330,7 @@ class BaseAgent:
 
     def override_inference(self, query, temp=0.0):
         sys_prompt = f"""You are {self.role_description()}"""
-        model_resp = query_model(model_str=self.model, system_prompt=sys_prompt, prompt=query, temp=temp, openai_api_key=self.openai_api_key)
+        model_resp = query_model_stable(model_str=self.model, system_prompt=sys_prompt, prompt=query, temp=temp, openai_api_key=self.openai_api_key)
         return model_resp
 
     def inference(self, research_topic, phase, step, feedback="", temp=None):
@@ -346,7 +346,7 @@ class BaseAgent:
             f"Current Step #{step}, Phase: {phase}\n{complete_str}\n"
             f"[Objective] Your goal is to perform research on the following topic: {research_topic}\n"
             f"Feedback: {feedback}\nNotes: {notes_str}\nYour previous command was: {self.prev_comm}. Make sure your new output is very different.\nPlease produce a single command below:\n")
-        model_resp = query_model(model_str=self.model, system_prompt=sys_prompt, prompt=prompt, temp=temp, openai_api_key=self.openai_api_key)
+        model_resp = query_model_stable(model_str=self.model, system_prompt=sys_prompt, prompt=prompt, temp=temp, openai_api_key=self.openai_api_key)
         print("^"*50, phase, "^"*50)
         model_resp = self.clean_text(model_resp)
         self.prev_comm = model_resp
@@ -419,7 +419,7 @@ class ProfessorAgent(BaseAgent):
         prompt = (
             f"""History: {history_str}\n{'~' * 10}\n"""
             f"Please produce the readme below in markdown:\n")
-        model_resp = query_model(model_str=self.model, system_prompt=sys_prompt, prompt=prompt, openai_api_key=self.openai_api_key)
+        model_resp = query_model_stable(model_str=self.model, system_prompt=sys_prompt, prompt=prompt, openai_api_key=self.openai_api_key)
         return model_resp.replace("```markdown", "")
 
     def context(self, phase):
@@ -804,7 +804,7 @@ class PhDStudentAgent(BaseAgent):
         prompt = (
             f"""History: {history_str}\n{'~' * 10}\n"""
             f"Please produce the requirements.txt below in markdown:\n")
-        model_resp = query_model(model_str=self.model, system_prompt=sys_prompt, prompt=prompt, openai_api_key=self.openai_api_key)
+        model_resp = query_model_stable(model_str=self.model, system_prompt=sys_prompt, prompt=prompt, openai_api_key=self.openai_api_key)
         return model_resp
 
     def example_command(self, phase):

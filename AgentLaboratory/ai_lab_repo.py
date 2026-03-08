@@ -1,6 +1,5 @@
 import PyPDF2
 import threading
-from app import *
 from agents import *
 from copy import copy
 from pathlib import Path
@@ -672,6 +671,8 @@ class AgentRxiv:
         url = f'http://127.0.0.1:{5000 + self.lab_index}/api/search?q={search_query}'
         return_str = str()
         try:
+            from app import app, update_papers_from_uploads
+
             with app.app_context():
                 update_papers_from_uploads()
             response = requests.get(url)
@@ -686,7 +687,7 @@ class AgentRxiv:
                     response = requests.get(result['pdf_url'])
                     filename.write_bytes(response.content)
                     self.pdf_text[arxiv_id] = self.read_pdf_pypdf2(f'_tmp_{self.lab_index}.pdf')
-                    self.summaries[arxiv_id] = query_model(
+                    self.summaries[arxiv_id] = query_model_stable(
                         prompt=self.pdf_text[arxiv_id],
                         system_prompt="Please provide a 5 sentence summary of this paper.",
                         openai_api_key=os.getenv('OPENAI_API_KEY'),
@@ -704,6 +705,8 @@ class AgentRxiv:
         return return_str
 
     def run_server(self, port):
+        from app import run_app
+
         run_app(port=port)
 
 

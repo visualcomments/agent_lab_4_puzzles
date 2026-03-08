@@ -1,0 +1,23 @@
+PyCompile: OK
+
+Pytest:
+...............                                                          [100%]
+=============================== warnings summary ===============================
+../../../../opt/pyvenv/lib/python3.13/site-packages/PyPDF2/__init__.py:21
+  /opt/pyvenv/lib/python3.13/site-packages/PyPDF2/__init__.py:21: DeprecationWarning: PyPDF2 is deprecated. Please move to the pypdf library instead.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+15 passed, 1 warning in 8.36s
+
+Smoke import:
+inference_import_ok=True
+callllm_import_ok=True
+g4f_stream_bound=aabb
+callllm_stream_bound=11223
+local_runtime_config={'device': 'cpu', 'quant': 'none', 'attn_impl': 'sdpa', 'dtype': 'auto', 'offload_enabled': False, 'offload_dir': './.offload', 'torch_compile': False, 'max_input_tokens': 0, 'cache_max_items': 1, 'cache_ttl_s': 3600, 'max_memory': None}
+
+App smoke:
+app_import_ok=True
+app_db_ok=True
+embed_model_lazy=True

@@ -62,6 +62,19 @@ Quickly inspect a pipeline (paths, bundled files, expected submission columns):
 python pipeline_cli.py show-pipeline --competition <slug>
 ```
 
+### Проверка g4f-моделей
+
+```bash
+# Показать все обнаруженные текстовые модели g4f
+python pipeline_cli.py check-g4f-models --list-only
+
+# Проверить доступность и вывести только реально ответившие модели
+python pipeline_cli.py check-g4f-models --timeout 12
+
+# Проверить свой белый список
+python pipeline_cli.py check-g4f-models --models gpt-4o-mini,command-r,aria
+```
+
 ---
 
 ## End-to-end pipeline

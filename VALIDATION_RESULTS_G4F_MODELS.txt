@@ -1,0 +1,31 @@
+Validation results for g4f model-check CLI
+
+1) py_compile pipeline_cli.py AgentLaboratory/inference.py llm-puzzles/CallLLM.py: PASS
+
+2) pytest subset:
+17 passed in 8.18s
+
+3) python pipeline_cli.py check-g4f-models --list-only --max-models 10
+Discovered 10 g4f models:
+gpt-4o-mini
+gpt-4
+gpt-4o
+command-r
+command-r-plus
+aria
+airoboros-70b
+codegemma-7b
+command-a
+command-r7b
+
+4) python pipeline_cli.py check-g4f-models --models gpt-4o-mini --timeout 5
+[g4f-check] checking 1 model(s)...
+[1/1] gpt-4o-mini: FAIL (11.88s) Max retries: timeout
+
+Working g4f models:
+<none>
+
+Interpretation:
+- command wiring works end-to-end;
+- local model discovery works against the bundled gpt4free registry;
+- live provider probing is handled gracefully, and failures are surfaced as probe results instead of crashing the CLI.

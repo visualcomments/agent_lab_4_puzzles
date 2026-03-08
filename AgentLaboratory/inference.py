@@ -2,6 +2,12 @@ import time
 import os
 import json
 import gc
+import io
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from collections import OrderedDict
 
 try:
     import ctypes
@@ -20,7 +26,7 @@ except Exception:
 #
 # This backend is intentionally lightweight and only activates when requested.
 
-_LOCAL_LM_CACHE = {}
+_LOCAL_LM_CACHE = OrderedDict()
 
 
 def _best_effort_release_memory(clear_local_cache: bool = False) -> None:
@@ -77,11 +83,102 @@ def _get_agentlab_device() -> str:
     return "cpu"
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int((os.getenv(name) or str(default)).strip())
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float((os.getenv(name) or str(default)).strip())
+    except Exception:
+        return default
+
+
+def _local_cache_key(model_id: str):
+    device = _get_agentlab_device()
+    return (
+        model_id,
+        device,
+        (os.getenv("AGENTLAB_LOCAL_QUANT") or "none").strip().lower(),
+        (os.getenv("AGENTLAB_ATTN_IMPL") or "").strip().lower(),
+        (os.getenv("AGENTLAB_LOCAL_DTYPE") or "").strip().lower(),
+        (os.getenv("AGENTLAB_LOCAL_MAX_MEMORY") or "").strip(),
+        (os.getenv("AGENTLAB_OFFLOAD_DIR") or "").strip(),
+        (os.getenv("AGENTLAB_TORCH_COMPILE") or "0").strip(),
+    )
+
+
+def _local_cache_get(key):
+    ttl_s = _env_int("AGENTLAB_LOCAL_CACHE_TTL_S", 3600)
+    try:
+        item = _LOCAL_LM_CACHE.pop(key)
+    except KeyError:
+        return None
+    value, ts = item
+    if ttl_s > 0 and (time.time() - ts) > ttl_s:
+        try:
+            del value
+        except Exception:
+            pass
+        return None
+    _LOCAL_LM_CACHE[key] = (value, ts)
+    return value
+
+
+def _local_cache_set(key, value) -> None:
+    max_items = max(1, _env_int("AGENTLAB_LOCAL_CACHE_MAX_ITEMS", 1))
+    try:
+        _LOCAL_LM_CACHE.pop(key, None)
+        _LOCAL_LM_CACHE[key] = (value, time.time())
+        while len(_LOCAL_LM_CACHE) > max_items:
+            _, (old_value, _) = _LOCAL_LM_CACHE.popitem(last=False)
+            try:
+                del old_value
+            except Exception:
+                pass
+    except Exception:
+        _LOCAL_LM_CACHE[key] = (value, time.time())
+
+
+def _resolve_torch_dtype(torch_mod, device: str):
+    raw = (os.getenv("AGENTLAB_LOCAL_DTYPE") or "").strip().lower()
+    if raw in {"float16", "fp16", "half"}:
+        return getattr(torch_mod, "float16", None)
+    if raw in {"bfloat16", "bf16"}:
+        return getattr(torch_mod, "bfloat16", None)
+    if raw in {"float32", "fp32"}:
+        return getattr(torch_mod, "float32", None)
+    if device.startswith("cuda"):
+        return getattr(torch_mod, "float16", None)
+    return None
+
+
+def _parse_max_memory() -> dict | None:
+    raw = (os.getenv("AGENTLAB_LOCAL_MAX_MEMORY") or "").strip()
+    if not raw:
+        return None
+    out = {}
+    for part in raw.split(','):
+        if ':' not in part:
+            continue
+        name, value = part.split(':', 1)
+        name = name.strip()
+        value = value.strip()
+        if not name or not value:
+            continue
+        out[name] = value
+    return out or None
+
+
 def _local_transformers_load(model_id: str):
     """Load and cache a HF Transformers CausalLM model (lazy import)."""
-    key = (model_id, _get_agentlab_device())
-    if key in _LOCAL_LM_CACHE:
-        return _LOCAL_LM_CACHE[key]
+    key = _local_cache_key(model_id)
+    cached = _local_cache_get(key)
+    if cached is not None:
+        return cached
 
     try:
         import torch  # type: ignore
@@ -93,26 +190,77 @@ def _local_transformers_load(model_id: str):
         ) from e
 
     device = _get_agentlab_device()
+    quant = (os.getenv("AGENTLAB_LOCAL_QUANT") or "none").strip().lower()
+    attn_impl = (os.getenv("AGENTLAB_ATTN_IMPL") or "sdpa").strip().lower()
+    offload_dir = (os.getenv("AGENTLAB_OFFLOAD_DIR") or "./.offload").strip()
+    offload_enabled = _env_truthy("AGENTLAB_ENABLE_OFFLOAD", default=False) or bool((os.getenv("AGENTLAB_LOCAL_MAX_MEMORY") or "").strip())
 
     tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
-
-    # Use fp16 on CUDA when possible to reduce VRAM/RAM pressure.
-    torch_dtype = None
-    if device.startswith("cuda"):
-        torch_dtype = getattr(torch, "float16", None)
+    if getattr(tok, 'pad_token_id', None) is None and getattr(tok, 'eos_token_id', None) is not None:
+        try:
+            tok.pad_token_id = tok.eos_token_id
+        except Exception:
+            pass
 
     model_kwargs = {"low_cpu_mem_usage": True}
+
+    torch_dtype = _resolve_torch_dtype(torch, device)
     if torch_dtype is not None:
         model_kwargs["torch_dtype"] = torch_dtype
+
+    if attn_impl and attn_impl not in {"auto", "default"}:
+        model_kwargs["attn_implementation"] = attn_impl
+
+    if quant in {"8bit", "int8", "8"}:
+        try:
+            from transformers import BitsAndBytesConfig  # type: ignore
+        except Exception as e:
+            raise ImportError(
+                "AGENTLAB_LOCAL_QUANT=8bit requires bitsandbytes support in transformers. "
+                "Install bitsandbytes (GPU Linux) and a recent transformers build."
+            ) from e
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+    elif quant in {"4bit", "nf4", "4"}:
+        try:
+            from transformers import BitsAndBytesConfig  # type: ignore
+        except Exception as e:
+            raise ImportError(
+                "AGENTLAB_LOCAL_QUANT=4bit requires bitsandbytes support in transformers. "
+                "Install bitsandbytes (GPU Linux) and a recent transformers build."
+            ) from e
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch_dtype or getattr(torch, "float16", None),
+        )
+
+    max_memory = _parse_max_memory()
+    if max_memory is not None:
+        model_kwargs["max_memory"] = max_memory
+
     if device.startswith("cuda"):
-        # Requires accelerate (included in AgentLaboratory requirements)
         model_kwargs["device_map"] = "auto"
+        if offload_enabled:
+            model_kwargs["offload_folder"] = offload_dir
+            model_kwargs["offload_state_dict"] = _env_truthy("AGENTLAB_OFFLOAD_STATE_DICT", default=True)
+            model_kwargs["offload_buffers"] = _env_truthy("AGENTLAB_OFFLOAD_BUFFERS", default=False)
+    else:
+        model_kwargs["device_map"] = {"": "cpu"}
 
     model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
     model.eval()
 
-    _LOCAL_LM_CACHE[key] = (tok, model)
-    return tok, model
+    if _env_truthy("AGENTLAB_TORCH_COMPILE", default=False):
+        compile_mode = (os.getenv("AGENTLAB_TORCH_COMPILE_MODE") or "reduce-overhead").strip()
+        try:
+            model = torch.compile(model, mode=compile_mode)
+        except Exception:
+            pass
+
+    value = (tok, model)
+    _local_cache_set(key, value)
+    return value
 
 
 def _local_transformers_chat(model_id: str, prompt: str, system_prompt: str, temp=None, timeout: float = 20.0) -> str:
@@ -130,8 +278,9 @@ def _local_transformers_chat(model_id: str, prompt: str, system_prompt: str, tem
     else:
         text = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{prompt}\n\nASSISTANT:\n"
 
-    max_new_tokens = int(os.getenv("AGENTLAB_LOCAL_MAX_NEW_TOKENS", "768"))
-    temperature = float(os.getenv("AGENTLAB_LOCAL_TEMPERATURE", str(temp if temp is not None else 0.2)))
+    max_new_tokens = _env_int("AGENTLAB_LOCAL_MAX_NEW_TOKENS", 768)
+    temperature = _env_float("AGENTLAB_LOCAL_TEMPERATURE", float(temp if temp is not None else 0.2))
+    max_input_tokens = _env_int("AGENTLAB_LOCAL_MAX_INPUT_TOKENS", 0)
 
     inputs = None
     out = None
@@ -140,7 +289,11 @@ def _local_transformers_chat(model_id: str, prompt: str, system_prompt: str, tem
     try:
         import torch  # type: ignore
 
-        inputs = tok(text, return_tensors="pt")
+        tok_kwargs = {"return_tensors": "pt"}
+        if max_input_tokens > 0:
+            tok_kwargs["truncation"] = True
+            tok_kwargs["max_length"] = max_input_tokens
+        inputs = tok(text, **tok_kwargs)
         # With device_map="auto", model spans devices; push inputs to the first param device.
         try:
             first_param = next(model.parameters())
@@ -165,6 +318,22 @@ def _local_transformers_chat(model_id: str, prompt: str, system_prompt: str, tem
     finally:
         del inputs, out, gen, messages, text, answer
         _best_effort_release_memory(clear_local_cache=False)
+
+def local_model_runtime_config() -> dict:
+    """Return the active local-model memory knobs for debugging / tests."""
+    return {
+        "device": _get_agentlab_device(),
+        "quant": (os.getenv("AGENTLAB_LOCAL_QUANT") or "none").strip().lower(),
+        "attn_impl": (os.getenv("AGENTLAB_ATTN_IMPL") or "sdpa").strip().lower(),
+        "dtype": (os.getenv("AGENTLAB_LOCAL_DTYPE") or "auto").strip().lower() or "auto",
+        "offload_enabled": _env_truthy("AGENTLAB_ENABLE_OFFLOAD", default=False) or bool((os.getenv("AGENTLAB_LOCAL_MAX_MEMORY") or "").strip()),
+        "offload_dir": (os.getenv("AGENTLAB_OFFLOAD_DIR") or "./.offload").strip(),
+        "torch_compile": _env_truthy("AGENTLAB_TORCH_COMPILE", default=False),
+        "max_input_tokens": _env_int("AGENTLAB_LOCAL_MAX_INPUT_TOKENS", 0),
+        "cache_max_items": _env_int("AGENTLAB_LOCAL_CACHE_MAX_ITEMS", 1),
+        "cache_ttl_s": _env_int("AGENTLAB_LOCAL_CACHE_TTL_S", 3600),
+        "max_memory": _parse_max_memory(),
+    }
 
 # Optional dependencies: keep g4f-only usage lightweight.
 try:
@@ -207,20 +376,209 @@ except Exception:
         g4f = None
 
 
-def _g4f_to_text(resp):
-    """g4f may return a string or an iterator (stream). Convert to string safely."""
-    if isinstance(resp, str):
-        return resp
-    if resp is not None and hasattr(resp, "__iter__"):
+def _chunk_to_text(chunk) -> str:
+    if isinstance(chunk, str):
+        return chunk
+    if isinstance(chunk, dict):
+        for key in ("content", "text"):
+            val = chunk.get(key)
+            if isinstance(val, str):
+                return val
         try:
-            parts = []
-            for ch in resp:
-                if isinstance(ch, str):
-                    parts.append(ch)
-            return "".join(parts)
+            choices = chunk.get("choices") or []
+            if choices:
+                delta = choices[0].get("delta") or {}
+                content = delta.get("content")
+                if isinstance(content, str):
+                    return content
         except Exception:
             return ""
+        return ""
+    for attr in ("content", "text"):
+        try:
+            val = getattr(chunk, attr)
+            if isinstance(val, str):
+                return val
+        except Exception:
+            pass
+    try:
+        choices = getattr(chunk, "choices")
+        if choices:
+            delta = getattr(choices[0], "delta", None)
+            content = getattr(delta, "content", None)
+            if isinstance(content, str):
+                return content
+    except Exception:
+        pass
     return ""
+
+
+def _g4f_to_text(resp, *, max_chars: int | None = None) -> str:
+    """g4f may return a string or an iterator (stream). Convert to string safely."""
+    if isinstance(resp, str):
+        if max_chars is not None and max_chars > 0:
+            return resp[:max_chars]
+        return resp
+    if resp is None or not hasattr(resp, "__iter__"):
+        return _chunk_to_text(resp)
+
+    buf = io.StringIO()
+    size = 0
+    try:
+        for ch in resp:
+            txt = _chunk_to_text(ch)
+            if not txt:
+                continue
+            if max_chars is not None and max_chars > 0:
+                remaining = max_chars - size
+                if remaining <= 0:
+                    break
+                if len(txt) > remaining:
+                    buf.write(txt[:remaining])
+                    size += remaining
+                    break
+            buf.write(txt)
+            size += len(txt)
+        return buf.getvalue()
+    except Exception:
+        return buf.getvalue()
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_remote_model(model_str: str | None) -> bool:
+    return not str(model_str or "").strip().startswith("local:")
+
+
+def _use_remote_subprocess_isolation(model_str: str | None) -> bool:
+    if not _is_remote_model(model_str):
+        return False
+    return _env_truthy("AGENTLAB_REMOTE_SUBPROCESS", default=True)
+
+
+def _g4f_supports_stream_flag() -> bool:
+    if g4f is None:
+        return False
+    try:
+        import inspect
+
+        sig = inspect.signature(g4f.ChatCompletion.create)  # type: ignore[attr-defined]
+        if "stream" in sig.parameters:
+            return True
+        return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    except Exception:
+        return True
+
+
+def _should_count_tokens(using_g4f_backend: bool) -> bool:
+    if tiktoken is None:
+        return False
+    if _env_truthy("AGENTLAB_DISABLE_TOKEN_COUNT", default=False):
+        return False
+    if using_g4f_backend and not _env_truthy("AGENTLAB_ENABLE_TOKEN_COUNT_FOR_G4F", default=False):
+        return False
+    return True
+
+
+def query_model_stable(
+    model_str,
+    prompt,
+    system_prompt,
+    openai_api_key=None,
+    gemini_api_key=None,
+    anthropic_api_key=None,
+    tries=5,
+    timeout=20.0,
+    temp=None,
+    print_cost=True,
+    version="1.5",
+):
+    if not _use_remote_subprocess_isolation(model_str):
+        return query_model(
+            model_str=model_str,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            openai_api_key=openai_api_key,
+            gemini_api_key=gemini_api_key,
+            anthropic_api_key=anthropic_api_key,
+            tries=tries,
+            timeout=timeout,
+            temp=temp,
+            print_cost=print_cost,
+            version=version,
+        )
+
+    worker_path = Path(__file__).resolve().with_name("query_model_worker.py")
+    if not worker_path.exists():
+        return query_model(
+            model_str=model_str,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            openai_api_key=openai_api_key,
+            gemini_api_key=gemini_api_key,
+            anthropic_api_key=anthropic_api_key,
+            tries=tries,
+            timeout=timeout,
+            temp=temp,
+            print_cost=print_cost,
+            version=version,
+        )
+
+    with tempfile.TemporaryDirectory(prefix="agentlab_query_") as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        prompt_file = tmpdir_path / "prompt.txt"
+        system_file = tmpdir_path / "system.txt"
+        out_json = tmpdir_path / "result.json"
+        prompt_file.write_text(prompt, encoding="utf-8")
+        system_file.write_text(system_prompt, encoding="utf-8")
+
+        cmd = [
+            sys.executable,
+            str(worker_path),
+            "--model",
+            str(model_str),
+            "--prompt-file",
+            str(prompt_file),
+            "--system-file",
+            str(system_file),
+            "--out-json",
+            str(out_json),
+            "--tries",
+            str(int(tries)),
+            "--timeout",
+            str(float(timeout)),
+            "--version",
+            str(version),
+        ]
+        if print_cost:
+            cmd.append("--print-cost")
+        if temp is not None:
+            cmd.extend(["--temp", str(temp)])
+
+        env = dict(os.environ)
+        env["AGENTLAB_REMOTE_SUBPROCESS"] = "0"
+        proc_timeout = max(30, int(float(timeout)) + 15)
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=proc_timeout)
+
+        if not out_json.exists():
+            stderr = (proc.stderr or proc.stdout or "").strip()
+            raise RuntimeError(f"{model_str}: remote worker did not produce a result file. {stderr}".strip())
+
+        payload = json.loads(out_json.read_text(encoding="utf-8"))
+        if payload.get("ok"):
+            answer = payload.get("answer", "")
+            return answer if isinstance(answer, str) else ""
+
+        error = str(payload.get("error", "") or "").strip()
+        error_type = str(payload.get("error_type", "") or "").strip()
+        if error_type == "MissingLLMCredentials":
+            raise MissingLLMCredentials(error or "credentials required")
+        raise RuntimeError(error or f"{model_str}: remote worker failed")
 
 
 class MissingLLMCredentials(RuntimeError):
@@ -381,6 +739,9 @@ def query_model(
                         kwargs["provider"] = prov
                     except Exception:
                         pass
+                if _g4f_supports_stream_flag():
+                    kwargs["stream"] = True
+                max_resp_chars = int(os.getenv("AGENTLAB_MAX_RESPONSE_CHARS", "60000") or "60000")
                 resp = g4f.ChatCompletion.create(
                     model=model_str,
                     messages=messages,
@@ -389,7 +750,7 @@ def query_model(
                     timeout=int(max(1, timeout)),
                     **kwargs,
                 )
-                answer = _g4f_to_text(resp)
+                answer = _g4f_to_text(resp, max_chars=max_resp_chars)
                 if isinstance(answer, str):
                     answer = answer.strip()
                 if answer:
@@ -545,19 +906,23 @@ def query_model(
                 answer = completion.choices[0].message.content
 
             try:
-                if model_str in ["o1-preview", "o1-mini", "claude-3.5-sonnet", "o1", "o3-mini"]:
-                    encoding = tiktoken.encoding_for_model("gpt-4o")
-                elif model_str in ["deepseek-chat"]:
-                    encoding = tiktoken.encoding_for_model("cl100k_base")
-                else:
-                    encoding = tiktoken.encoding_for_model(model_str)
-                if model_str not in TOKENS_IN:
-                    TOKENS_IN[model_str] = 0
-                    TOKENS_OUT[model_str] = 0
-                TOKENS_IN[model_str] += len(encoding.encode(system_prompt + prompt))
-                TOKENS_OUT[model_str] += len(encoding.encode(answer))
-                if print_cost:
-                    print(f"Current experiment cost = ${curr_cost_est()}, ** Approximate values, may not reflect true cost")
+                using_g4f_backend = bool(force_g4f or (g4f is not None and openai_api_key is None and anthropic_api_key is None and gemini_api_key is None))
+                if _should_count_tokens(using_g4f_backend):
+                    if model_str in ["o1-preview", "o1-mini", "claude-3.5-sonnet", "o1", "o3-mini"]:
+                        encoding = tiktoken.encoding_for_model("gpt-4o")
+                    elif model_str in ["deepseek-chat"]:
+                        encoding = tiktoken.encoding_for_model("cl100k_base")
+                    else:
+                        encoding = tiktoken.encoding_for_model(model_str)
+                    if model_str not in TOKENS_IN:
+                        TOKENS_IN[model_str] = 0
+                        TOKENS_OUT[model_str] = 0
+                    TOKENS_IN[model_str] += len(encoding.encode(system_prompt + prompt))
+                    TOKENS_OUT[model_str] += len(encoding.encode(answer))
+                    if print_cost:
+                        print(f"Current experiment cost = ${curr_cost_est()}, ** Approximate values, may not reflect true cost")
+                elif print_cost and using_g4f_backend:
+                    print("Token counting skipped for g4f low-RAM mode. Set AGENTLAB_ENABLE_TOKEN_COUNT_FOR_G4F=1 to enable.")
             except Exception as e:
                 if print_cost: print(f"Cost approximation has an error? {e}")
             _best_effort_release_memory(clear_local_cache=False)

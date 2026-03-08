@@ -1,0 +1,9 @@
+# Optional local-LLM extras for memory-optimized on-device inference
+# Install this only if you use model_str=local:<hf_model>
+torch
+transformers
+accelerate
+bitsandbytes
+safetensors
+sentencepiece
+psutil

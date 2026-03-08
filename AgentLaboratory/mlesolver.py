@@ -149,7 +149,7 @@ def get_score(outlined_plan, code, code_return, REWARD_MODEL_LLM, attempts=3, op
                 f"You are a professor agent who is serving as an expert reward model that can read a research plan, research code, and code output and are able to determine how well a model followed the plan, built the code, and got the proper output scored from 0 to 1 as a float.\n\n"
                 f"You must structure your score exactly in the following way: ```SCORE\n<score here>\n``` where SCORE is just the word score, <score here> is a floating point number between 0 and 1 representing how well the model followed the plan, built the code, and got the proper output."
             )
-            scoring = query_model(
+            scoring = query_model_stable(
                 model_str=f"{REWARD_MODEL_LLM}",
                 system_prompt=sys,
                 openai_api_key=openai_api_key,
@@ -174,7 +174,7 @@ def code_repair(code, error, ctype, REPAIR_LLM, openai_api_key=None):
             "You must wrap the code in the following ```python\n<code here>\n```\n"
             "Do not forget the opening ```python and the closing ```."
         )
-        model_resp = query_model(
+        model_resp = query_model_stable(
             openai_api_key=openai_api_key,
             model_str=f"{REPAIR_LLM}",
             system_prompt=repair_sys,
@@ -194,7 +194,7 @@ def code_repair(code, error, ctype, REPAIR_LLM, openai_api_key=None):
             "Do not forget the opening ```EDIT N M and the closing ```."
             "Your output should look like the following\n\n```EDIT N M\n<new lines to replace old lines>\n```"
         )
-        model_resp = query_model(
+        model_resp = query_model_stable(
             openai_api_key=openai_api_key,
             model_str=f"{REPAIR_LLM}",
             system_prompt=repair_sys,
@@ -337,7 +337,7 @@ class MLESolver:
                 if len(error_hist) == 5: _ = error_hist.pop(0)
                 err = "\n".join(error_hist)
                 err_hist = "The following is a history of your previous errors\n" + err + "\nDO NOT REPEAT THESE."
-            model_resp = query_model(
+            model_resp = query_model_stable(
                 openai_api_key=self.openai_api_key,
                 model_str=self.model,
                 system_prompt=self.system_prompt(),
@@ -359,7 +359,7 @@ class MLESolver:
         while True:
             if len(self.commands) == 2: cmd_app_str = "You must output either the ```EDIT or ```REPLACE command immediately. "
             else: cmd_app_str = ""
-            model_resp = query_model(
+            model_resp = query_model_stable(
                 openai_api_key=self.openai_api_key,
                 model_str=self.model,
                 system_prompt=self.system_prompt(),
@@ -403,7 +403,7 @@ class MLESolver:
         code_strs = ("$"*40 + "\n\n").join([self.generate_code_lines(_code[0]) + f"\nCode Return {_code[1]}" for _code in self.best_codes])
         code_strs = f"Please reflect on the following sets of code: {code_strs} and come up with generalizable insights that will help you improve your performance on this benchmark."
         syst = self.system_prompt(commands=False) + code_strs
-        return query_model(prompt="Please reflect on ideas for how to improve your current code. Examine the provided code and think very specifically (with precise ideas) on how to improve performance, which methods to use, how to improve generalization on the test set with line-by-line examples below:\n", system_prompt=syst, model_str=f"{self.llm_str}", openai_api_key=self.openai_api_key)
+        return query_model_stable(prompt="Please reflect on ideas for how to improve your current code. Examine the provided code and think very specifically (with precise ideas) on how to improve performance, which methods to use, how to improve generalization on the test set with line-by-line examples below:\n", system_prompt=syst, model_str=f"{self.llm_str}", openai_api_key=self.openai_api_key)
 
     def process_command(self, model_resp):
         """
@@ -594,7 +594,7 @@ class MLESolver:
         @return: (str) reflection string
         """
         # Keep reflection concise (full code is already in reflect_prompt).
-        return query_model(
+        return query_model_stable(
             prompt=reflect_prompt,
             system_prompt=self.system_prompt(commands=False),
             model_str=f"{self.llm_str}",

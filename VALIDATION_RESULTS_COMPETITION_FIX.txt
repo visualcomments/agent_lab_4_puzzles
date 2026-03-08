@@ -1,0 +1,6 @@
+Competition schema fix validation
+
+1) pytest subset: PASS (16 tests)
+2) pipeline_cli run --competition cayleypy-pancake --output submissions/submission.csv --no-llm --schema-check --max-iters 100: PASS
+3) submission header: id,permutation,solution
+4) first row example: 0,"3,2,0,1,4",R4.R2
