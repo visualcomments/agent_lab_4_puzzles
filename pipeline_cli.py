@@ -290,24 +290,27 @@ def cmd_check_g4f_models(args: argparse.Namespace) -> None:
     if not candidates:
         raise SystemExit("No g4f models found to check.")
 
-    if args.list_only:
+    source_name = "backend-api" if getattr(args, "backend_api_url", None) else "registry"
+
+    if getattr(args, "discover_only", False):
         payload = {
             "provider": provider_name or None,
-            "source": "backend-api" if getattr(args, "backend_api_url", None) else "registry",
-            "models": candidates,
-            "count": len(candidates),
+            "source": source_name,
+            "discovered_models": candidates,
+            "discovered_count": len(candidates),
         }
         if args.json:
             print(json.dumps(payload, indent=2, ensure_ascii=False))
         else:
-            print(f"Discovered {len(candidates)} g4f models:")
+            print(f"Discovered {len(candidates)} g4f candidate models (not probed):")
             for name in candidates:
                 print(name)
         return
 
     results = []
     working: List[str] = []
-    print(f"[g4f-check] checking {len(candidates)} model(s)...")
+    if not args.list_only:
+        print(f"[g4f-check] checking {len(candidates)} model(s) with prompt={args.prompt!r}...")
     for idx, model in enumerate(candidates, start=1):
         ok, info, elapsed = _probe_g4f_model(
             model=model,
@@ -324,12 +327,14 @@ def cmd_check_g4f_models(args: argparse.Namespace) -> None:
         results.append(result)
         if ok:
             working.append(model)
-        status = "OK" if ok else "FAIL"
-        print(f"[{idx}/{len(candidates)}] {model}: {status} ({elapsed:.2f}s) {info}")
+        if not args.list_only:
+            status = "OK" if ok else "FAIL"
+            print(f"[{idx}/{len(candidates)}] {model}: {status} ({elapsed:.2f}s) {info}")
 
     payload = {
         "provider": provider_name or None,
-        "source": "backend-api" if getattr(args, "backend_api_url", None) else "registry",
+        "source": source_name,
+        "probe_prompt": args.prompt,
         "working_models": working,
         "working_count": len(working),
         "checked_count": len(candidates),
@@ -338,12 +343,18 @@ def cmd_check_g4f_models(args: argparse.Namespace) -> None:
     if args.json:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
-        print("\nWorking g4f models:")
-        if working:
+        if args.list_only:
             for name in working:
                 print(name)
+            if not working:
+                print("<none>")
         else:
-            print("<none>")
+            print("\nWorking g4f models:")
+            if working:
+                for name in working:
+                    print(name)
+            else:
+                print("<none>")
 
 
 def _resolve_competition_zip(spec: PipelineSpec) -> Optional[Path]:
@@ -1701,9 +1712,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--backend-api-url", default=None, help="Optional base URL of a running g4f backend API; model list is fetched from /backend-api/v2/models.")
     sp.add_argument("--timeout", type=float, default=12.0, help="Per-model probe timeout in seconds")
     sp.add_argument("--max-models", type=int, default=None, help="Optional cap on number of models to check")
-    sp.add_argument("--prompt", default="Reply with exactly OK", help="Probe user prompt")
+    sp.add_argument("--prompt", default="ping", help="Probe user prompt")
     sp.add_argument("--system-prompt", default="Return a very short plain-text reply.", help="Probe system prompt")
-    sp.add_argument("--list-only", action="store_true", help="Only list discovered models without probing them")
+    sp.add_argument("--list-only", action="store_true", help="Probe models but print only the models that returned a non-empty answer")
+    sp.add_argument("--discover-only", action="store_true", help="Only list discovered candidate models without probing them")
     sp.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     sp.set_defaults(func=cmd_check_g4f_models)
 

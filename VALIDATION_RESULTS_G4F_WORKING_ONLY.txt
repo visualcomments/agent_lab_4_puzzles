@@ -1,0 +1,18 @@
+Validation summary for g4f working-only list change
+===============================================
+
+Repo: /mnt/data/work_g4f_filter
+
+1) Syntax check
+- python -m py_compile pipeline_cli.py tests_test_g4f_model_check.py
+- Result: PASS
+
+2) Targeted tests
+- pytest -q tests_test_g4f_model_check.py
+- Result: PASS (6 passed)
+
+3) Behavioral validation covered by tests
+- --list-only prints only models that returned a non-empty probe response
+- default probe prompt is 'ping'
+- --discover-only preserves candidate listing without probing
+- JSON output for --list-only returns working_models only

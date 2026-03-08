@@ -65,14 +65,17 @@ python pipeline_cli.py show-pipeline --competition <slug>
 ### Проверка g4f-моделей
 
 ```bash
-# Показать все обнаруженные текстовые модели g4f
+# Проверить модели запросом ping и вывести только те, которые реально ответили
 python pipeline_cli.py check-g4f-models --list-only
 
-# Проверить доступность и вывести только реально ответившие модели
+# То же, но с подробным статусом по каждой проверенной модели
 python pipeline_cli.py check-g4f-models --timeout 12
 
 # Проверить свой белый список
 python pipeline_cli.py check-g4f-models --models gpt-4o-mini,command-r,aria
+
+# При необходимости отдельно показать все найденные кандидаты без probe
+python pipeline_cli.py check-g4f-models --discover-only
 ```
 
 ---

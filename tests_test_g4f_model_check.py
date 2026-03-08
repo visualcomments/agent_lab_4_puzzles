@@ -77,11 +77,50 @@ def test_cmd_check_g4f_models_prints_working_models(monkeypatch, capsys):
     assert "command-r" in out  # shown in per-model status lines
 
 
-def test_cmd_check_g4f_models_json_list_only_dedupes_prefixes(capsys):
+def test_cmd_check_g4f_models_list_only_prints_only_models_that_answered(monkeypatch, capsys):
+    monkeypatch.setattr(
+        pipeline_cli,
+        "_discover_g4f_candidate_models",
+        lambda backend_api_url=None: ["gpt-4o-mini", "command-r", "aria"],
+    )
+
+    def fake_probe(model, timeout, prompt, system_prompt):
+        assert prompt == "ping"
+        if model in {"gpt-4o-mini", "aria"}:
+            return True, "pong", 0.1
+        return False, "timeout", 0.2
+
+    monkeypatch.setattr(pipeline_cli, "_probe_g4f_model", fake_probe)
+
+    args = pipeline_cli.build_parser().parse_args(["check-g4f-models", "--list-only", "--max-models", "3"])
+    args.func(args)
+
+    out_lines = [line.strip() for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert out_lines == ["gpt-4o-mini", "aria"]
+
+
+def test_cmd_check_g4f_models_json_list_only_reports_only_working_subset(monkeypatch, capsys):
+    def fake_probe(model, timeout, prompt, system_prompt):
+        return (model == "gpt-4o-mini"), "OK" if model == "gpt-4o-mini" else "err", 0.1
+
+    monkeypatch.setattr(pipeline_cli, "_probe_g4f_model", fake_probe)
+
     args = pipeline_cli.build_parser().parse_args(
         ["check-g4f-models", "--list-only", "--json", "--models", "g4f:gpt-4o-mini,gpt-4o-mini,aria"]
     )
     args.func(args)
     payload = json.loads(capsys.readouterr().out)
-    assert payload["models"] == ["gpt-4o-mini", "aria"]
-    assert payload["count"] == 2
+    assert payload["working_models"] == ["gpt-4o-mini"]
+    assert payload["working_count"] == 1
+    assert payload["checked_count"] == 2
+    assert payload["probe_prompt"] == "ping"
+
+
+def test_cmd_check_g4f_models_discover_only_json_preserves_candidate_listing(capsys):
+    args = pipeline_cli.build_parser().parse_args(
+        ["check-g4f-models", "--discover-only", "--json", "--models", "g4f:gpt-4o-mini,gpt-4o-mini,aria"]
+    )
+    args.func(args)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["discovered_models"] == ["gpt-4o-mini", "aria"]
+    assert payload["discovered_count"] == 2
