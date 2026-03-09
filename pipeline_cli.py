@@ -693,6 +693,119 @@ def _validate_submission_schema(
     }
 
 
+def _load_allowed_moves_from_validator(validator_path: Path) -> Optional[set[str]]:
+    """Best-effort load of ALLOWED move tokens from a competition validator."""
+    try:
+        mod_name = f"_validator_{validator_path.stem}_{abs(hash(str(validator_path)))}"
+        spec = importlib.util.spec_from_file_location(mod_name, validator_path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        allowed = getattr(module, "ALLOWED", None)
+        if allowed is None:
+            return None
+        normalized = {str(x) for x in allowed if str(x)}
+        return normalized or None
+    except Exception:
+        return None
+
+
+def _validate_submission_move_tokens(
+    *,
+    submission_csv: Path,
+    move_column: str,
+    allowed_moves: set[str],
+    joiner: str = ".",
+) -> dict[str, Any]:
+    """Validate that every move token in the built submission is competition-legal."""
+    if not allowed_moves:
+        return {}
+
+    with submission_csv.open(newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError(f"submission CSV is empty: {submission_csv}")
+        if move_column not in reader.fieldnames:
+            raise ValueError(
+                f"submission CSV is missing move column {move_column!r}. "
+                f"Fields: {reader.fieldnames}"
+            )
+
+        rows_checked = 0
+        non_empty_rows = 0
+        max_tokens = 0
+        for row_idx, row in enumerate(reader, 1):
+            rows_checked += 1
+            raw = str(row.get(move_column, '') or '').strip()
+            if not raw:
+                continue
+            non_empty_rows += 1
+            tokens = [tok.strip() for tok in raw.split(joiner)] if joiner else [raw]
+            tokens = [tok for tok in tokens if tok]
+            max_tokens = max(max_tokens, len(tokens))
+            for token in tokens:
+                if token == 'UNSOLVED':
+                    continue
+                if token not in allowed_moves:
+                    raise ValueError(
+                        f"Row {row_idx}: unknown move {token!r}. "
+                        f"Allowed: {sorted(allowed_moves)}"
+                    )
+
+    return {
+        'move_column': move_column,
+        'allowed_moves': sorted(allowed_moves),
+        'rows_checked': rows_checked,
+        'rows_with_moves': non_empty_rows,
+        'max_tokens_in_row': max_tokens,
+    }
+
+
+def _resolve_submission_move_column(competition_slug: str) -> tuple[str, str]:
+    """Return (output_move_column, joiner) for a competition format."""
+    _ensure_llm_puzzles_on_path()
+    from src.comp_registry import get_config  # type: ignore
+
+    cfg = get_config(competition_slug)
+    headers = list(cfg.submission_headers or [])
+    keys = list(cfg.header_keys or [])
+    for header, key in zip(headers, keys):
+        if key == 'moves':
+            return str(header), str(cfg.move_joiner or '.')
+    return str(cfg.moves_key or 'moves'), str(cfg.move_joiner or '.')
+
+
+def _candidate_output_path(out_csv: Path) -> Path:
+    return out_csv.with_name(out_csv.name + '.candidate')
+
+
+def _backup_output_path(out_csv: Path) -> Path:
+    return out_csv.with_name(out_csv.name + '.bak')
+
+
+def _finalize_submission_output(candidate_csv: Path, out_csv: Path) -> None:
+    if not candidate_csv.exists():
+        raise FileNotFoundError(candidate_csv)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    if out_csv.exists():
+        shutil.copyfile(out_csv, _backup_output_path(out_csv))
+    candidate_csv.replace(out_csv)
+
+
+def _format_kaggle_submit_error(exc: Exception, competition: str) -> str:
+    status_code = getattr(getattr(exc, 'response', None), 'status_code', None)
+    if status_code == 401:
+        return (
+            f"Kaggle returned 401 Unauthorized while submitting to '{competition}'. "
+            "Most often this means the runtime has no valid Kaggle credentials, the token is stale, "
+            "or the competition rules have not been accepted for this account. "
+            "Pass --kaggle-json /path/to/kaggle.json (or ~/.kaggle/access_token), regenerate the token if needed, "
+            "and make sure the account has joined the competition."
+        )
+    return f"Kaggle submission failed: {exc}"
+
+
 def _append_run_log(path: Path, record: dict) -> None:
     """Append a run record to run_log.json.
 
@@ -825,8 +938,8 @@ def _kaggle_submit(
             return
         except Exception as e:
             if submit_via == 'api':
-                raise
-            print(f"[kaggle] API submit failed, falling back to CLI: {e}", flush=True)
+                raise SystemExit(_format_kaggle_submit_error(e, competition))
+            print(f"[kaggle] API submit failed, falling back to CLI: {_format_kaggle_submit_error(e, competition)}", flush=True)
 
     env = os.environ.copy()
     if kaggle_json:
@@ -856,7 +969,7 @@ def _kaggle_submit(
                 break
             print(f"[kaggle] CLI submit attempt {idx} failed, retrying with compatibility syntax: {e}", flush=True)
     assert last_error is not None
-    raise last_error
+    raise SystemExit(_format_kaggle_submit_error(last_error, competition))
 
 
 # ---------------------------------------------------------------------------
@@ -1007,22 +1120,6 @@ def _poll_kaggle_submission_status(competition: str, kaggle_json: str | None, ka
         print(f"[kaggle] WARNING: could not poll submission status: {e}", flush=True)
 
 
-def _move_stale_output_aside(path: Path) -> Optional[Path]:
-    """Move an existing output file aside before a new run.
-
-    This prevents an old submission.csv from being accidentally uploaded when a
-    later run fails before producing a fresh file.
-    """
-    if not path.exists():
-        return None
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup = path.with_name(f"{path.name}.stale-{ts}.bak")
-    backup.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(path), str(backup))
-    print(f"[output] moved stale file aside -> {backup}")
-    return backup
-
-
 def _build_submission(
     *,
     puzzles_csv: Path,
@@ -1070,21 +1167,16 @@ def _build_submission(
     print(f"         output={out_csv}")
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
-    tmp_out_csv = out_csv.with_name(out_csv.name + ".tmp")
-    if tmp_out_csv.exists():
-        tmp_out_csv.unlink()
 
     lp_build_submission(
         puzzles_csv=str(puzzles_csv),
-        output_csv=str(tmp_out_csv),
+        output_csv=str(out_csv),
         competition=resolved_format_slug,
         solver=row_solver,
         max_rows=max_rows,
         progress=(not no_progress),
         progress_desc=f"{spec.key}: building submission",
     )
-
-    tmp_out_csv.replace(out_csv)
 
 
 # ---------------------------------------------------------------------------
@@ -1440,7 +1532,7 @@ def cmd_build_submission(args: argparse.Namespace) -> None:
     solver_path = Path(args.solver)
     puzzles_csv = Path(args.puzzles) if args.puzzles else _resolve_default_puzzles(spec)
     out_csv = Path(args.output)
-    stale_output_backup = _move_stale_output_aside(out_csv)
+    candidate_out = _candidate_output_path(out_csv)
 
     report: dict[str, Any] = {
         "ts": datetime.now().isoformat(),
@@ -1453,8 +1545,6 @@ def cmd_build_submission(args: argparse.Namespace) -> None:
         "solver": str(solver_path),
         "stages": {},
     }
-    if stale_output_backup is not None:
-        report["stale_output_backup"] = str(stale_output_backup)
 
     run_log_path = Path(args.run_log) if args.run_log else (out_csv.parent / "run_log.json")
 
@@ -1464,16 +1554,15 @@ def cmd_build_submission(args: argparse.Namespace) -> None:
     except Exception:
         sample_for_log = None
 
-    candidate_out_csv = out_csv.with_name(out_csv.name + ".candidate")
-    if candidate_out_csv.exists():
-        candidate_out_csv.unlink()
-
     try:
+        if candidate_out.exists():
+            candidate_out.unlink()
+
         t2 = _stage("build submission")
         report["stages"]["build_submission"] = {"start": time.time()}
         _build_submission(
             puzzles_csv=puzzles_csv,
-            out_csv=candidate_out_csv,
+            out_csv=candidate_out,
             competition_format_slug=args.format or spec.format_slug,
             solver_path=solver_path,
             spec=spec,
@@ -1483,6 +1572,23 @@ def cmd_build_submission(args: argparse.Namespace) -> None:
         )
         report["stages"]["build_submission"]["end"] = time.time()
         report["stages"]["build_submission"]["seconds"] = report["stages"]["build_submission"]["end"] - report["stages"]["build_submission"]["start"]
+        _stage_done("build submission", t2)
+
+        allowed_moves = _load_allowed_moves_from_validator(spec.validator)
+        if allowed_moves:
+            tmc = _stage("content check")
+            report["stages"]["content_check"] = {"start": time.time()}
+            move_column, joiner = _resolve_submission_move_column(args.format or spec.competition)
+            move_stats = _validate_submission_move_tokens(
+                submission_csv=candidate_out,
+                move_column=move_column,
+                allowed_moves=allowed_moves,
+                joiner=joiner,
+            )
+            report["move_validation"] = move_stats
+            report["stages"]["content_check"]["end"] = time.time()
+            report["stages"]["content_check"]["seconds"] = report["stages"]["content_check"]["end"] - report["stages"]["content_check"]["start"]
+            _stage_done("content check", tmc)
 
         if args.schema_check and not args.no_schema_check:
             sample = _resolve_sample_submission(spec)
@@ -1492,7 +1598,7 @@ def cmd_build_submission(args: argparse.Namespace) -> None:
                 tsc = _stage("schema check")
                 report["stages"]["schema_check"] = {"start": time.time()}
                 stats = _validate_submission_schema(
-                    submission_csv=candidate_out_csv,
+                    submission_csv=candidate_out,
                     sample_submission_csv=sample,
                     check_ids=(not args.no_schema_check_ids),
                 )
@@ -1501,8 +1607,7 @@ def cmd_build_submission(args: argparse.Namespace) -> None:
                 report["stages"]["schema_check"]["seconds"] = report["stages"]["schema_check"]["end"] - report["stages"]["schema_check"]["start"]
                 _stage_done("schema check", tsc)
 
-        candidate_out_csv.replace(out_csv)
-        _stage_done("build submission", t2)
+        _finalize_submission_output(candidate_out, out_csv)
         report["status"] = "ok"
     except Exception as e:
         now = time.time()
@@ -1523,7 +1628,7 @@ def cmd_build_submission(args: argparse.Namespace) -> None:
             _attach_io_stats(
                 report,
                 puzzles_csv=puzzles_csv,
-                output_csv=(out_csv if out_csv.exists() else candidate_out_csv),
+                output_csv=out_csv,
                 solver_path=solver_path,
                 sample_submission_csv=sample_for_log,
             )
@@ -1567,7 +1672,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     puzzles_csv = Path(args.puzzles) if args.puzzles else _resolve_default_puzzles(spec)
     out_csv = Path(args.output)
-    stale_output_backup = _move_stale_output_aside(out_csv)
+    candidate_out = _candidate_output_path(out_csv)
     run_log_path = Path(args.run_log) if args.run_log else (out_csv.parent / "run_log.json")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1598,18 +1703,12 @@ def cmd_run(args: argparse.Namespace) -> None:
         },
         "stages": {},
     }
-    if stale_output_backup is not None:
-        report["stale_output_backup"] = str(stale_output_backup)
 
     sample_for_log: Path | None = None
     try:
         sample_for_log = _resolve_sample_submission(spec)
     except Exception:
         sample_for_log = None
-
-    candidate_out_csv = out_csv.with_name(out_csv.name + ".candidate")
-    if candidate_out_csv.exists():
-        candidate_out_csv.unlink()
 
     try:
         t0 = _stage("generate solver")
@@ -1657,11 +1756,14 @@ def cmd_run(args: argparse.Namespace) -> None:
         _stage_done("validate solver", t1)
 
         # Build submission
+        if candidate_out.exists():
+            candidate_out.unlink()
+
         t2 = _stage("build submission")
         report["stages"]["build_submission"] = {"start": time.time()}
         _build_submission(
             puzzles_csv=puzzles_csv,
-            out_csv=candidate_out_csv,
+            out_csv=candidate_out,
             competition_format_slug=args.format or spec.format_slug,
             solver_path=solver_path,
             spec=spec,
@@ -1673,6 +1775,22 @@ def cmd_run(args: argparse.Namespace) -> None:
         report["stages"]["build_submission"]["seconds"] = report["stages"]["build_submission"]["end"] - report["stages"]["build_submission"]["start"]
         _stage_done("build submission", t2)
 
+        allowed_moves = _load_allowed_moves_from_validator(spec.validator)
+        if allowed_moves:
+            tmc = _stage("content check")
+            report["stages"]["content_check"] = {"start": time.time()}
+            move_column, joiner = _resolve_submission_move_column(args.format or spec.competition)
+            move_stats = _validate_submission_move_tokens(
+                submission_csv=candidate_out,
+                move_column=move_column,
+                allowed_moves=allowed_moves,
+                joiner=joiner,
+            )
+            report["move_validation"] = move_stats
+            report["stages"]["content_check"]["end"] = time.time()
+            report["stages"]["content_check"]["seconds"] = report["stages"]["content_check"]["end"] - report["stages"]["content_check"]["start"]
+            _stage_done("content check", tmc)
+
         # Schema check (auto before submit; optional otherwise)
         do_schema_check = (args.submit or args.schema_check) and (not args.no_schema_check)
         if do_schema_check:
@@ -1683,7 +1801,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                 tsc = _stage("schema check")
                 report["stages"]["schema_check"] = {"start": time.time()}
                 stats = _validate_submission_schema(
-                    submission_csv=candidate_out_csv,
+                    submission_csv=candidate_out,
                     sample_submission_csv=sample,
                     check_ids=(not args.no_schema_check_ids),
                 )
@@ -1692,7 +1810,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                 report["stages"]["schema_check"]["seconds"] = report["stages"]["schema_check"]["end"] - report["stages"]["schema_check"]["start"]
                 _stage_done("schema check", tsc)
 
-        candidate_out_csv.replace(out_csv)
+        _finalize_submission_output(candidate_out, out_csv)
 
         # Optionally submit to Kaggle
         if args.submit:
@@ -1735,7 +1853,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             _attach_io_stats(
                 report,
                 puzzles_csv=puzzles_csv,
-                output_csv=(out_csv if out_csv.exists() else candidate_out_csv),
+                output_csv=out_csv,
                 solver_path=solver_path,
                 sample_submission_csv=sample_for_log,
             )

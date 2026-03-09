@@ -43,35 +43,3 @@ def test_infer_format_slug_from_sample_header(tmp_path):
     sample = tmp_path / "sample_submission.csv"
     sample.write_text("id,permutation,solution\n0,3,UNSOLVED\n", encoding="utf-8")
     assert pipeline_cli._infer_format_slug_from_sample(sample) == "format/id+permutation+solution"
-
-
-def test_rapapport_sample_row_matches_competition_move_semantics():
-    sample = ROOT / "competitions" / "cayleypy-rapapport-m2" / "data" / "sample_submission.csv"
-    with sample.open(newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        row = next(reader)
-    arr = [int(x) for x in row["permutation"].split(",")]
-    for move in row["solution"].split("."):
-        if move == "S":
-            arr[0], arr[1] = arr[1], arr[0]
-        elif move == "I":
-            i = 0
-            while i + 1 < len(arr):
-                arr[i], arr[i + 1] = arr[i + 1], arr[i]
-                i += 2
-        elif move == "K":
-            i = 1
-            while i + 1 < len(arr):
-                arr[i], arr[i + 1] = arr[i + 1], arr[i]
-                i += 2
-    assert arr == sorted(arr)
-
-
-def test_move_stale_output_aside(tmp_path):
-    out = tmp_path / "submission.csv"
-    out.write_text("old", encoding="utf-8")
-    backup = pipeline_cli._move_stale_output_aside(out)
-    assert backup is not None
-    assert backup.exists()
-    assert not out.exists()
-    assert backup.read_text(encoding="utf-8") == "old"

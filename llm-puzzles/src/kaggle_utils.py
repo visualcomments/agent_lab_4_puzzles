@@ -63,8 +63,26 @@ def _load_kaggle_credentials(credentials_path: str) -> dict:
     )
 
 
+
+
+def _discover_default_credentials_path(config_dir: Optional[str] = None) -> Optional[str]:
+    candidates = []
+    cfg_dir = Path(config_dir).expanduser() if config_dir else None
+    env_cfg = Path(os.environ["KAGGLE_CONFIG_DIR"]).expanduser() if os.environ.get("KAGGLE_CONFIG_DIR") else None
+    for base in [cfg_dir, env_cfg, Path.home() / ".kaggle"]:
+        if base is None:
+            continue
+        candidates.append(base / "kaggle.json")
+        candidates.append(base / "access_token")
+    for path in candidates:
+        if path.exists():
+            return str(path)
+    return None
+
+
 def build_kaggle_env(credentials_path: Optional[str] = None, config_dir: Optional[str] = None) -> dict[str, str]:
     env: dict[str, str] = {}
+    credentials_path = credentials_path or _discover_default_credentials_path(config_dir)
     if not credentials_path:
         return env
 
@@ -116,8 +134,9 @@ def ensure_auth(kaggle_json_path: Optional[str] = None, config_dir: Optional[str
     if KaggleApi is None:
         raise ImportError("kaggle package is not installed. Run: pip install kaggle")
 
-    if kaggle_json_path:
-        os.environ.update(build_kaggle_env(kaggle_json_path, config_dir=config_dir))
+    env_updates = build_kaggle_env(kaggle_json_path, config_dir=config_dir)
+    if env_updates:
+        os.environ.update(env_updates)
 
     api = KaggleApi()
     api.authenticate()
