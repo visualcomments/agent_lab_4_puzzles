@@ -1114,6 +1114,10 @@ def _run_agent_laboratory(
     max_iters: int = 8,
     no_llm: bool = False,
     allow_baseline: bool = True,
+    g4f_recovery_rounds: int | None = None,
+    g4f_recovery_max_iters: int | None = None,
+    g4f_recovery_sleep: float | None = None,
+    worker_no_kill_process_group: bool = False,
 ) -> None:
     """Run AgentLaboratory perm_pipeline to generate/repair a solver."""
 
@@ -1153,10 +1157,23 @@ def _run_agent_laboratory(
         cmd.extend(["--custom-prompts", str(custom_prompts)])
 
     env = os.environ.copy()
-    env.update(_memory_env_for_codegen(llm))
+    effective_codegen_env = _memory_env_for_codegen(llm)
+    env.update(effective_codegen_env)
+    if g4f_recovery_rounds is not None:
+        env["AGENTLAB_G4F_RECOVERY_ROUNDS"] = str(max(0, int(g4f_recovery_rounds)))
+        effective_codegen_env["AGENTLAB_G4F_RECOVERY_ROUNDS"] = env["AGENTLAB_G4F_RECOVERY_ROUNDS"]
+    if g4f_recovery_max_iters is not None:
+        env["AGENTLAB_G4F_RECOVERY_MAX_ITERS"] = str(max(1, int(g4f_recovery_max_iters)))
+        effective_codegen_env["AGENTLAB_G4F_RECOVERY_MAX_ITERS"] = env["AGENTLAB_G4F_RECOVERY_MAX_ITERS"]
+    if g4f_recovery_sleep is not None:
+        env["AGENTLAB_G4F_RECOVERY_SLEEP_S"] = str(max(0.0, float(g4f_recovery_sleep)))
+        effective_codegen_env["AGENTLAB_G4F_RECOVERY_SLEEP_S"] = env["AGENTLAB_G4F_RECOVERY_SLEEP_S"]
+    if worker_no_kill_process_group:
+        env["AGENTLAB_WORKER_KILL_PROCESS_GROUP"] = "0"
+        effective_codegen_env["AGENTLAB_WORKER_KILL_PROCESS_GROUP"] = "0"
     print("[agentlab] " + " ".join(cmd))
-    if env:
-        print("[agentlab] low-RAM env: " + ", ".join(f"{k}={env[k]}" for k in sorted(_memory_env_for_codegen(llm).keys())))
+    if effective_codegen_env:
+        print("[agentlab] low-RAM env: " + ", ".join(f"{k}={effective_codegen_env[k]}" for k in sorted(effective_codegen_env.keys())))
     subprocess.check_call(cmd, cwd=str(ROOT), env=env)
 
 
@@ -1383,6 +1400,10 @@ def cmd_generate_solver(args: argparse.Namespace) -> None:
         max_iters=args.max_iters,
         no_llm=False,
         allow_baseline=args.allow_baseline,
+        g4f_recovery_rounds=args.g4f_recovery_rounds,
+        g4f_recovery_max_iters=args.g4f_recovery_max_iters,
+        g4f_recovery_sleep=args.g4f_recovery_sleep,
+        worker_no_kill_process_group=args.worker_no_kill_process_group,
     )
 
     _validate_solver(out_path, spec.validator, spec.smoke_vector or [0, 1])
@@ -1581,6 +1602,10 @@ def cmd_run(args: argparse.Namespace) -> None:
                 max_iters=args.max_iters,
                 no_llm=False,
                 allow_baseline=args.allow_baseline,
+                g4f_recovery_rounds=args.g4f_recovery_rounds,
+                g4f_recovery_max_iters=args.g4f_recovery_max_iters,
+                g4f_recovery_sleep=args.g4f_recovery_sleep,
+                worker_no_kill_process_group=args.worker_no_kill_process_group,
             )
 
         report["stages"]["generate_solver"]["end"] = time.time()
@@ -1788,6 +1813,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--coder-models", default=None, help="Optional model list override for the coder agent.")
     sp.add_argument("--fixer-models", default=None, help="Optional model list override for the fixer agent.")
     sp.add_argument("--max-iters", type=int, default=8)
+    sp.add_argument("--g4f-recovery-rounds", type=int, default=None, help="Extra recovery rounds before offline fallback (forwarded to AgentLaboratory).")
+    sp.add_argument("--g4f-recovery-max-iters", type=int, default=None, help="Fixer iterations per recovery round (forwarded to AgentLaboratory).")
+    sp.add_argument("--g4f-recovery-sleep", type=float, default=None, help="Cooldown in seconds before each recovery round (forwarded to AgentLaboratory).")
+    sp.add_argument("--worker-no-kill-process-group", action="store_true", help="Do not hard-kill the entire worker process group on timeout; only terminate the worker process itself.")
     sp.add_argument("--allow-baseline", action="store_true")
     sp.add_argument("--no-llm", action="store_true", help="Skip LLM: just copy baseline")
     sp.set_defaults(func=cmd_generate_solver)
@@ -1837,6 +1866,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--coder-models", default=None, help="Optional model list override for the coder agent.")
     sp.add_argument("--fixer-models", default=None, help="Optional model list override for the fixer agent.")
     sp.add_argument("--max-iters", type=int, default=8)
+    sp.add_argument("--g4f-recovery-rounds", type=int, default=None, help="Extra recovery rounds before offline fallback (forwarded to AgentLaboratory).")
+    sp.add_argument("--g4f-recovery-max-iters", type=int, default=None, help="Fixer iterations per recovery round (forwarded to AgentLaboratory).")
+    sp.add_argument("--g4f-recovery-sleep", type=float, default=None, help="Cooldown in seconds before each recovery round (forwarded to AgentLaboratory).")
+    sp.add_argument("--worker-no-kill-process-group", action="store_true", help="Do not hard-kill the entire worker process group on timeout; only terminate the worker process itself.")
     sp.add_argument("--allow-baseline", action="store_true")
     sp.add_argument("--no-llm", action="store_true")
     sp.add_argument("--format", default=None, help="Override llm-puzzles format slug")

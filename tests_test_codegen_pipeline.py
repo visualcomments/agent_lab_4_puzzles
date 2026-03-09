@@ -73,3 +73,70 @@ def test_query_model_stable_bypasses_worker_for_local(monkeypatch):
     monkeypatch.setattr(rpp, 'query_model', fake_query_model)
     answer = rpp._query_model_stable('local:demo-model', 'prompt', 'system')
     assert answer == 'LOCAL_OK'
+
+
+def test_attempt_recovery_rounds_retries_models(monkeypatch, tmp_path):
+    reports = [
+        'g4f:gpt-4: fixer iteration 44 did not return a python file',
+        'g4f:gpt-4: baseline-patcher did not return a python file',
+    ]
+    monkeypatch.setenv('AGENTLAB_G4F_RECOVERY_ROUNDS', '1')
+    monkeypatch.setenv('AGENTLAB_G4F_RECOVERY_MAX_ITERS', '1')
+    monkeypatch.setenv('AGENTLAB_G4F_RECOVERY_SLEEP_S', '0')
+
+    calls = []
+
+    def fake_try_generate_with_model(**kwargs):
+        calls.append((kwargs['model'], kwargs['stage_label'], kwargs['plan'], kwargs['baseline_code']))
+        return True, 'g4f:gpt-4: recovery round 1 output validated immediately'
+
+    monkeypatch.setattr(rpp, 'try_generate_with_model', fake_try_generate_with_model)
+    monkeypatch.setattr(rpp, '_best_effort_release_memory', lambda clear_local_cache=True: None)
+
+    ok, report = rpp.attempt_recovery_rounds(
+        recovery_models=['g4f:gpt-4'],
+        fixer_models=['g4f:gpt-4'],
+        user_prompt='solve it',
+        plan='initial plan',
+        prompts={'coder': 'coder', 'fixer': 'fixer'},
+        out_path=tmp_path / 'solve.py',
+        validator_path=tmp_path / 'validator.py',
+        tests=[[1, 2, 3]],
+        max_iters=4,
+        baseline_code='def solve(vec):\n    return [], list(vec)\n',
+        generation_reports=reports,
+    )
+
+    assert ok is True
+    assert 'recovery round 1' in report
+    assert calls
+    assert calls[0][1] == 'recovery round 1'
+    assert 'RECOVERY MODE' in calls[0][2]
+    assert 'did not return a python file' in calls[0][2]
+
+
+def test_attempt_recovery_rounds_skips_nonrecoverable_reports(monkeypatch, tmp_path):
+    monkeypatch.setenv('AGENTLAB_G4F_RECOVERY_ROUNDS', '1')
+    called = []
+
+    def fake_try_generate_with_model(**kwargs):
+        called.append(kwargs)
+        return False, 'should not run'
+
+    monkeypatch.setattr(rpp, 'try_generate_with_model', fake_try_generate_with_model)
+    ok, report = rpp.attempt_recovery_rounds(
+        recovery_models=['g4f:gpt-4'],
+        fixer_models=['g4f:gpt-4'],
+        user_prompt='solve it',
+        plan='plan',
+        prompts={'coder': 'coder', 'fixer': 'fixer'},
+        out_path=tmp_path / 'solve.py',
+        validator_path=tmp_path / 'validator.py',
+        tests=[[1, 2, 3]],
+        max_iters=4,
+        baseline_code='def solve(vec):\n    return [], list(vec)\n',
+        generation_reports=['compile check failed'],
+    )
+    assert ok is False
+    assert report is None
+    assert called == []

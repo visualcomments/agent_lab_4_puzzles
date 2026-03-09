@@ -92,3 +92,51 @@ def test_g4f_to_text_stops_on_idle_stream_timeout():
     )
     assert out == "abc"
 
+
+
+def test_terminate_process_tree_can_avoid_killpg(monkeypatch):
+    events = []
+
+    class DummyProc:
+        pid = 123
+        def terminate(self):
+            events.append('terminate')
+        def kill(self):
+            events.append('kill')
+        def wait(self, timeout=None):
+            events.append(f'wait:{timeout}')
+
+    monkeypatch.setenv('AGENTLAB_WORKER_KILL_PROCESS_GROUP', '0')
+    monkeypatch.setattr(inference.os, 'name', 'posix')
+
+    def fail_killpg(pid, sig):
+        events.append(f'killpg:{pid}:{sig}')
+        raise AssertionError('killpg should not be used when disabled')
+
+    monkeypatch.setattr(inference.os, 'killpg', fail_killpg)
+    inference._terminate_process_tree(DummyProc())
+    assert events[0] == 'terminate'
+    assert not any(evt.startswith('killpg:') for evt in events)
+
+
+def test_terminate_process_tree_uses_killpg_by_default(monkeypatch):
+    events = []
+
+    class DummyProc:
+        pid = 321
+        def kill(self):
+            events.append('kill')
+        def wait(self, timeout=None):
+            events.append(f'wait:{timeout}')
+
+    monkeypatch.delenv('AGENTLAB_WORKER_KILL_PROCESS_GROUP', raising=False)
+    monkeypatch.setattr(inference.os, 'name', 'posix')
+
+    def fake_killpg(pid, sig):
+        events.append(f'killpg:{pid}:{sig}')
+        if sig == inference.signal.SIGTERM:
+            raise RuntimeError('force escalation')
+
+    monkeypatch.setattr(inference.os, 'killpg', fake_killpg)
+    inference._terminate_process_tree(DummyProc())
+    assert any(evt.startswith('killpg:321:') for evt in events)

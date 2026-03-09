@@ -659,13 +659,33 @@ def _worker_log_excerpt(stdout_path: Path, stderr_path: Path, *, max_chars: int 
     return "\n\n".join(parts).strip()
 
 
+def _worker_kill_process_group_enabled() -> bool:
+    return _env_truthy("AGENTLAB_WORKER_KILL_PROCESS_GROUP", default=True)
+
+
 def _terminate_process_tree(proc: subprocess.Popen) -> None:
-    try:
-        if os.name != "nt":
+    kill_group = _worker_kill_process_group_enabled()
+    if os.name != "nt" and kill_group:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=2)
+            return
+        except Exception:
+            pass
+        try:
             os.killpg(proc.pid, signal.SIGKILL)
-        else:
-            proc.kill()
-    except Exception:
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    else:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+            return
+        except Exception:
+            pass
         try:
             proc.kill()
         except Exception:
@@ -693,7 +713,7 @@ def _run_json_worker_subprocess(
             "stderr": stderr_f,
             "env": env,
         }
-        if os.name != "nt":
+        if os.name != "nt" and _worker_kill_process_group_enabled():
             popen_kwargs["start_new_session"] = True
         proc = subprocess.Popen(cmd, **popen_kwargs)
         try:

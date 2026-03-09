@@ -25,6 +25,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -182,6 +183,13 @@ def extract_python(resp: str) -> Optional[str]:
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)) or str(default))
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)) or str(default))
     except Exception:
         return default
 
@@ -688,6 +696,102 @@ def try_generate_with_model(
     )
 
 
+def _recovery_enabled() -> bool:
+    return _env_int("AGENTLAB_G4F_RECOVERY_ROUNDS", 1) > 0
+
+
+def _report_is_recoverable(report: str) -> bool:
+    lowered = (report or "").lower()
+    markers = (
+        "did not return a python file",
+        "format-rescue failed",
+        "remote worker timed out",
+        "remote worker failed",
+        "remote worker did not produce a result file",
+        "failed to parse remote worker output",
+        "no python block",
+        "provider",
+        "timeout",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _build_recovery_plan(plan: str, generation_reports: Sequence[str]) -> str:
+    recent = [r.strip() for r in generation_reports[-4:] if str(r or "").strip()]
+    recent_text = "\n\n".join(_clip_middle(r, 1200) for r in recent)
+    guidance = (
+        "RECOVERY MODE:\n"
+        "A previous remote-model attempt failed because the provider returned malformed output or became unstable.\n"
+        "Return exactly one complete dependency-free Python solver file.\n"
+        "Prefer a minimal patch of the known-good baseline over a rewrite.\n"
+        "Do not include explanations, bullet points, markdown outside the code block, or partial snippets.\n"
+        "Keep the public entrypoints and stdout contract unchanged."
+    )
+    if recent_text:
+        guidance += f"\n\nRECENT FAILURES TO AVOID:\n{recent_text}"
+    if plan.strip():
+        return f"{plan}\n\n{guidance}"
+    return guidance
+
+
+def attempt_recovery_rounds(
+    *,
+    recovery_models: Sequence[str],
+    fixer_models: Sequence[str],
+    user_prompt: str,
+    plan: str,
+    prompts: Dict[str, str],
+    out_path: Path,
+    validator_path: Path,
+    tests: Sequence[List[int]],
+    max_iters: int,
+    baseline_code: str,
+    generation_reports: List[str],
+) -> Tuple[bool, Optional[str]]:
+    rounds = max(0, _env_int("AGENTLAB_G4F_RECOVERY_ROUNDS", 1))
+    if rounds <= 0 or not recovery_models or not baseline_code.strip():
+        return False, None
+
+    recovery_iters = max(1, min(max_iters, _env_int("AGENTLAB_G4F_RECOVERY_MAX_ITERS", 2)))
+    sleep_s = max(0.0, _env_float("AGENTLAB_G4F_RECOVERY_SLEEP_S", 1.5))
+
+    if not any(_report_is_recoverable(r) for r in generation_reports[-6:]):
+        return False, None
+
+    for round_idx in range(1, rounds + 1):
+        log_status(
+            f"[recovery] round {round_idx}/{rounds}: releasing memory and retrying remote models before offline fallback."
+        )
+        _best_effort_release_memory(clear_local_cache=True)
+        if sleep_s > 0:
+            time.sleep(sleep_s)
+
+        recovery_plan = _build_recovery_plan(plan, generation_reports)
+        offset = (round_idx - 1) % len(recovery_models)
+        rotated_models = list(recovery_models[offset:]) + list(recovery_models[:offset])
+        for model in rotated_models:
+            log_status(f"[recovery] trying model: {model}")
+            ok, report = try_generate_with_model(
+                model=model,
+                fixer_models=fixer_models,
+                user_prompt=user_prompt,
+                plan=recovery_plan,
+                prompts=prompts,
+                out_path=out_path,
+                validator_path=validator_path,
+                tests=tests,
+                max_iters=recovery_iters,
+                baseline_code=baseline_code,
+                stage_label=f"recovery round {round_idx}",
+            )
+            generation_reports.append(report)
+            if ok:
+                return True, report
+            log_status(f"[recovery] {report}")
+
+    return False, None
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--user-prompt", default="", help="User prompt (inline string).")
@@ -725,7 +829,20 @@ def main() -> None:
                    help="Path to validate_solve_output.py (supports LRX/ISK simulation).")
     p.add_argument("--baseline", default=None,
                    help="Path to baseline solve_module.py used for --no-llm and fallback. Default: ./solve_module.py in current working directory.")
+    p.add_argument("--g4f-recovery-rounds", type=int, default=None, help="Optional extra recovery rounds before falling back to baseline (default from AGENTLAB_G4F_RECOVERY_ROUNDS or 1).")
+    p.add_argument("--g4f-recovery-max-iters", type=int, default=None, help="Optional fixer iterations per recovery round (default from AGENTLAB_G4F_RECOVERY_MAX_ITERS or 2).")
+    p.add_argument("--g4f-recovery-sleep", type=float, default=None, help="Optional cooldown in seconds before each recovery round (default from AGENTLAB_G4F_RECOVERY_SLEEP_S or 1.5).")
+    p.add_argument("--worker-no-kill-process-group", action="store_true", help="Do not hard-kill the entire worker process group on timeout; only terminate the worker process itself.")
     args = p.parse_args()
+
+    if args.g4f_recovery_rounds is not None:
+        os.environ["AGENTLAB_G4F_RECOVERY_ROUNDS"] = str(max(0, int(args.g4f_recovery_rounds)))
+    if args.g4f_recovery_max_iters is not None:
+        os.environ["AGENTLAB_G4F_RECOVERY_MAX_ITERS"] = str(max(1, int(args.g4f_recovery_max_iters)))
+    if args.g4f_recovery_sleep is not None:
+        os.environ["AGENTLAB_G4F_RECOVERY_SLEEP_S"] = str(max(0.0, float(args.g4f_recovery_sleep)))
+    if args.worker_no_kill_process_group:
+        os.environ["AGENTLAB_WORKER_KILL_PROCESS_GROUP"] = "0"
 
     user_prompt = read_user_prompt(args).strip()
     if not user_prompt:
@@ -760,6 +877,15 @@ def main() -> None:
 
     if any(_use_remote_subprocess_isolation(model) for model in set(planner_models + coder_models + fixer_models)):
         log_status('[memory] Remote LLM queries run in isolated subprocesses to keep notebook RAM stable.')
+        if os.getenv('AGENTLAB_WORKER_KILL_PROCESS_GROUP', '1').strip().lower() in {'0', 'false', 'no', 'off'}:
+            log_status('[memory] Worker timeout cleanup will not kill the entire process group (AGENTLAB_WORKER_KILL_PROCESS_GROUP=0).')
+
+    if _recovery_enabled():
+        log_status(
+            f"[recovery] enabled: rounds={max(0, _env_int('AGENTLAB_G4F_RECOVERY_ROUNDS', 1))}, "
+            f"max_iters={max(1, _env_int('AGENTLAB_G4F_RECOVERY_MAX_ITERS', 2))}, "
+            f"sleep_s={max(0.0, _env_float('AGENTLAB_G4F_RECOVERY_SLEEP_S', 1.5)):.1f}"
+        )
 
     if agent_model_overrides:
         log_status(
@@ -876,7 +1002,24 @@ def main() -> None:
                 sys.exit(0)
             log_status(f"[baseline-patcher] {report}")
 
-    detail = "\n".join(generation_reports[-6:]).strip()
+    recovered, recovery_report = attempt_recovery_rounds(
+        recovery_models=baseline_patch_models or fixer_models or coder_models,
+        fixer_models=fixer_models,
+        user_prompt=user_prompt,
+        plan=plan,
+        prompts=prompts,
+        out_path=out_path,
+        validator_path=validator_path,
+        tests=tests,
+        max_iters=args.max_iters,
+        baseline_code=baseline_code,
+        generation_reports=generation_reports,
+    )
+    if recovered:
+        log_status(f"[+] {recovery_report}. Saved to {out_path}")
+        sys.exit(0)
+
+    detail = "\n".join(generation_reports[-8:]).strip()
     reason = "Failed to generate a locally validated solver with the configured models."
     if detail:
         reason = f"{reason}\n{detail}"
