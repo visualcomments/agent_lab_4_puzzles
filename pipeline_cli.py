@@ -1007,6 +1007,22 @@ def _poll_kaggle_submission_status(competition: str, kaggle_json: str | None, ka
         print(f"[kaggle] WARNING: could not poll submission status: {e}", flush=True)
 
 
+def _move_stale_output_aside(path: Path) -> Optional[Path]:
+    """Move an existing output file aside before a new run.
+
+    This prevents an old submission.csv from being accidentally uploaded when a
+    later run fails before producing a fresh file.
+    """
+    if not path.exists():
+        return None
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup = path.with_name(f"{path.name}.stale-{ts}.bak")
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(path), str(backup))
+    print(f"[output] moved stale file aside -> {backup}")
+    return backup
+
+
 def _build_submission(
     *,
     puzzles_csv: Path,
@@ -1054,16 +1070,21 @@ def _build_submission(
     print(f"         output={out_csv}")
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
+    tmp_out_csv = out_csv.with_name(out_csv.name + ".tmp")
+    if tmp_out_csv.exists():
+        tmp_out_csv.unlink()
 
     lp_build_submission(
         puzzles_csv=str(puzzles_csv),
-        output_csv=str(out_csv),
+        output_csv=str(tmp_out_csv),
         competition=resolved_format_slug,
         solver=row_solver,
         max_rows=max_rows,
         progress=(not no_progress),
         progress_desc=f"{spec.key}: building submission",
     )
+
+    tmp_out_csv.replace(out_csv)
 
 
 # ---------------------------------------------------------------------------
@@ -1419,6 +1440,7 @@ def cmd_build_submission(args: argparse.Namespace) -> None:
     solver_path = Path(args.solver)
     puzzles_csv = Path(args.puzzles) if args.puzzles else _resolve_default_puzzles(spec)
     out_csv = Path(args.output)
+    stale_output_backup = _move_stale_output_aside(out_csv)
 
     report: dict[str, Any] = {
         "ts": datetime.now().isoformat(),
@@ -1431,6 +1453,8 @@ def cmd_build_submission(args: argparse.Namespace) -> None:
         "solver": str(solver_path),
         "stages": {},
     }
+    if stale_output_backup is not None:
+        report["stale_output_backup"] = str(stale_output_backup)
 
     run_log_path = Path(args.run_log) if args.run_log else (out_csv.parent / "run_log.json")
 
@@ -1440,12 +1464,16 @@ def cmd_build_submission(args: argparse.Namespace) -> None:
     except Exception:
         sample_for_log = None
 
+    candidate_out_csv = out_csv.with_name(out_csv.name + ".candidate")
+    if candidate_out_csv.exists():
+        candidate_out_csv.unlink()
+
     try:
         t2 = _stage("build submission")
         report["stages"]["build_submission"] = {"start": time.time()}
         _build_submission(
             puzzles_csv=puzzles_csv,
-            out_csv=out_csv,
+            out_csv=candidate_out_csv,
             competition_format_slug=args.format or spec.format_slug,
             solver_path=solver_path,
             spec=spec,
@@ -1464,7 +1492,7 @@ def cmd_build_submission(args: argparse.Namespace) -> None:
                 tsc = _stage("schema check")
                 report["stages"]["schema_check"] = {"start": time.time()}
                 stats = _validate_submission_schema(
-                    submission_csv=out_csv,
+                    submission_csv=candidate_out_csv,
                     sample_submission_csv=sample,
                     check_ids=(not args.no_schema_check_ids),
                 )
@@ -1473,6 +1501,7 @@ def cmd_build_submission(args: argparse.Namespace) -> None:
                 report["stages"]["schema_check"]["seconds"] = report["stages"]["schema_check"]["end"] - report["stages"]["schema_check"]["start"]
                 _stage_done("schema check", tsc)
 
+        candidate_out_csv.replace(out_csv)
         _stage_done("build submission", t2)
         report["status"] = "ok"
     except Exception as e:
@@ -1494,7 +1523,7 @@ def cmd_build_submission(args: argparse.Namespace) -> None:
             _attach_io_stats(
                 report,
                 puzzles_csv=puzzles_csv,
-                output_csv=out_csv,
+                output_csv=(out_csv if out_csv.exists() else candidate_out_csv),
                 solver_path=solver_path,
                 sample_submission_csv=sample_for_log,
             )
@@ -1538,6 +1567,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     puzzles_csv = Path(args.puzzles) if args.puzzles else _resolve_default_puzzles(spec)
     out_csv = Path(args.output)
+    stale_output_backup = _move_stale_output_aside(out_csv)
     run_log_path = Path(args.run_log) if args.run_log else (out_csv.parent / "run_log.json")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1568,12 +1598,18 @@ def cmd_run(args: argparse.Namespace) -> None:
         },
         "stages": {},
     }
+    if stale_output_backup is not None:
+        report["stale_output_backup"] = str(stale_output_backup)
 
     sample_for_log: Path | None = None
     try:
         sample_for_log = _resolve_sample_submission(spec)
     except Exception:
         sample_for_log = None
+
+    candidate_out_csv = out_csv.with_name(out_csv.name + ".candidate")
+    if candidate_out_csv.exists():
+        candidate_out_csv.unlink()
 
     try:
         t0 = _stage("generate solver")
@@ -1625,7 +1661,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         report["stages"]["build_submission"] = {"start": time.time()}
         _build_submission(
             puzzles_csv=puzzles_csv,
-            out_csv=out_csv,
+            out_csv=candidate_out_csv,
             competition_format_slug=args.format or spec.format_slug,
             solver_path=solver_path,
             spec=spec,
@@ -1647,7 +1683,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                 tsc = _stage("schema check")
                 report["stages"]["schema_check"] = {"start": time.time()}
                 stats = _validate_submission_schema(
-                    submission_csv=out_csv,
+                    submission_csv=candidate_out_csv,
                     sample_submission_csv=sample,
                     check_ids=(not args.no_schema_check_ids),
                 )
@@ -1655,6 +1691,8 @@ def cmd_run(args: argparse.Namespace) -> None:
                 report["stages"]["schema_check"]["end"] = time.time()
                 report["stages"]["schema_check"]["seconds"] = report["stages"]["schema_check"]["end"] - report["stages"]["schema_check"]["start"]
                 _stage_done("schema check", tsc)
+
+        candidate_out_csv.replace(out_csv)
 
         # Optionally submit to Kaggle
         if args.submit:
@@ -1697,7 +1735,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             _attach_io_stats(
                 report,
                 puzzles_csv=puzzles_csv,
-                output_csv=out_csv,
+                output_csv=(out_csv if out_csv.exists() else candidate_out_csv),
                 solver_path=solver_path,
                 sample_submission_csv=sample_for_log,
             )
