@@ -3,9 +3,12 @@ import os
 import json
 import gc
 import io
+import queue
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from collections import OrderedDict
 
@@ -427,11 +430,71 @@ def _chunk_to_text(chunk) -> str:
     return ""
 
 
-def _g4f_to_text(resp, *, max_chars: int | None = None, stop_at_python_fence: bool = False) -> str:
+def _iter_stream_in_background(resp, out_q) -> None:
+    try:
+        for ch in resp:
+            out_q.put(("chunk", ch))
+    except BaseException as exc:  # pragma: no cover - defensive against provider quirks
+        out_q.put(("error", exc))
+    finally:
+        out_q.put(("done", None))
+
+
+def _iter_stream_with_timeouts(resp, *, total_timeout_s: float | None = None, idle_timeout_s: float | None = None):
+    if total_timeout_s is None and idle_timeout_s is None:
+        yield from resp
+        return
+
+    out_q = queue.Queue(maxsize=128)
+    producer = threading.Thread(
+        target=_iter_stream_in_background,
+        args=(resp, out_q),
+        daemon=True,
+        name="agentlab-g4f-stream",
+    )
+    producer.start()
+
+    deadline = time.monotonic() + float(total_timeout_s) if total_timeout_s is not None and total_timeout_s > 0 else None
+    idle_wait = float(idle_timeout_s) if idle_timeout_s is not None and idle_timeout_s > 0 else None
+
+    while True:
+        wait_s = idle_wait
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            wait_s = remaining if wait_s is None else min(wait_s, remaining)
+
+        try:
+            if wait_s is None:
+                kind, payload = out_q.get()
+            else:
+                kind, payload = out_q.get(timeout=max(0.01, wait_s))
+        except queue.Empty:
+            break
+
+        if kind == "chunk":
+            yield payload
+            continue
+        if kind in {"done", "error"}:
+            break
+
+
+def _g4f_to_text(
+    resp,
+    *,
+    max_chars: int | None = None,
+    stop_at_python_fence: bool = False,
+    stream_timeout_s: float | None = None,
+    stream_idle_timeout_s: float | None = None,
+) -> str:
     """g4f may return a string or an iterator (stream). Convert to string safely.
 
-    For codegen workloads we optionally stop right after a completed ```python fenced
-    block arrives, which avoids reading long trailing explanations into RAM.
+    For streamed providers we optionally consume chunks from a background thread with
+    wall-clock and idle deadlines so a provider that stalls after opening the stream
+    cannot block the whole pipeline forever. For codegen workloads we optionally stop
+    right after a completed ```python fenced block arrives, which avoids reading long
+    trailing explanations into RAM.
     """
     if isinstance(resp, str):
         text = resp[:max_chars] if (max_chars is not None and max_chars > 0) else resp
@@ -446,11 +509,17 @@ def _g4f_to_text(resp, *, max_chars: int | None = None, stop_at_python_fence: bo
             text = _trim_after_python_fence(text)
         return text
 
+    iterable = _iter_stream_with_timeouts(
+        resp,
+        total_timeout_s=stream_timeout_s,
+        idle_timeout_s=stream_idle_timeout_s,
+    )
+
     buf = io.StringIO()
     size = 0
     window = ""
     try:
-        for ch in resp:
+        for ch in iterable:
             txt = _chunk_to_text(ch)
             if not txt:
                 continue
@@ -558,6 +627,96 @@ def _tiktoken_encoding_for_model(model_str: str):
             return None
 
 
+def _read_text_tail(path: Path, max_chars: int = 8000) -> str:
+    try:
+        size = path.stat().st_size
+    except Exception:
+        return ""
+    if size <= 0:
+        return ""
+    max_bytes = max(1024, int(max_chars * 4))
+    try:
+        with path.open("rb") as fh:
+            if size > max_bytes:
+                fh.seek(size - max_bytes)
+            data = fh.read()
+        text = data.decode("utf-8", errors="replace")
+        if len(text) > max_chars:
+            text = text[-max_chars:]
+        return text.strip()
+    except Exception:
+        return ""
+
+
+def _worker_log_excerpt(stdout_path: Path, stderr_path: Path, *, max_chars: int = 8000) -> str:
+    parts = []
+    err_tail = _read_text_tail(stderr_path, max_chars=max_chars // 2)
+    out_tail = _read_text_tail(stdout_path, max_chars=max_chars // 2)
+    if err_tail:
+        parts.append(f"stderr tail:\n{err_tail}")
+    if out_tail:
+        parts.append(f"stdout tail:\n{out_tail}")
+    return "\n\n".join(parts).strip()
+
+
+def _terminate_process_tree(proc: subprocess.Popen) -> None:
+    try:
+        if os.name != "nt":
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def _run_json_worker_subprocess(
+    *,
+    cmd: list[str],
+    env: dict[str, str],
+    proc_timeout: int,
+    out_json: Path,
+    tmpdir_path: Path,
+    model_label: str,
+):
+    stdout_path = tmpdir_path / "worker_stdout.log"
+    stderr_path = tmpdir_path / "worker_stderr.log"
+    with stdout_path.open("w", encoding="utf-8", errors="replace") as stdout_f, stderr_path.open("w", encoding="utf-8", errors="replace") as stderr_f:
+        popen_kwargs = {
+            "stdout": stdout_f,
+            "stderr": stderr_f,
+            "env": env,
+        }
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+        try:
+            proc.wait(timeout=proc_timeout)
+        except subprocess.TimeoutExpired as exc:
+            _terminate_process_tree(proc)
+            excerpt = _worker_log_excerpt(stdout_path, stderr_path)
+            detail = f" {excerpt}" if excerpt else ""
+            raise RuntimeError(f"{model_label}: remote worker timed out after {proc_timeout}s.{detail}".strip()) from exc
+
+    if not out_json.exists():
+        excerpt = _worker_log_excerpt(stdout_path, stderr_path)
+        detail = f" {excerpt}" if excerpt else ""
+        raise RuntimeError(f"{model_label}: remote worker did not produce a result file.{detail}".strip())
+
+    try:
+        return json.loads(out_json.read_text(encoding="utf-8"))
+    except Exception as exc:
+        excerpt = _worker_log_excerpt(stdout_path, stderr_path)
+        detail = f" {excerpt}" if excerpt else ""
+        raise RuntimeError(f"{model_label}: failed to parse remote worker output ({exc}).{detail}".strip()) from exc
+
+
 def query_model_stable(
     model_str,
     prompt,
@@ -636,13 +795,14 @@ def query_model_stable(
         env = dict(os.environ)
         env["AGENTLAB_REMOTE_SUBPROCESS"] = "0"
         proc_timeout = max(30, int(float(timeout)) + 15)
-        proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=proc_timeout)
-
-        if not out_json.exists():
-            stderr = (proc.stderr or proc.stdout or "").strip()
-            raise RuntimeError(f"{model_str}: remote worker did not produce a result file. {stderr}".strip())
-
-        payload = json.loads(out_json.read_text(encoding="utf-8"))
+        payload = _run_json_worker_subprocess(
+            cmd=cmd,
+            env=env,
+            proc_timeout=proc_timeout,
+            out_json=out_json,
+            tmpdir_path=tmpdir_path,
+            model_label=str(model_str),
+        )
         if payload.get("ok"):
             answer = payload.get("answer", "")
             return answer if isinstance(answer, str) else ""
@@ -815,6 +975,12 @@ def query_model(
                     kwargs["stream"] = True
                 max_resp_chars = int(os.getenv("AGENTLAB_MAX_RESPONSE_CHARS", "60000") or "60000")
                 stop_at_python_fence = _env_truthy("AGENTLAB_G4F_STOP_AT_PYTHON_FENCE", default=False)
+                stream_timeout_s = _env_float("AGENTLAB_G4F_STREAM_TIMEOUT_S", max(3.0, float(timeout) + 5.0))
+                stream_idle_timeout_s = _env_float("AGENTLAB_G4F_STREAM_IDLE_TIMEOUT_S", max(5.0, min(15.0, float(timeout))))
+                if stream_timeout_s <= 0:
+                    stream_timeout_s = None
+                if stream_idle_timeout_s <= 0:
+                    stream_idle_timeout_s = None
                 resp = g4f_mod.ChatCompletion.create(
                     model=model_str,
                     messages=messages,
@@ -823,7 +989,13 @@ def query_model(
                     timeout=int(max(1, timeout)),
                     **kwargs,
                 )
-                answer = _g4f_to_text(resp, max_chars=max_resp_chars, stop_at_python_fence=stop_at_python_fence)
+                answer = _g4f_to_text(
+                    resp,
+                    max_chars=max_resp_chars,
+                    stop_at_python_fence=stop_at_python_fence,
+                    stream_timeout_s=stream_timeout_s,
+                    stream_idle_timeout_s=stream_idle_timeout_s,
+                )
                 if isinstance(answer, str):
                     answer = answer.strip()
                 if answer:

@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "AgentLaboratory"))
@@ -19,15 +20,11 @@ def test_g4f_to_text_bounds_stream(monkeypatch):
 def test_query_model_stable_uses_worker_result(monkeypatch):
     monkeypatch.setenv("AGENTLAB_REMOTE_SUBPROCESS", "1")
 
-    def fake_run(cmd, capture_output, text, env, timeout):
-        out_json = Path(cmd[cmd.index("--out-json") + 1])
-        out_json.write_text(json.dumps({"ok": True, "answer": "OK"}), encoding="utf-8")
-        class CP:
-            stdout = ""
-            stderr = ""
-        return CP()
+    def fake_worker(**kwargs):
+        kwargs["out_json"].write_text(json.dumps({"ok": True, "answer": "OK"}), encoding="utf-8")
+        return {"ok": True, "answer": "OK"}
 
-    monkeypatch.setattr(inference.subprocess, "run", fake_run)
+    monkeypatch.setattr(inference, "_run_json_worker_subprocess", fake_worker)
     assert inference.query_model_stable("g4f:gpt-4o-mini", "p", "s", tries=1, timeout=5.0) == "OK"
 
 
@@ -80,3 +77,18 @@ def test_base_agent_spills_large_artifacts(tmp_path, monkeypatch):
     assert agent.report == big
     assert agent._artifact_paths.get("report")
     assert Path(agent._artifact_paths["report"]).exists()
+
+def test_g4f_to_text_stops_on_idle_stream_timeout():
+    def slow_chunks():
+        yield "abc"
+        time.sleep(0.25)
+        yield "def"
+
+    out = inference._g4f_to_text(
+        slow_chunks(),
+        max_chars=100,
+        stream_timeout_s=1.0,
+        stream_idle_timeout_s=0.05,
+    )
+    assert out == "abc"
+

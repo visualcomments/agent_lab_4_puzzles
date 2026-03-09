@@ -42,7 +42,7 @@ except Exception:  # pragma: no cover - optional runtime dependency
 THIS_DIR = Path(__file__).resolve().parent
 AGENTLAB_ROOT = THIS_DIR.parent
 sys.path.insert(0, str(AGENTLAB_ROOT))
-from inference import query_model, MissingLLMCredentials, _best_effort_release_memory  # type: ignore
+from inference import query_model, MissingLLMCredentials, _best_effort_release_memory, _run_json_worker_subprocess  # type: ignore
 
 RE_PY_BLOCK = re.compile(r"```python\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 RE_ANY_BLOCK = re.compile(r"```(?:[a-zA-Z0-9_+-]+)?\s*(.*?)```", re.DOTALL)
@@ -291,17 +291,14 @@ def _query_model_stable(
         env = dict(os.environ)
         env['AGENTLAB_REMOTE_SUBPROCESS'] = '0'
         proc_timeout = max(30, int(float(timeout)) + 15)
-        proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=proc_timeout)
-
-        if not out_json.exists():
-            stderr = (proc.stderr or proc.stdout or '').strip()
-            raise RuntimeError(f'{model}: remote worker did not produce a result file. {stderr}'.strip())
-
-        try:
-            payload = json.loads(out_json.read_text(encoding='utf-8'))
-        except Exception as e:
-            stderr = (proc.stderr or proc.stdout or '').strip()
-            raise RuntimeError(f'{model}: failed to parse remote worker output ({e}). {stderr}'.strip()) from e
+        payload = _run_json_worker_subprocess(
+            cmd=cmd,
+            env=env,
+            proc_timeout=proc_timeout,
+            out_json=out_json,
+            tmpdir_path=tmpdir_path,
+            model_label=model,
+        )
 
         if payload.get('ok'):
             answer = payload.get('answer', '')

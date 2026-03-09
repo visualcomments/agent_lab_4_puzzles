@@ -55,12 +55,11 @@ def test_default_max_rss_mb_uses_explicit_env_or_colab_default(monkeypatch):
 def test_query_model_stable_uses_worker_result(monkeypatch, tmp_path):
     monkeypatch.setenv('AGENTLAB_REMOTE_SUBPROCESS', '1')
 
-    def fake_run(cmd, capture_output, text, env, timeout):
-        out_json = Path(cmd[cmd.index('--out-json') + 1])
-        out_json.write_text(json.dumps({'ok': True, 'answer': '```python\ndef solve(vec):\n    return [], list(vec)\n```'}), encoding='utf-8')
-        return subprocess.CompletedProcess(cmd, 0, stdout='', stderr='')
+    def fake_worker(**kwargs):
+        kwargs['out_json'].write_text(json.dumps({'ok': True, 'answer': '```python\ndef solve(vec):\n    return [], list(vec)\n```'}), encoding='utf-8')
+        return {'ok': True, 'answer': '```python\ndef solve(vec):\n    return [], list(vec)\n```'}
 
-    monkeypatch.setattr(rpp.subprocess, 'run', fake_run)
+    monkeypatch.setattr(rpp, '_run_json_worker_subprocess', fake_worker)
     answer = rpp._query_model_stable('g4f:gpt-4', 'prompt', 'system', tries=1, timeout=5.0)
     assert 'def solve' in answer
 
