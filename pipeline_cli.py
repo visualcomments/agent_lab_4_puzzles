@@ -832,11 +832,10 @@ def _kaggle_submit(
     if kaggle_json:
         try:
             _ensure_llm_puzzles_on_path()
-            from src.kaggle_utils import prepare_kaggle_config
-            cfg_dir = prepare_kaggle_config(kaggle_json, target_dir=kaggle_config_dir)
-            env['KAGGLE_CONFIG_DIR'] = cfg_dir
+            from src.kaggle_utils import build_kaggle_env
+            env.update(build_kaggle_env(kaggle_json, config_dir=kaggle_config_dir))
         except Exception as e:
-            print(f"[kaggle] could not prepare kaggle.json for CLI: {e}", flush=True)
+            print(f"[kaggle] could not prepare Kaggle credentials for CLI: {e}", flush=True)
 
     # Prefer the current official CLI syntax first; retry the legacy `-c` form
     # for environments that still ship the older kaggle package/CLI wrapper.
@@ -1087,6 +1086,19 @@ def _memory_env_for_codegen(models: str) -> dict[str, str]:
     return env
 
 
+def _agent_model_cli_args(*, agent_models: str | None = None, planner_models: str | None = None, coder_models: str | None = None, fixer_models: str | None = None) -> list[str]:
+    args: list[str] = []
+    if agent_models:
+        args.extend(["--agent-models", agent_models])
+    if planner_models:
+        args.extend(["--planner-models", planner_models])
+    if coder_models:
+        args.extend(["--coder-models", coder_models])
+    if fixer_models:
+        args.extend(["--fixer-models", fixer_models])
+    return args
+
+
 def _run_agent_laboratory(
     *,
     prompt_file: Path,
@@ -1095,6 +1107,10 @@ def _run_agent_laboratory(
     baseline: Path,
     custom_prompts: Optional[Path] = None,
     llm: str = "gpt-4o-mini",
+    agent_models: str | None = None,
+    planner_models: str | None = None,
+    coder_models: str | None = None,
+    fixer_models: str | None = None,
     max_iters: int = 8,
     no_llm: bool = False,
     allow_baseline: bool = True,
@@ -1121,6 +1137,14 @@ def _run_agent_laboratory(
         "--models",
         llm,
     ]
+    cmd.extend(
+        _agent_model_cli_args(
+            agent_models=agent_models,
+            planner_models=planner_models,
+            coder_models=coder_models,
+            fixer_models=fixer_models,
+        )
+    )
 
     # run_perm_pipeline.py already falls back to baseline unless --strict is used.
     if no_llm:
@@ -1352,6 +1376,10 @@ def cmd_generate_solver(args: argparse.Namespace) -> None:
         baseline=spec.baseline_solver,
         custom_prompts=custom_prompts,
         llm=args.models,
+        agent_models=args.agent_models,
+        planner_models=args.planner_models,
+        coder_models=args.coder_models,
+        fixer_models=args.fixer_models,
         max_iters=args.max_iters,
         no_llm=False,
         allow_baseline=args.allow_baseline,
@@ -1506,6 +1534,10 @@ def cmd_run(args: argparse.Namespace) -> None:
         "args": {
             "no_llm": bool(args.no_llm),
             "models": args.models,
+            "agent_models": args.agent_models,
+            "planner_models": args.planner_models,
+            "coder_models": args.coder_models,
+            "fixer_models": args.fixer_models,
             "max_iters": args.max_iters,
             "vector_col": args.vector_col,
             "max_rows": args.max_rows,
@@ -1542,6 +1574,10 @@ def cmd_run(args: argparse.Namespace) -> None:
                 baseline=spec.baseline_solver,
                 custom_prompts=custom_prompts,
                 llm=args.models,
+                agent_models=args.agent_models,
+                planner_models=args.planner_models,
+                coder_models=args.coder_models,
+                fixer_models=args.fixer_models,
                 max_iters=args.max_iters,
                 no_llm=False,
                 allow_baseline=args.allow_baseline,
@@ -1747,6 +1783,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     sp.add_argument("--llm", dest="models", default=None, help=argparse.SUPPRESS)
+    sp.add_argument("--agent-models", default=None, help="Optional per-agent override mapping for AgentLaboratory, e.g. 'planner=gpt-4;coder=local:Qwen/Qwen2.5-Coder-1.5B;fixer=gpt-4o-mini'.")
+    sp.add_argument("--planner-models", default=None, help="Optional model list override for the planner agent.")
+    sp.add_argument("--coder-models", default=None, help="Optional model list override for the coder agent.")
+    sp.add_argument("--fixer-models", default=None, help="Optional model list override for the fixer agent.")
     sp.add_argument("--max-iters", type=int, default=8)
     sp.add_argument("--allow-baseline", action="store_true")
     sp.add_argument("--no-llm", action="store_true", help="Skip LLM: just copy baseline")
@@ -1792,6 +1832,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     sp.add_argument("--llm", dest="models", default=None, help=argparse.SUPPRESS)
+    sp.add_argument("--agent-models", default=None, help="Optional per-agent override mapping for AgentLaboratory, e.g. 'planner=gpt-4;coder=local:Qwen/Qwen2.5-Coder-1.5B;fixer=gpt-4o-mini'.")
+    sp.add_argument("--planner-models", default=None, help="Optional model list override for the planner agent.")
+    sp.add_argument("--coder-models", default=None, help="Optional model list override for the coder agent.")
+    sp.add_argument("--fixer-models", default=None, help="Optional model list override for the fixer agent.")
     sp.add_argument("--max-iters", type=int, default=8)
     sp.add_argument("--allow-baseline", action="store_true")
     sp.add_argument("--no-llm", action="store_true")
@@ -1801,7 +1845,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-progress", action="store_true", help="Disable progress bar")
     sp.add_argument("--submit", action="store_true")
     sp.add_argument("--message", default=None, help="Kaggle submission message")
-    sp.add_argument("--kaggle-json", default=None, help="Path to kaggle.json (optional). If set, credentials are loaded via KAGGLE_CONFIG_DIR.")
+    sp.add_argument("--kaggle-json", default=None, help="Path to a Kaggle credentials file (legacy kaggle.json or access_token). If set, credentials are loaded for both API and CLI submission paths.")
     sp.add_argument("--kaggle-config-dir", default=None, help="Optional directory to place a temporary kaggle.json copy")
     sp.add_argument("--submit-via", default="auto", choices=["auto","api","cli"], help="How to submit: auto (try API then CLI), api, or cli")
     sp.add_argument("--submit-competition", dest="submit_competition", default=None, help="Override Kaggle competition slug for submission")

@@ -13,62 +13,111 @@ except Exception:  # pragma: no cover
     KaggleApi = None  # type: ignore
 
 
-def prepare_kaggle_config(kaggle_json_path: str, target_dir: Optional[str] = None) -> str:
-    """Prepare a Kaggle config directory that contains a `kaggle.json`.
+def _chmod_private(path: Path) -> None:
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
 
-    Kaggle tools look for credentials in either:
-    - env vars `KAGGLE_USERNAME` / `KAGGLE_KEY`, OR
-    - `~/.kaggle/kaggle.json`, OR
-    - `$KAGGLE_CONFIG_DIR/kaggle.json`.
 
-    This helper copies the given `kaggle.json` into a dedicated directory and returns
-    that directory path (so the caller can set `KAGGLE_CONFIG_DIR`).
-
-    Notes:
-    - We do NOT print the credentials.
-    - On Unix we chmod 600 for compatibility with Kaggle CLI.
-    """
-
-    src = Path(kaggle_json_path).expanduser().resolve()
+def _load_kaggle_credentials(credentials_path: str) -> dict:
+    src = Path(credentials_path).expanduser().resolve()
     if not src.exists():
         raise FileNotFoundError(str(src))
 
-    # Basic JSON sanity check
-    obj = json.loads(src.read_text(encoding="utf-8"))
-    if not isinstance(obj, dict) or "username" not in obj or "key" not in obj:
-        raise ValueError('kaggle.json must contain "username" and "key"')
+    raw = src.read_text(encoding="utf-8").strip()
+    parsed = None
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        parsed = None
 
+    if isinstance(parsed, dict):
+        if parsed.get("username") and parsed.get("key"):
+            return {
+                "kind": "legacy_json",
+                "source": str(src),
+                "username": str(parsed["username"]),
+                "key": str(parsed["key"]),
+            }
+        for token_key in ("api_token", "access_token", "token"):
+            token = parsed.get(token_key)
+            if token:
+                return {
+                    "kind": "access_token",
+                    "source": str(src),
+                    "token": str(token),
+                }
+
+    # Support passing a plain access_token file as well.
+    if raw and "\n" not in raw and not raw.startswith("{"):
+        return {
+            "kind": "access_token",
+            "source": str(src),
+            "token": raw,
+        }
+
+    raise ValueError(
+        "Unsupported Kaggle credentials file. Expected kaggle.json with username/key, "
+        "a JSON file with api_token/access_token/token, or a plain access_token file."
+    )
+
+
+def build_kaggle_env(credentials_path: Optional[str] = None, config_dir: Optional[str] = None) -> dict[str, str]:
+    env: dict[str, str] = {}
+    if not credentials_path:
+        return env
+
+    creds = _load_kaggle_credentials(credentials_path)
+    cfg_dir = prepare_kaggle_config(credentials_path, target_dir=config_dir)
+    env["KAGGLE_CONFIG_DIR"] = cfg_dir
+
+    if creds["kind"] == "legacy_json":
+        env["KAGGLE_USERNAME"] = creds["username"]
+        env["KAGGLE_KEY"] = creds["key"]
+    else:
+        env["KAGGLE_API_TOKEN"] = creds["token"]
+
+    return env
+
+
+def prepare_kaggle_config(kaggle_json_path: str, target_dir: Optional[str] = None) -> str:
+    """Prepare a Kaggle config directory for either legacy or token-style auth.
+
+    Supported input file formats:
+    - legacy `kaggle.json` with `username` / `key`
+    - JSON with `api_token` / `access_token` / `token`
+    - plain-text access token file
+    """
+
+    creds = _load_kaggle_credentials(kaggle_json_path)
     if target_dir is None:
         target_dir = tempfile.mkdtemp(prefix="kaggle_cfg_")
 
     dst_dir = Path(target_dir).expanduser().resolve()
     dst_dir.mkdir(parents=True, exist_ok=True)
 
-    dst = dst_dir / "kaggle.json"
-    shutil.copyfile(src, dst)
-
-    # Best-effort chmod for unix
-    try:
-        os.chmod(dst, 0o600)
-    except Exception:
-        pass
+    if creds["kind"] == "legacy_json":
+        src = Path(creds["source"])
+        dst = dst_dir / "kaggle.json"
+        shutil.copyfile(src, dst)
+        _chmod_private(dst)
+    else:
+        dst = dst_dir / "access_token"
+        dst.write_text(creds["token"], encoding="utf-8")
+        _chmod_private(dst)
 
     return str(dst_dir)
 
 
 def ensure_auth(kaggle_json_path: Optional[str] = None, config_dir: Optional[str] = None):
-    """Authenticate with Kaggle API using env vars or a kaggle.json.
-
-    If `kaggle_json_path` is provided, we set `KAGGLE_CONFIG_DIR` to a directory
-    containing that file before initializing `KaggleApi`.
-    """
+    """Authenticate with Kaggle API using env vars or an explicit credentials file."""
 
     if KaggleApi is None:
         raise ImportError("kaggle package is not installed. Run: pip install kaggle")
 
     if kaggle_json_path:
-        cfg_dir = prepare_kaggle_config(kaggle_json_path, target_dir=config_dir)
-        os.environ["KAGGLE_CONFIG_DIR"] = cfg_dir
+        os.environ.update(build_kaggle_env(kaggle_json_path, config_dir=config_dir))
 
     api = KaggleApi()
     api.authenticate()
@@ -164,12 +213,7 @@ def latest_submission(api, competition: str) -> Optional[dict]:
 
 
 def wait_for_submission_result(api, competition: str, target_ref: str | int | None = None, wait_seconds: int = 45, poll_every: float = 3.0) -> Optional[dict]:
-    """Best-effort wait for the latest submission to get a score or an error.
-
-    Kaggle usually accepts the file immediately, then evaluates it asynchronously.
-    Polling recent submissions helps surface format/scoring errors that explain why
-    a submission does not appear on the leaderboard.
-    """
+    """Best-effort wait for the latest submission to get a score or an error."""
     import time
 
     deadline = time.time() + max(0, wait_seconds)

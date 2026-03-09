@@ -105,12 +105,40 @@ def normalize_model_name(model: str) -> str:
 def parse_models(raw: str) -> List[str]:
     items: List[str] = []
     seen = set()
-    for part in (raw or "").split(","):
+    for part in (raw or "").replace("|", ",").split(","):
         m = normalize_model_name(part)
         if m and m not in seen:
             seen.add(m)
             items.append(m)
     return items
+
+
+def parse_agent_model_overrides(raw: Optional[str]) -> Dict[str, List[str]]:
+    mapping: Dict[str, List[str]] = {}
+    for chunk in re.split(r"[;\n]+", raw or ""):
+        entry = chunk.strip()
+        if not entry or "=" not in entry:
+            continue
+        role, model_list = entry.split("=", 1)
+        role_key = role.strip().lower().replace("_", "-")
+        parsed = parse_models(model_list)
+        if parsed:
+            mapping[role_key] = parsed
+    return mapping
+
+
+def apply_agent_model_override(mapping: Dict[str, List[str]], role: str, raw_models: Optional[str]) -> None:
+    parsed = parse_models(raw_models or "")
+    if parsed:
+        mapping[role.strip().lower().replace("_", "-")] = parsed
+
+
+def resolve_agent_models(role: str, fallback: Sequence[str], overrides: Dict[str, List[str]]) -> List[str]:
+    key = role.strip().lower().replace("_", "-")
+    resolved = overrides.get(key)
+    if resolved:
+        return list(resolved)
+    return list(fallback)
 
 
 def model_quality_score(model: str) -> int:
@@ -462,52 +490,89 @@ def _make_iteration_progress(model: str, max_iters: int):
     )
 
 
-def try_generate_with_model(
+def build_initial_codegen_prompt(user_prompt: str, plan: str, *, baseline_code: Optional[str] = None) -> str:
+    parts = [
+        f"USER TASK:\n{user_prompt}",
+        f"PLANNER NOTES:\n{plan}",
+    ]
+    if baseline_code is None:
+        parts.append("Now write the solver file.")
+    else:
+        parts.extend(
+            [
+                "KNOWN-GOOD BASELINE SOLVER:",
+                f"```python\n{baseline_code}\n```",
+                (
+                    "Modify the baseline minimally to better solve the task while preserving the public entrypoints, "
+                    "stdout contract, and dependency-free behavior. Return the complete updated solver file."
+                ),
+            ]
+        )
+    return "\n\n".join(parts)
+
+
+def _query_code_block_with_rescue(
     *,
     model: str,
+    prompt: str,
+    system_prompt: str,
+    stage_label: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        resp = _query_model_stable(model, prompt, system_prompt)
+    except MissingLLMCredentials as e:
+        return None, f"{model}: {stage_label} credentials required ({e})"
+    except Exception as e:
+        return None, f"{model}: {stage_label} failed ({e})"
+
+    code = extract_python(resp or "")
+    if code:
+        return code, None
+
+    rescue_prompt = (
+        f"{prompt}\n\n"
+        "CRITICAL OUTPUT FORMAT REPAIR:\n"
+        "Return exactly one complete Python file inside a single ```python``` block.\n"
+        "Do not include explanations, bullet points, markdown outside the code fence, or truncated snippets."
+    )
+    try:
+        resp = _query_model_stable(model, rescue_prompt, system_prompt, tries=1)
+    except MissingLLMCredentials as e:
+        return None, f"{model}: {stage_label} format-rescue credentials required ({e})"
+    except Exception as e:
+        return None, f"{model}: {stage_label} format-rescue failed ({e})"
+
+    code = extract_python(resp or "")
+    if code:
+        return code, None
+    return None, f"{model}: {stage_label} did not return a python file"
+
+
+def _run_fixer_loop(
+    *,
+    fixer_models: Sequence[str],
     user_prompt: str,
-    plan: str,
     prompts: Dict[str, str],
     out_path: Path,
     validator_path: Path,
     tests: Sequence[List[int]],
     max_iters: int,
+    current_code: str,
+    last_report: str,
+    progress_label: str,
 ) -> Tuple[bool, str]:
-    coder_prompt = f"USER TASK:\n{user_prompt}\n\nPLANNER NOTES:\n{plan}\n\nNow write the solver file."
-
-    try:
-        resp = _query_model_stable(model, coder_prompt, prompts["coder"])
-    except MissingLLMCredentials as e:
-        return False, f"{model}: credentials required ({e})"
-    except Exception as e:
-        return False, f"{model}: coder failed ({e})"
-
-    code = extract_python(resp or "")
-    if not code:
-        return False, f"{model}: coder did not return a python file"
-
-    ok, compile_err = compile_python(code)
-    if not ok:
-        last_report = f"Initial compile check failed.\n{compile_err}\n"
-    else:
-        out_path.write_text(code, encoding="utf-8")
-        valid, last_report = validate_solver_suite(validator_path, out_path, tests)
-        if valid:
-            return True, f"{model}: coder output validated immediately"
-
     max_code_chars = _env_int("AGENTLAB_MAX_CODE_PROMPT_CHARS", 24000)
     max_report_chars = _env_int("AGENTLAB_MAX_FAILURE_REPORT_CHARS", 12000)
 
-    current_code = code
     exceeded, rss_mb, limit_mb = _memory_limit_exceeded()
     if exceeded:
         _best_effort_release_memory(clear_local_cache=False)
         return False, (
-            f"{model}: aborting before fixer loop because RSS {rss_mb:.1f} MB reached the configured limit "
+            f"{progress_label}: aborting before fixer loop because RSS {rss_mb:.1f} MB reached the configured limit "
             f"{limit_mb} MB. Reduce --max-iters or raise AGENTLAB_MAX_RSS_MB."
         )
 
-    progress = _make_iteration_progress(model, max_iters)
+    progress = _make_iteration_progress(progress_label, max_iters)
     if progress is not None:
         progress.set_postfix_str(f"iter 0/{max_iters}")
 
@@ -518,7 +583,7 @@ def try_generate_with_model(
             exceeded, rss_mb, limit_mb = _memory_limit_exceeded()
             if exceeded:
                 return False, (
-                    f"{model}: stopped fixer loop at iteration {it} because RSS {rss_mb:.1f} MB reached "
+                    f"{progress_label}: stopped fixer loop at iteration {it} because RSS {rss_mb:.1f} MB reached "
                     f"the configured limit {limit_mb} MB. Reduce --max-iters or raise AGENTLAB_MAX_RSS_MB."
                 )
 
@@ -528,16 +593,25 @@ def try_generate_with_model(
                 f"FAILURE REPORT:\n{_clip_middle(last_report, max_report_chars)}\n\n"
                 "Return a corrected full python file."
             )
-            try:
-                resp = _query_model_stable(model, fix_prompt, prompts["fixer"])
-            except MissingLLMCredentials as e:
-                return False, f"{model}: fixer credentials required ({e})"
-            except Exception as e:
-                return False, f"{model}: fixer failed ({e})"
 
-            new_code = extract_python(resp or "")
-            if not new_code:
-                return False, f"{model}: fixer iteration {it} returned no python file"
+            new_code = None
+            fixer_errors: List[str] = []
+            for fix_model in fixer_models:
+                log_status(f"[fixer] iteration {it} trying model: {fix_model}")
+                candidate, err = _query_code_block_with_rescue(
+                    model=fix_model,
+                    prompt=fix_prompt,
+                    system_prompt=prompts["fixer"],
+                    stage_label=f"fixer iteration {it}",
+                )
+                if candidate:
+                    new_code = candidate
+                    break
+                if err:
+                    fixer_errors.append(err)
+
+            if new_code is None:
+                return False, "\n".join(fixer_errors) if fixer_errors else f"{progress_label}: fixer iteration {it} returned no python file"
 
             ok, compile_err = compile_python(new_code)
             current_code = new_code
@@ -554,10 +628,10 @@ def try_generate_with_model(
             _best_effort_release_memory(clear_local_cache=False)
             exceeded, rss_mb, limit_mb = _memory_limit_exceeded()
             if valid:
-                return True, f"{model}: validated after fixer iteration {it}"
+                return True, f"{progress_label}: validated after fixer iteration {it}"
             if exceeded:
                 return False, (
-                    f"{model}: stopping after validation step {it} because RSS {rss_mb:.1f} MB reached "
+                    f"{progress_label}: stopping after validation step {it} because RSS {rss_mb:.1f} MB reached "
                     f"the configured limit {limit_mb} MB."
                 )
     finally:
@@ -565,7 +639,56 @@ def try_generate_with_model(
             progress.close()
         _best_effort_release_memory(clear_local_cache=False)
 
-    return False, f"{model}: failed validation after {max_iters} fixer iterations\n{_clip_middle(last_report, max_report_chars)}"
+    return False, f"{progress_label}: failed validation after {max_iters} fixer iterations\n{_clip_middle(last_report, max_report_chars)}"
+
+
+def try_generate_with_model(
+    *,
+    model: str,
+    fixer_models: Sequence[str],
+    user_prompt: str,
+    plan: str,
+    prompts: Dict[str, str],
+    out_path: Path,
+    validator_path: Path,
+    tests: Sequence[List[int]],
+    max_iters: int,
+    baseline_code: Optional[str] = None,
+    stage_label: str = "coder",
+) -> Tuple[bool, str]:
+    coder_prompt = build_initial_codegen_prompt(user_prompt, plan, baseline_code=baseline_code)
+    code, err = _query_code_block_with_rescue(
+        model=model,
+        prompt=coder_prompt,
+        system_prompt=prompts["coder"],
+        stage_label=stage_label,
+    )
+    if not code:
+        return False, err or f"{model}: {stage_label} did not return a python file"
+
+    ok, compile_err = compile_python(code)
+    if not ok:
+        last_report = f"Initial compile check failed.\n{compile_err}\n"
+    else:
+        out_path.write_text(code, encoding="utf-8")
+        valid, last_report = validate_solver_suite(validator_path, out_path, tests)
+        if valid:
+            immediate_label = f"{stage_label} output validated immediately" if stage_label != "coder" else "coder output validated immediately"
+            return True, f"{model}: {immediate_label}"
+
+    progress_label = f"{stage_label}:{model}" if stage_label != "coder" else model
+    return _run_fixer_loop(
+        fixer_models=fixer_models,
+        user_prompt=user_prompt,
+        prompts=prompts,
+        out_path=out_path,
+        validator_path=validator_path,
+        tests=tests,
+        max_iters=max_iters,
+        current_code=code,
+        last_report=last_report,
+        progress_label=progress_label,
+    )
 
 
 def main() -> None:
@@ -576,10 +699,21 @@ def main() -> None:
         "--models",
         default=DEFAULT_MODELS,
         help=(
-            "Comma-separated model list. Bare names use g4f backend (remote providers). "
+            "Comma-separated default model list. Bare names use g4f backend (remote providers). "
             "You can also pass explicit backends like local:<hf_model_id> to run Transformers locally (CUDA-supported)."
         ),
     )
+    p.add_argument(
+        "--agent-models",
+        default=None,
+        help=(
+            "Optional per-agent override mapping, e.g. 'planner=gpt-4;coder=local:Qwen/Qwen2.5-Coder-1.5B;fixer=gpt-4o-mini'. "
+            "Each value accepts the same comma-separated syntax as --models."
+        ),
+    )
+    p.add_argument("--planner-models", default=None, help="Optional model list override for the planner agent.")
+    p.add_argument("--coder-models", default=None, help="Optional model list override for the coder agent.")
+    p.add_argument("--fixer-models", default=None, help="Optional model list override for the fixer agent.")
     p.add_argument("--custom-prompts", default=None, help="Path to JSON overriding default system prompts.")
     p.add_argument("--out", default=str(Path.cwd() / "generated" / "solve_module.py"), help="Where to write the final solver.")
     p.add_argument("--max-iters", type=int, default=4, help="Max repair iterations per model candidate.")
@@ -608,6 +742,15 @@ def main() -> None:
         sys.exit(2)
     ordered_models = order_models_for_codegen(models)
 
+    agent_model_overrides = parse_agent_model_overrides(args.agent_models)
+    apply_agent_model_override(agent_model_overrides, "planner", args.planner_models)
+    apply_agent_model_override(agent_model_overrides, "coder", args.coder_models)
+    apply_agent_model_override(agent_model_overrides, "fixer", args.fixer_models)
+
+    planner_models = resolve_agent_models("planner", ordered_models, agent_model_overrides)
+    coder_models = resolve_agent_models("coder", ordered_models, agent_model_overrides)
+    fixer_models = resolve_agent_models("fixer", coder_models, agent_model_overrides)
+
     out_path = Path(args.out).resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     validator_path = Path(args.validator).resolve()
@@ -618,8 +761,20 @@ def main() -> None:
     else:
         baseline_code = make_baseline_stub()
 
-    if any(_use_remote_subprocess_isolation(model) for model in ordered_models):
+    if any(_use_remote_subprocess_isolation(model) for model in set(planner_models + coder_models + fixer_models)):
         log_status('[memory] Remote LLM queries run in isolated subprocesses to keep notebook RAM stable.')
+
+    if agent_model_overrides:
+        log_status(
+            "[models] "
+            + ", ".join(
+                [
+                    f"planner={','.join(planner_models)}",
+                    f"coder={','.join(coder_models)}",
+                    f"fixer={','.join(fixer_models)}",
+                ]
+            )
+        )
 
     memory_cap_mb = _default_max_rss_mb()
     if memory_cap_mb > 0:
@@ -643,7 +798,7 @@ def main() -> None:
         sys.exit(0)
 
     try:
-        plan, planner_model = ask_first_nonempty(ordered_models, user_prompt, prompts["planner"])
+        plan, planner_model = ask_first_nonempty(planner_models, user_prompt, prompts["planner"])
         if not plan:
             plan = "(planner failed; proceeding without planner notes)"
         log_status(f"[planner] selected model: {planner_model or 'none'}")
@@ -665,17 +820,19 @@ def main() -> None:
     ]
 
 
-    model_progress = _make_model_progress(len(ordered_models))
+    model_progress = _make_model_progress(len(coder_models))
     if model_progress is not None:
-        model_progress.set_postfix_str(f"model 0/{len(ordered_models)}")
+        model_progress.set_postfix_str(f"model 0/{len(coder_models)}")
 
+    generation_reports: List[str] = []
     try:
-        for idx, model in enumerate(ordered_models, start=1):
+        for idx, model in enumerate(coder_models, start=1):
             if model_progress is not None:
-                model_progress.set_postfix_str(f"model {idx}/{len(ordered_models)}: {model}")
+                model_progress.set_postfix_str(f"model {idx}/{len(coder_models)}: {model}")
             log_status(f"[coder] trying model: {model}")
             ok, report = try_generate_with_model(
                 model=model,
+                fixer_models=fixer_models,
                 user_prompt=user_prompt,
                 plan=plan,
                 prompts=prompts,
@@ -684,6 +841,7 @@ def main() -> None:
                 tests=tests,
                 max_iters=args.max_iters,
             )
+            generation_reports.append(report)
             if model_progress is not None:
                 model_progress.update(1)
             if ok:
@@ -694,7 +852,38 @@ def main() -> None:
         if model_progress is not None:
             model_progress.close()
 
-    _fallback_to_baseline("Failed to generate a locally validated solver with the configured models.")
+    baseline_patch_models = resolve_agent_models("baseline-patcher", fixer_models or coder_models, agent_model_overrides)
+    if baseline_code.strip() and baseline_patch_models:
+        patch_iters = max(1, min(args.max_iters, _env_int("AGENTLAB_BASELINE_PATCH_MAX_ITERS", 2)))
+        log_status(
+            "[baseline-patcher] attempting a minimal validated patch of the known-good baseline before offline fallback."
+        )
+        for model in baseline_patch_models:
+            log_status(f"[baseline-patcher] trying model: {model}")
+            ok, report = try_generate_with_model(
+                model=model,
+                fixer_models=fixer_models,
+                user_prompt=user_prompt,
+                plan=plan,
+                prompts=prompts,
+                out_path=out_path,
+                validator_path=validator_path,
+                tests=tests,
+                max_iters=patch_iters,
+                baseline_code=baseline_code,
+                stage_label="baseline-patcher",
+            )
+            generation_reports.append(report)
+            if ok:
+                log_status(f"[+] {report}. Saved to {out_path}")
+                sys.exit(0)
+            log_status(f"[baseline-patcher] {report}")
+
+    detail = "\n".join(generation_reports[-6:]).strip()
+    reason = "Failed to generate a locally validated solver with the configured models."
+    if detail:
+        reason = f"{reason}\n{detail}"
+    _fallback_to_baseline(reason)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,0 @@
-[g4f-check] checking 1 model(s)...
-[1/1] gpt-4o-mini: FAIL (11.45s) Max retries: timeout
-
-Working g4f models:
-<none>

@@ -1,0 +1,98 @@
+[
+  {
+    "ts": "2026-03-08T22:57:36.611389",
+    "cmd": "run",
+    "pipeline": "cayleypy-rapapport-m2",
+    "competition": "cayleypy-rapapport-m2",
+    "format": "format/id+permutation+solution",
+    "puzzles_csv": "/mnt/data/repo_work/src/competitions/cayleypy-rapapport-m2/data/test.csv",
+    "output_csv": "submissions/test_submission_small.csv",
+    "solver": "/mnt/data/repo_work/src/generated/solve_cayleypy-rapapport-m2_20260308_225736.py",
+    "args": {
+      "no_llm": true,
+      "models": "gpt-4o-mini",
+      "agent_models": "planner=gpt-4;coder=local:Qwen/demo;fixer=gpt-4o-mini",
+      "planner_models": "gpt-4",
+      "coder_models": "local:Qwen/demo",
+      "fixer_models": "gpt-4o-mini",
+      "max_iters": 8,
+      "vector_col": null,
+      "max_rows": 20,
+      "submit": false,
+      "submit_via": "auto",
+      "submit_competition": null
+    },
+    "stages": {
+      "generate_solver": {
+        "start": 1773010656.6154463,
+        "end": 1773010656.6165807,
+        "seconds": 0.0011343955993652344
+      },
+      "validate_solver": {
+        "start": 1773010656.6166253,
+        "end": 1773010660.3269708,
+        "seconds": 3.710345506668091
+      },
+      "build_submission": {
+        "start": 1773010660.3270578,
+        "end": 1773010660.3541765,
+        "seconds": 0.027118682861328125
+      },
+      "schema_check": {
+        "start": 1773010660.3570054,
+        "end": 1773010660.392546,
+        "seconds": 0.03554058074951172
+      }
+    },
+    "status": "error",
+    "error": {
+      "type": "ValueError",
+      "message": "submission.csv row count does not match sample_submission.csv\n  submission rows: 20\n  sample rows:     2401\nFix: ensure you generate one prediction per test row.",
+      "stacktrace": "Traceback (most recent call last):\n  File \"/mnt/data/repo_work/src/pipeline_cli.py\", line 1624, in cmd_run\n    stats = _validate_submission_schema(\n        submission_csv=out_csv,\n        sample_submission_csv=sample,\n        check_ids=(not args.no_schema_check_ids),\n    )\n  File \"/mnt/data/repo_work/src/pipeline_cli.py\", line 664, in _validate_submission_schema\n    raise ValueError(\n    ...<4 lines>...\n    )\nValueError: submission.csv row count does not match sample_submission.csv\n  submission rows: 20\n  sample rows:     2401\nFix: ensure you generate one prediction per test row.\n"
+    },
+    "files": {
+      "puzzles_csv": {
+        "path": "/mnt/data/repo_work/src/competitions/cayleypy-rapapport-m2/data/test.csv",
+        "exists": true,
+        "bytes": 276926,
+        "mtime": "2026-03-07T22:36:04",
+        "columns": [
+          "id",
+          "n",
+          "permutation"
+        ],
+        "rows": 2401
+      },
+      "output_csv": {
+        "path": "submissions/test_submission_small.csv",
+        "exists": true,
+        "bytes": 18831,
+        "mtime": "2026-03-08T22:57:40.354141",
+        "columns": [
+          "id",
+          "permutation",
+          "solution"
+        ],
+        "rows": 20
+      },
+      "solver": {
+        "path": "/mnt/data/repo_work/src/generated/solve_cayleypy-rapapport-m2_20260308_225736.py",
+        "exists": true,
+        "bytes": 4658,
+        "mtime": "2026-03-08T22:57:36.616013"
+      },
+      "sample_submission_csv": {
+        "path": "/mnt/data/repo_work/src/competitions/cayleypy-rapapport-m2/data/sample_submission.csv",
+        "exists": true,
+        "bytes": 293541,
+        "mtime": "2026-03-08T22:57:40.356914",
+        "columns": [
+          "id",
+          "permutation",
+          "solution"
+        ],
+        "rows": 2401
+      }
+    }
+  }
+]
