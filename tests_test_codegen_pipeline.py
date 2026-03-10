@@ -140,3 +140,34 @@ def test_attempt_recovery_rounds_skips_nonrecoverable_reports(monkeypatch, tmp_p
     assert ok is False
     assert report is None
     assert called == []
+
+
+
+def test_query_model_stable_sleeps_before_switching_remote_models(monkeypatch):
+    monkeypatch.setenv('AGENTLAB_G4F_MODEL_SWITCH_SLEEP_S', '1.5')
+    monkeypatch.setenv('AGENTLAB_G4F_REPEAT_MODEL_SLEEP_S', '0')
+    monkeypatch.setattr(rpp, '_LAST_REMOTE_MODEL', 'g4f:planner-a')
+    monkeypatch.setattr(rpp, '_LAST_REMOTE_QUERY_FINISHED_AT', 10.0)
+
+    slept = []
+    monkeypatch.setattr(rpp.time, 'monotonic', lambda: 10.4)
+    monkeypatch.setattr(rpp.time, 'sleep', lambda seconds: slept.append(seconds))
+    monkeypatch.setattr(rpp, '_run_json_worker_subprocess', lambda **kwargs: {'ok': True, 'answer': 'OK'})
+
+    answer = rpp._query_model_stable('g4f:coder-b', 'prompt', 'system', tries=1, timeout=5.0)
+    assert answer == 'OK'
+    assert slept and abs(slept[0] - 1.1) < 1e-9
+
+
+def test_ask_first_nonempty_can_print_generation(monkeypatch, capsys):
+    monkeypatch.setenv('AGENTLAB_PRINT_GENERATION', '1')
+    monkeypatch.setenv('AGENTLAB_PRINT_GENERATION_MAX_CHARS', '0')
+    monkeypatch.setattr(rpp, '_query_model_stable', lambda *args, **kwargs: 'planner response')
+
+    answer, model = rpp.ask_first_nonempty(['g4f:gpt-4'], 'prompt', 'system')
+
+    out = capsys.readouterr().out
+    assert answer == 'planner response'
+    assert model == 'g4f:gpt-4'
+    assert 'planner response' in out
+    assert '[generation:planner]' in out

@@ -140,3 +140,23 @@ def test_terminate_process_tree_uses_killpg_by_default(monkeypatch):
     monkeypatch.setattr(inference.os, 'killpg', fake_killpg)
     inference._terminate_process_tree(DummyProc())
     assert any(evt.startswith('killpg:321:') for evt in events)
+
+
+
+def test_inference_query_model_stable_sleeps_before_remote_switch(monkeypatch):
+    monkeypatch.setenv('AGENTLAB_G4F_MODEL_SWITCH_SLEEP_S', '1.5')
+    monkeypatch.setenv('AGENTLAB_G4F_REPEAT_MODEL_SLEEP_S', '0')
+    monkeypatch.setattr(inference, '_LAST_REMOTE_MODEL', 'g4f:planner-a')
+    monkeypatch.setattr(inference, '_LAST_REMOTE_QUERY_FINISHED_AT', 20.0)
+
+    slept = []
+    monkeypatch.setattr(inference.time, 'monotonic', lambda: 20.25)
+    monkeypatch.setattr(inference.time, 'sleep', lambda seconds: slept.append(seconds))
+
+    def fake_worker(**kwargs):
+        kwargs['out_json'].write_text(json.dumps({'ok': True, 'answer': 'OK'}), encoding='utf-8')
+        return {'ok': True, 'answer': 'OK'}
+
+    monkeypatch.setattr(inference, '_run_json_worker_subprocess', fake_worker)
+    assert inference.query_model_stable('g4f:gpt-4o-mini', 'p', 's', tries=1, timeout=5.0) == 'OK'
+    assert slept and abs(slept[0] - 1.25) < 1e-9
