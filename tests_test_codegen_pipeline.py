@@ -52,16 +52,28 @@ def test_default_max_rss_mb_uses_explicit_env_or_colab_default(monkeypatch):
     assert rpp._default_max_rss_mb() == 7200
 
 
+def test_remote_worker_timeout_scales_with_stream_budget(monkeypatch):
+    monkeypatch.setenv('AGENTLAB_G4F_STREAM_TIMEOUT_S', '250')
+    monkeypatch.setenv('AGENTLAB_G4F_STREAM_IDLE_TIMEOUT_S', '80')
+    timeout_s = rpp._remote_worker_timeout_s(tries=5, timeout=20.0, model='g4f:gpt-4')
+    assert timeout_s >= 1285
+
+
 def test_query_model_stable_uses_worker_result(monkeypatch, tmp_path):
     monkeypatch.setenv('AGENTLAB_REMOTE_SUBPROCESS', '1')
+    captured = {}
 
     def fake_worker(**kwargs):
+        captured['proc_timeout'] = kwargs['proc_timeout']
         kwargs['out_json'].write_text(json.dumps({'ok': True, 'answer': '```python\ndef solve(vec):\n    return [], list(vec)\n```'}), encoding='utf-8')
         return {'ok': True, 'answer': '```python\ndef solve(vec):\n    return [], list(vec)\n```'}
 
     monkeypatch.setattr(rpp, '_run_json_worker_subprocess', fake_worker)
     answer = rpp._query_model_stable('g4f:gpt-4', 'prompt', 'system', tries=1, timeout=5.0)
     assert 'def solve' in answer
+    assert captured['proc_timeout'] >= 30
+
+
 
 
 def test_query_model_stable_bypasses_worker_for_local(monkeypatch):
@@ -140,3 +152,12 @@ def test_attempt_recovery_rounds_skips_nonrecoverable_reports(monkeypatch, tmp_p
     assert ok is False
     assert report is None
     assert called == []
+
+
+def test_print_generation_preview_respects_env(monkeypatch, capsys):
+    monkeypatch.setenv('AGENTLAB_PRINT_GENERATION', '1')
+    monkeypatch.setenv('AGENTLAB_PRINT_GENERATION_MAX_CHARS', '12')
+    rpp._print_generation_preview('coder', 'g4f:gpt-4', '1234567890abcdef')
+    out = capsys.readouterr().out
+    assert '[generation:coder]' in out
+    assert '1234567890ab' in out

@@ -140,3 +140,37 @@ def test_terminate_process_tree_uses_killpg_by_default(monkeypatch):
     monkeypatch.setattr(inference.os, 'killpg', fake_killpg)
     inference._terminate_process_tree(DummyProc())
     assert any(evt.startswith('killpg:321:') for evt in events)
+
+
+def test_query_model_prefers_g4f_async_client(monkeypatch):
+    class FakeChoices:
+        def __init__(self):
+            self.message = type('Msg', (), {'content': 'ASYNC_OK'})()
+
+    class FakeResponse:
+        choices = [FakeChoices()]
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            return FakeResponse()
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.chat = type('Chat', (), {'completions': FakeCompletions()})()
+
+    class FakeG4F:
+        class ChatCompletion:
+            @staticmethod
+            def create(*args, **kwargs):
+                raise AssertionError('sync g4f path should not be used when async is enabled')
+
+    monkeypatch.setenv('AGENTLAB_G4F_USE_ASYNC', '1')
+    monkeypatch.setenv('AGENTLAB_G4F_ASYNC_FALLBACK_TO_SYNC', '0')
+    monkeypatch.setattr(inference, '_load_g4f_module', lambda: FakeG4F)
+    monkeypatch.setattr(inference, '_load_g4f_async_client_class', lambda: FakeAsyncClient)
+    monkeypatch.delenv('OPENAI_API_KEY', raising=False)
+    monkeypatch.delenv('ANTHROPIC_API_KEY', raising=False)
+    monkeypatch.delenv('GEMINI_API_KEY', raising=False)
+
+    out = inference.query_model('g4f:gpt-4o-mini', 'ping', 'sys', tries=1, timeout=5.0)
+    assert out == 'ASYNC_OK'
