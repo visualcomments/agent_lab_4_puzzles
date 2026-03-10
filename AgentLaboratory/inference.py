@@ -1,6 +1,8 @@
 import time
+import asyncio
 import os
 import json
+import math
 import gc
 import io
 import queue
@@ -355,6 +357,8 @@ genai = None  # type: ignore
 _TIKTOKEN_UNAVAILABLE = False
 _G4F_MODULE = None
 _G4F_IMPORT_ERROR = None
+_G4F_ASYNC_CLIENT_CLASS = None
+_G4F_ASYNC_CLIENT_IMPORT_ERROR = None
 
 
 def _load_g4f_module():
@@ -379,6 +383,209 @@ def _load_g4f_module():
         except Exception as exc:
             _G4F_IMPORT_ERROR = exc
             return None
+
+def _load_g4f_async_client_class():
+    global _G4F_ASYNC_CLIENT_CLASS, _G4F_ASYNC_CLIENT_IMPORT_ERROR
+    if _G4F_ASYNC_CLIENT_CLASS is not None:
+        return _G4F_ASYNC_CLIENT_CLASS
+    if _G4F_ASYNC_CLIENT_IMPORT_ERROR is not None:
+        return None
+    try:
+        from g4f.client import AsyncClient  # type: ignore
+        _G4F_ASYNC_CLIENT_CLASS = AsyncClient
+        return _G4F_ASYNC_CLIENT_CLASS
+    except Exception:
+        try:
+            _ROOT = Path(__file__).resolve().parents[1]
+            _VENDOR = _ROOT / "gpt4free"
+            if _VENDOR.exists() and str(_VENDOR) not in sys.path:
+                sys.path.insert(0, str(_VENDOR))
+            from g4f.client import AsyncClient  # type: ignore
+            _G4F_ASYNC_CLIENT_CLASS = AsyncClient
+            return _G4F_ASYNC_CLIENT_CLASS
+        except Exception as exc:
+            _G4F_ASYNC_CLIENT_IMPORT_ERROR = exc
+            return None
+
+
+def _g4f_api_key_from_env() -> str | None:
+    for name in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY", "TOGETHER_API_KEY", "GEMINI_API_KEY"):
+        value = (os.getenv(name) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _g4f_async_enabled() -> bool:
+    return _env_truthy("AGENTLAB_G4F_USE_ASYNC", default=True)
+
+
+def _g4f_async_stream_enabled() -> bool:
+    return _env_truthy("AGENTLAB_G4F_ASYNC_STREAM", default=False)
+
+
+async def _async_iter_stream_with_timeouts(resp, *, total_timeout_s: float | None = None, idle_timeout_s: float | None = None):
+    iterator = resp.__aiter__()
+    deadline = time.monotonic() + float(total_timeout_s) if total_timeout_s is not None and total_timeout_s > 0 else None
+    while True:
+        wait_s = None
+        if idle_timeout_s is not None and idle_timeout_s > 0:
+            wait_s = float(idle_timeout_s)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            wait_s = remaining if wait_s is None else min(wait_s, remaining)
+        try:
+            if wait_s is None:
+                chunk = await iterator.__anext__()
+            else:
+                chunk = await asyncio.wait_for(iterator.__anext__(), timeout=max(0.01, wait_s))
+        except (StopAsyncIteration, asyncio.TimeoutError):
+            break
+        yield chunk
+
+
+async def _g4f_async_to_text(
+    resp,
+    *,
+    max_chars: int | None = None,
+    stop_at_python_fence: bool = False,
+    stream_timeout_s: float | None = None,
+    stream_idle_timeout_s: float | None = None,
+) -> str:
+    if isinstance(resp, str):
+        text = resp[:max_chars] if (max_chars is not None and max_chars > 0) else resp
+        if stop_at_python_fence:
+            text = _trim_after_python_fence(text)
+        return text
+
+    if resp is None:
+        return ""
+
+    if hasattr(resp, "choices") and getattr(resp, "choices", None):
+        try:
+            message = resp.choices[0].message
+            content = getattr(message, "content", None)
+            if isinstance(content, str):
+                text = content[:max_chars] if (max_chars is not None and max_chars > 0) else content
+                if stop_at_python_fence:
+                    text = _trim_after_python_fence(text)
+                return text
+        except Exception:
+            pass
+
+    if not hasattr(resp, "__aiter__"):
+        text = _chunk_to_text(resp)
+        if max_chars is not None and max_chars > 0:
+            text = text[:max_chars]
+        if stop_at_python_fence:
+            text = _trim_after_python_fence(text)
+        return text
+
+    buf = io.StringIO()
+    size = 0
+    window = ""
+    async for ch in _async_iter_stream_with_timeouts(
+        resp,
+        total_timeout_s=stream_timeout_s,
+        idle_timeout_s=stream_idle_timeout_s,
+    ):
+        txt = _chunk_to_text(ch)
+        if not txt:
+            continue
+        if max_chars is not None and max_chars > 0:
+            remaining = max_chars - size
+            if remaining <= 0:
+                break
+            if len(txt) > remaining:
+                txt = txt[:remaining]
+        buf.write(txt)
+        size += len(txt)
+        if stop_at_python_fence:
+            window = (window + txt)[-4096:]
+            lowered = window.lower()
+            open_idx = lowered.find("```python")
+            if open_idx != -1:
+                close_idx = lowered.rfind("```")
+                if close_idx > open_idx:
+                    break
+        if max_chars is not None and max_chars > 0 and size >= max_chars:
+            break
+
+    text = buf.getvalue()
+    if stop_at_python_fence:
+        return _trim_after_python_fence(text)
+    return text
+
+
+def _run_coro_sync(coro):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    holder = {}
+
+    def _runner():
+        try:
+            holder["result"] = asyncio.run(coro)
+        except BaseException as exc:
+            holder["error"] = exc
+
+    thread = threading.Thread(target=_runner, daemon=True, name="agentlab-async-runner")
+    thread.start()
+    thread.join()
+    if "error" in holder:
+        raise holder["error"]
+    return holder.get("result")
+
+
+async def _g4f_async_create_text(
+    *,
+    model_str: str,
+    messages: list[dict],
+    provider_name: str | None,
+    timeout_s: float,
+    stream_timeout_s: float | None,
+    stream_idle_timeout_s: float | None,
+    max_resp_chars: int | None,
+    stop_at_python_fence: bool,
+) -> str:
+    AsyncClient = _load_g4f_async_client_class()
+    if AsyncClient is None:
+        raise RuntimeError(f"g4f AsyncClient is unavailable: {_G4F_ASYNC_CLIENT_IMPORT_ERROR}")
+
+    client_kwargs = {}
+    api_key = _g4f_api_key_from_env()
+    if api_key:
+        client_kwargs["api_key"] = api_key
+    client = AsyncClient(**client_kwargs)
+
+    request_kwargs = {
+        "model": model_str,
+        "messages": messages,
+        "provider": provider_name or None,
+        "web_search": False,
+        "stream": _g4f_async_stream_enabled(),
+    }
+    max_tokens = _env_int("AGENTLAB_G4F_MAX_TOKENS", 0)
+    if max_tokens > 0:
+        request_kwargs["max_tokens"] = max_tokens
+
+    response = await asyncio.wait_for(
+        client.chat.completions.create(**request_kwargs),
+        timeout=max(1.0, float(timeout_s)),
+    )
+    text = await _g4f_async_to_text(
+        response,
+        max_chars=max_resp_chars,
+        stop_at_python_fence=stop_at_python_fence,
+        stream_timeout_s=stream_timeout_s if request_kwargs["stream"] else None,
+        stream_idle_timeout_s=stream_idle_timeout_s if request_kwargs["stream"] else None,
+    )
+    return text.strip() if isinstance(text, str) else ""
+
 
 
 def _get_tiktoken_module():
@@ -648,6 +855,32 @@ def _read_text_tail(path: Path, max_chars: int = 8000) -> str:
         return ""
 
 
+def _remote_worker_per_attempt_budget(timeout: float, *, model: str | None = None) -> float:
+    base_timeout = max(1.0, float(timeout))
+    if not _is_remote_model(model):
+        return base_timeout
+    stream_timeout_s = _env_float("AGENTLAB_G4F_STREAM_TIMEOUT_S", max(3.0, base_timeout + 5.0))
+    idle_timeout_s = _env_float("AGENTLAB_G4F_STREAM_IDLE_TIMEOUT_S", max(5.0, min(15.0, base_timeout)))
+    budget = base_timeout
+    if stream_timeout_s > 0:
+        budget = max(budget, float(stream_timeout_s))
+    if idle_timeout_s > 0:
+        budget = max(budget, float(idle_timeout_s))
+    return budget
+
+
+def _remote_worker_timeout_s(*, tries: int, timeout: float, model: str | None = None) -> int:
+    explicit = _env_float("AGENTLAB_REMOTE_WORKER_TIMEOUT_S", 0.0)
+    if explicit > 0:
+        return max(30, int(math.ceil(explicit)))
+    attempts = max(1, int(tries))
+    per_attempt_budget = _remote_worker_per_attempt_budget(timeout, model=model)
+    per_attempt_buffer = max(5.0, _env_float("AGENTLAB_REMOTE_WORKER_ATTEMPT_BUFFER_S", 5.0))
+    startup_buffer = max(10.0, _env_float("AGENTLAB_REMOTE_WORKER_STARTUP_BUFFER_S", 10.0))
+    total_budget = startup_buffer + attempts * (per_attempt_budget + per_attempt_buffer)
+    return max(30, int(math.ceil(total_budget)))
+
+
 def _worker_log_excerpt(stdout_path: Path, stderr_path: Path, *, max_chars: int = 8000) -> str:
     parts = []
     err_tail = _read_text_tail(stderr_path, max_chars=max_chars // 2)
@@ -814,7 +1047,7 @@ def query_model_stable(
 
         env = dict(os.environ)
         env["AGENTLAB_REMOTE_SUBPROCESS"] = "0"
-        proc_timeout = max(30, int(float(timeout)) + 15)
+        proc_timeout = _remote_worker_timeout_s(tries=tries, timeout=timeout, model=str(model_str))
         payload = _run_json_worker_subprocess(
             cmd=cmd,
             env=env,
@@ -965,6 +1198,46 @@ def query_model(
                     {"role": "user", "content": prompt},
                 ]
                 kwargs = {}
+                provider_name = os.getenv("G4F_PROVIDER", "").strip() or None
+                max_resp_chars = _env_int("AGENTLAB_MAX_RESPONSE_CHARS", 60000)
+                if max_resp_chars <= 0:
+                    max_resp_chars = None
+                stop_at_python_fence = _env_truthy("AGENTLAB_G4F_STOP_AT_PYTHON_FENCE", default=False)
+                stream_timeout_s = _env_float("AGENTLAB_G4F_STREAM_TIMEOUT_S", max(3.0, float(timeout) + 5.0))
+                stream_idle_timeout_s = _env_float("AGENTLAB_G4F_STREAM_IDLE_TIMEOUT_S", max(5.0, min(15.0, float(timeout))))
+                request_timeout_s = _env_float(
+                    "AGENTLAB_G4F_REQUEST_TIMEOUT_S",
+                    max(float(timeout), _remote_worker_per_attempt_budget(timeout, model=model_str)),
+                )
+                if stream_timeout_s <= 0:
+                    stream_timeout_s = None
+                if stream_idle_timeout_s <= 0:
+                    stream_idle_timeout_s = None
+                if request_timeout_s <= 0:
+                    request_timeout_s = max(1.0, float(timeout))
+
+                if _g4f_async_enabled():
+                    try:
+                        answer = _run_coro_sync(
+                            _g4f_async_create_text(
+                                model_str=model_str,
+                                messages=messages,
+                                provider_name=provider_name,
+                                timeout_s=request_timeout_s,
+                                stream_timeout_s=stream_timeout_s,
+                                stream_idle_timeout_s=stream_idle_timeout_s,
+                                max_resp_chars=max_resp_chars,
+                                stop_at_python_fence=stop_at_python_fence,
+                            )
+                        )
+                        if isinstance(answer, str):
+                            answer = answer.strip()
+                        if answer:
+                            _best_effort_release_memory(clear_local_cache=False)
+                            return answer
+                    except Exception:
+                        if not _env_truthy("AGENTLAB_G4F_ASYNC_FALLBACK_TO_SYNC", default=True):
+                            raise
 
                 # Some g4f providers require credentials (API key or .har). If the user provided
                 # one via env vars, pass it through (only if supported by this installed g4f).
@@ -972,41 +1245,25 @@ def query_model(
                     import inspect
                     sig = inspect.signature(g4f_mod.ChatCompletion.create)  # type: ignore
                     if "api_key" in sig.parameters:
-                        api_key = (
-                            os.getenv("OPENROUTER_API_KEY")
-                            or os.getenv("OPENAI_API_KEY")
-                            or os.getenv("GROQ_API_KEY")
-                            or os.getenv("TOGETHER_API_KEY")
-                            or os.getenv("GEMINI_API_KEY")
-                        )
+                        api_key = _g4f_api_key_from_env()
                         if api_key:
                             kwargs["api_key"] = api_key
                 except Exception:
                     pass
 
-                provider_name = os.getenv("G4F_PROVIDER", "").strip()
                 if provider_name:
                     try:
                         prov = getattr(g4f_mod.Provider, provider_name)  # type: ignore
                         kwargs["provider"] = prov
                     except Exception:
-                        pass
+                        kwargs["provider"] = provider_name
                 if _g4f_supports_stream_flag(g4f_mod):
                     kwargs["stream"] = True
-                max_resp_chars = int(os.getenv("AGENTLAB_MAX_RESPONSE_CHARS", "60000") or "60000")
-                stop_at_python_fence = _env_truthy("AGENTLAB_G4F_STOP_AT_PYTHON_FENCE", default=False)
-                stream_timeout_s = _env_float("AGENTLAB_G4F_STREAM_TIMEOUT_S", max(3.0, float(timeout) + 5.0))
-                stream_idle_timeout_s = _env_float("AGENTLAB_G4F_STREAM_IDLE_TIMEOUT_S", max(5.0, min(15.0, float(timeout))))
-                if stream_timeout_s <= 0:
-                    stream_timeout_s = None
-                if stream_idle_timeout_s <= 0:
-                    stream_idle_timeout_s = None
                 resp = g4f_mod.ChatCompletion.create(
                     model=model_str,
                     messages=messages,
-                    # g4f expects an integer timeout (seconds). Allow <5s for quick smoke tests,
-                    # but never pass 0.
-                    timeout=int(max(1, timeout)),
+                    # Keep the provider request timeout aligned with the outer stream/worker budget.
+                    timeout=int(max(1, math.ceil(request_timeout_s))),
                     **kwargs,
                 )
                 answer = _g4f_to_text(
