@@ -80,76 +80,6 @@ MODEL_HINT_SCORES: Tuple[Tuple[str, int], ...] = (
 )
 
 
-_LAST_REMOTE_MODEL: Optional[str] = None
-_LAST_REMOTE_QUERY_FINISHED_AT: float = 0.0
-
-
-def _generation_print_enabled() -> bool:
-    return (os.getenv("AGENTLAB_PRINT_GENERATION", "0") or "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _generation_print_max_chars() -> int:
-    return max(0, _env_int("AGENTLAB_PRINT_GENERATION_MAX_CHARS", 12000))
-
-
-def _emit_generation_trace(stage: str, model: str, text: Optional[str]) -> None:
-    if not _generation_print_enabled():
-        return
-    raw = text if isinstance(text, str) else ""
-    body = raw if raw else "<empty response>"
-    max_chars = _generation_print_max_chars()
-    clipped = False
-    if max_chars > 0 and len(body) > max_chars:
-        body = body[:max_chars]
-        clipped = True
-    log_status(f"[generation:{stage}] model={model} begin")
-    print(body, flush=True)
-    if clipped:
-        log_status(
-            f"[generation:{stage}] output clipped at {max_chars} chars; set AGENTLAB_PRINT_GENERATION_MAX_CHARS=0 to disable clipping."
-        )
-    log_status(f"[generation:{stage}] model={model} end")
-
-
-def _remote_switch_sleep_s() -> float:
-    return max(0.0, _env_float("AGENTLAB_G4F_MODEL_SWITCH_SLEEP_S", 1.5))
-
-
-def _remote_repeat_sleep_s() -> float:
-    return max(0.0, _env_float("AGENTLAB_G4F_REPEAT_MODEL_SLEEP_S", 0.0))
-
-
-def _maybe_pause_before_remote_query(model: str) -> None:
-    global _LAST_REMOTE_MODEL, _LAST_REMOTE_QUERY_FINISHED_AT
-    if not _is_remote_model(model):
-        return
-    if _LAST_REMOTE_QUERY_FINISHED_AT <= 0:
-        return
-    required_sleep = _remote_switch_sleep_s() if _LAST_REMOTE_MODEL != model else _remote_repeat_sleep_s()
-    if required_sleep <= 0:
-        return
-    elapsed = max(0.0, time.monotonic() - _LAST_REMOTE_QUERY_FINISHED_AT)
-    remaining = required_sleep - elapsed
-    if remaining <= 0:
-        return
-    transition = "switching models" if _LAST_REMOTE_MODEL != model else "reusing the same model"
-    log_status(f"[g4f-cooldown] {transition}: sleeping {remaining:.2f}s before {model}")
-    time.sleep(remaining)
-
-
-def _mark_remote_query_finished(model: str) -> None:
-    global _LAST_REMOTE_MODEL, _LAST_REMOTE_QUERY_FINISHED_AT
-    if not _is_remote_model(model):
-        return
-    _LAST_REMOTE_MODEL = model
-    _LAST_REMOTE_QUERY_FINISHED_AT = time.monotonic()
-
-
 def load_prompts(custom_path: Optional[str]) -> Dict[str, str]:
     prompts_path = THIS_DIR / "default_prompts.json"
     prompts = json.loads(prompts_path.read_text(encoding="utf-8"))
@@ -355,47 +285,44 @@ def _query_model_stable(
     print_cost: bool = False,
     version: str = '1.5',
 ) -> str:
-    _maybe_pause_before_remote_query(model)
-    try:
-        if not _use_remote_subprocess_isolation(model):
-            return query_model(model, prompt, system_prompt, tries=tries, timeout=timeout, temp=temp, print_cost=print_cost, version=version)
+    if not _use_remote_subprocess_isolation(model):
+        return query_model(model, prompt, system_prompt, tries=tries, timeout=timeout, temp=temp, print_cost=print_cost, version=version)
 
-        worker_path = THIS_DIR / 'query_model_worker.py'
-        if not worker_path.exists():
-            return query_model(model, prompt, system_prompt, tries=tries, timeout=timeout, temp=temp, print_cost=print_cost, version=version)
+    worker_path = THIS_DIR / 'query_model_worker.py'
+    if not worker_path.exists():
+        return query_model(model, prompt, system_prompt, tries=tries, timeout=timeout, temp=temp, print_cost=print_cost, version=version)
 
-        with tempfile.TemporaryDirectory(prefix='agentlab_query_') as tmpdir:
-            tmpdir_path = Path(tmpdir)
-            prompt_file = tmpdir_path / 'prompt.txt'
-            system_file = tmpdir_path / 'system.txt'
-            out_json = tmpdir_path / 'result.json'
-            prompt_file.write_text(prompt, encoding='utf-8')
-            system_file.write_text(system_prompt, encoding='utf-8')
+    with tempfile.TemporaryDirectory(prefix='agentlab_query_') as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        prompt_file = tmpdir_path / 'prompt.txt'
+        system_file = tmpdir_path / 'system.txt'
+        out_json = tmpdir_path / 'result.json'
+        prompt_file.write_text(prompt, encoding='utf-8')
+        system_file.write_text(system_prompt, encoding='utf-8')
 
-            cmd = [
-                sys.executable,
-                str(worker_path),
-                '--model',
-                model,
-                '--prompt-file',
-                str(prompt_file),
-                '--system-file',
-                str(system_file),
-                '--out-json',
-                str(out_json),
-                '--tries',
-                str(int(tries)),
-                '--timeout',
-                str(float(timeout)),
-                '--version',
-                str(version),
-            ]
-            if print_cost:
-                cmd.append('--print-cost')
-            if temp is not None:
-                cmd.extend(['--temp', str(temp)])
+        cmd = [
+            sys.executable,
+            str(worker_path),
+            '--model',
+            model,
+            '--prompt-file',
+            str(prompt_file),
+            '--system-file',
+            str(system_file),
+            '--out-json',
+            str(out_json),
+            '--tries',
+            str(int(tries)),
+            '--timeout',
+            str(float(timeout)),
+            '--version',
+            str(version),
+        ]
+        if print_cost:
+            cmd.append('--print-cost')
+        if temp is not None:
+            cmd.extend(['--temp', str(temp)])
 
-<<<<<<< HEAD
         env = dict(os.environ)
         env['AGENTLAB_REMOTE_SUBPROCESS'] = '0'
         proc_timeout = _remote_worker_timeout_s(tries=tries, timeout=timeout, model=model)
@@ -407,31 +334,16 @@ def _query_model_stable(
             tmpdir_path=tmpdir_path,
             model_label=model,
         )
-=======
-            env = dict(os.environ)
-            env['AGENTLAB_REMOTE_SUBPROCESS'] = '0'
-            proc_timeout = max(30, int(float(timeout)) + 15)
-            payload = _run_json_worker_subprocess(
-                cmd=cmd,
-                env=env,
-                proc_timeout=proc_timeout,
-                out_json=out_json,
-                tmpdir_path=tmpdir_path,
-                model_label=model,
-            )
->>>>>>> 276eb25ee6c698fa92662165c92dfe2952004e84
 
-            if payload.get('ok'):
-                answer = payload.get('answer', '')
-                return answer if isinstance(answer, str) else ''
+        if payload.get('ok'):
+            answer = payload.get('answer', '')
+            return answer if isinstance(answer, str) else ''
 
-            error = str(payload.get('error', '') or '').strip()
-            error_type = str(payload.get('error_type', '') or '').strip()
-            if error_type == 'MissingLLMCredentials':
-                raise MissingLLMCredentials(error or 'credentials required')
-            raise RuntimeError(error or f'{model}: remote worker failed')
-    finally:
-        _mark_remote_query_finished(model)
+        error = str(payload.get('error', '') or '').strip()
+        error_type = str(payload.get('error_type', '') or '').strip()
+        if error_type == 'MissingLLMCredentials':
+            raise MissingLLMCredentials(error or 'credentials required')
+        raise RuntimeError(error or f'{model}: remote worker failed')
 
 
 def _clip_middle(text: str, max_chars: int) -> str:
@@ -556,7 +468,6 @@ def ask_first_nonempty(models: Sequence[str], prompt: str, system_prompt: str) -
     for model in models:
         try:
             resp = _query_model_stable(model, prompt, system_prompt)
-            _emit_generation_trace('planner', model, resp if isinstance(resp, str) else '')
             if isinstance(resp, str) and resp.strip():
                 _print_generation_preview("planner", model, resp.strip())
                 return resp.strip(), model
@@ -663,7 +574,6 @@ def _query_code_block_with_rescue(
     except Exception as e:
         return None, f"{model}: {stage_label} failed ({e})"
 
-    _emit_generation_trace(stage_label, model, resp if isinstance(resp, str) else '')
     code = extract_python(resp or "")
     if code:
         return code, None
@@ -683,7 +593,6 @@ def _query_code_block_with_rescue(
     except Exception as e:
         return None, f"{model}: {stage_label} format-rescue failed ({e})"
 
-    _emit_generation_trace(f"{stage_label}:format-rescue", model, resp if isinstance(resp, str) else '')
     code = extract_python(resp or "")
     if code:
         return code, None
@@ -969,10 +878,6 @@ def main() -> None:
     p.add_argument("--g4f-recovery-rounds", type=int, default=None, help="Optional extra recovery rounds before falling back to baseline (default from AGENTLAB_G4F_RECOVERY_ROUNDS or 1).")
     p.add_argument("--g4f-recovery-max-iters", type=int, default=None, help="Optional fixer iterations per recovery round (default from AGENTLAB_G4F_RECOVERY_MAX_ITERS or 2).")
     p.add_argument("--g4f-recovery-sleep", type=float, default=None, help="Optional cooldown in seconds before each recovery round (default from AGENTLAB_G4F_RECOVERY_SLEEP_S or 1.5).")
-    p.add_argument("--g4f-switch-sleep", type=float, default=None, help="Optional cooldown in seconds before switching between remote g4f models (default from AGENTLAB_G4F_MODEL_SWITCH_SLEEP_S or 1.5).")
-    p.add_argument("--g4f-repeat-model-sleep", type=float, default=None, help="Optional cooldown in seconds before repeating the same remote g4f model (default from AGENTLAB_G4F_REPEAT_MODEL_SLEEP_S or 0).")
-    p.add_argument("--print-generation", action="store_true", help="Print raw model generations for planner/coder/fixer stages.")
-    p.add_argument("--print-generation-max-chars", type=int, default=None, help="Maximum chars to print per generation (default from AGENTLAB_PRINT_GENERATION_MAX_CHARS or 12000; 0 disables clipping).")
     p.add_argument("--worker-no-kill-process-group", action="store_true", help="Do not hard-kill the entire worker process group on timeout; only terminate the worker process itself.")
     p.add_argument("--print-generation", action="store_true", help="Print raw model generations for planner/coder/fixer stages.")
     p.add_argument("--print-generation-max-chars", type=int, default=None, help="Maximum number of characters to print per generation (default from AGENTLAB_PRINT_GENERATION_MAX_CHARS or 16000).")
@@ -991,14 +896,6 @@ def main() -> None:
         os.environ["AGENTLAB_G4F_RECOVERY_MAX_ITERS"] = str(max(1, int(args.g4f_recovery_max_iters)))
     if args.g4f_recovery_sleep is not None:
         os.environ["AGENTLAB_G4F_RECOVERY_SLEEP_S"] = str(max(0.0, float(args.g4f_recovery_sleep)))
-    if args.g4f_switch_sleep is not None:
-        os.environ["AGENTLAB_G4F_MODEL_SWITCH_SLEEP_S"] = str(max(0.0, float(args.g4f_switch_sleep)))
-    if args.g4f_repeat_model_sleep is not None:
-        os.environ["AGENTLAB_G4F_REPEAT_MODEL_SLEEP_S"] = str(max(0.0, float(args.g4f_repeat_model_sleep)))
-    if args.print_generation:
-        os.environ["AGENTLAB_PRINT_GENERATION"] = "1"
-    if args.print_generation_max_chars is not None:
-        os.environ["AGENTLAB_PRINT_GENERATION_MAX_CHARS"] = str(max(0, int(args.print_generation_max_chars)))
     if args.worker_no_kill_process_group:
         os.environ["AGENTLAB_WORKER_KILL_PROCESS_GROUP"] = "0"
     if args.print_generation:
