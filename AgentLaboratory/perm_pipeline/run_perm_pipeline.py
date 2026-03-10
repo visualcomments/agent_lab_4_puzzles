@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import math
 import os
 import re
 import subprocess
@@ -194,6 +195,32 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _remote_worker_per_attempt_budget(timeout: float, *, model: Optional[str] = None) -> float:
+    base_timeout = max(1.0, float(timeout))
+    if not _is_remote_model(model or ""):
+        return base_timeout
+    stream_timeout_s = _env_float('AGENTLAB_G4F_STREAM_TIMEOUT_S', max(3.0, base_timeout + 5.0))
+    idle_timeout_s = _env_float('AGENTLAB_G4F_STREAM_IDLE_TIMEOUT_S', max(5.0, min(15.0, base_timeout)))
+    budget = base_timeout
+    if stream_timeout_s > 0:
+        budget = max(budget, float(stream_timeout_s))
+    if idle_timeout_s > 0:
+        budget = max(budget, float(idle_timeout_s))
+    return budget
+
+
+def _remote_worker_timeout_s(*, tries: int, timeout: float, model: Optional[str] = None) -> int:
+    explicit = _env_float('AGENTLAB_REMOTE_WORKER_TIMEOUT_S', 0.0)
+    if explicit > 0:
+        return max(30, int(math.ceil(explicit)))
+    attempts = max(1, int(tries))
+    per_attempt_budget = _remote_worker_per_attempt_budget(timeout, model=model)
+    per_attempt_buffer = max(5.0, _env_float('AGENTLAB_REMOTE_WORKER_ATTEMPT_BUFFER_S', 5.0))
+    startup_buffer = max(10.0, _env_float('AGENTLAB_REMOTE_WORKER_STARTUP_BUFFER_S', 10.0))
+    total_budget = startup_buffer + attempts * (per_attempt_budget + per_attempt_buffer)
+    return max(30, int(math.ceil(total_budget)))
+
+
 def _is_remote_model(model: str) -> bool:
     return not (model or '').strip().startswith('local:')
 
@@ -298,7 +325,7 @@ def _query_model_stable(
 
         env = dict(os.environ)
         env['AGENTLAB_REMOTE_SUBPROCESS'] = '0'
-        proc_timeout = max(30, int(float(timeout)) + 15)
+        proc_timeout = _remote_worker_timeout_s(tries=tries, timeout=timeout, model=model)
         payload = _run_json_worker_subprocess(
             cmd=cmd,
             env=env,
@@ -328,6 +355,20 @@ def _clip_middle(text: str, max_chars: int) -> str:
     if keep_tail < 0:
         keep_tail = 0
     return text[:keep_head] + marker + text[-keep_tail:]
+
+
+def _should_print_generation() -> bool:
+    return (os.getenv("AGENTLAB_PRINT_GENERATION", "0") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _print_generation_preview(stage_label: str, model: str, text: str) -> None:
+    if not _should_print_generation():
+        return
+    max_chars = _env_int("AGENTLAB_PRINT_GENERATION_MAX_CHARS", 16000)
+    body = text or ""
+    if max_chars > 0 and len(body) > max_chars:
+        body = body[:max_chars] + "\n...<trimmed>..."
+    log_status(f"[generation:{stage_label}] model={model}\n{body}")
 
 
 def _is_colab_env() -> bool:
@@ -428,6 +469,7 @@ def ask_first_nonempty(models: Sequence[str], prompt: str, system_prompt: str) -
         try:
             resp = _query_model_stable(model, prompt, system_prompt)
             if isinstance(resp, str) and resp.strip():
+                _print_generation_preview("planner", model, resp.strip())
                 return resp.strip(), model
         except MissingLLMCredentials as e:
             last_error = e
@@ -525,6 +567,8 @@ def _query_code_block_with_rescue(
 ) -> Tuple[Optional[str], Optional[str]]:
     try:
         resp = _query_model_stable(model, prompt, system_prompt)
+        if isinstance(resp, str) and resp.strip():
+            _print_generation_preview(stage_label, model, resp.strip())
     except MissingLLMCredentials as e:
         return None, f"{model}: {stage_label} credentials required ({e})"
     except Exception as e:
@@ -542,6 +586,8 @@ def _query_code_block_with_rescue(
     )
     try:
         resp = _query_model_stable(model, rescue_prompt, system_prompt, tries=1)
+        if isinstance(resp, str) and resp.strip():
+            _print_generation_preview(f"{stage_label}:format-rescue", model, resp.strip())
     except MissingLLMCredentials as e:
         return None, f"{model}: {stage_label} format-rescue credentials required ({e})"
     except Exception as e:
@@ -833,6 +879,15 @@ def main() -> None:
     p.add_argument("--g4f-recovery-max-iters", type=int, default=None, help="Optional fixer iterations per recovery round (default from AGENTLAB_G4F_RECOVERY_MAX_ITERS or 2).")
     p.add_argument("--g4f-recovery-sleep", type=float, default=None, help="Optional cooldown in seconds before each recovery round (default from AGENTLAB_G4F_RECOVERY_SLEEP_S or 1.5).")
     p.add_argument("--worker-no-kill-process-group", action="store_true", help="Do not hard-kill the entire worker process group on timeout; only terminate the worker process itself.")
+    p.add_argument("--print-generation", action="store_true", help="Print raw model generations for planner/coder/fixer stages.")
+    p.add_argument("--print-generation-max-chars", type=int, default=None, help="Maximum number of characters to print per generation (default from AGENTLAB_PRINT_GENERATION_MAX_CHARS or 16000).")
+    p.add_argument("--g4f-async", dest="g4f_async", action="store_true", help="Use g4f AsyncClient in the pipeline worker path.")
+    p.add_argument("--no-g4f-async", dest="g4f_async", action="store_false", help="Disable g4f AsyncClient and fall back to ChatCompletion.create.")
+    p.add_argument("--max-response-chars", type=int, default=None, help="Optional hard cap on captured g4f response size. 0 disables clipping.")
+    p.add_argument("--g4f-request-timeout", type=float, default=None, help="Optional timeout passed to g4f requests. Higher values help slower providers.")
+    p.add_argument("--g4f-stop-at-python-fence", dest="g4f_stop_at_python_fence", action="store_true", help="Trim g4f output right after a complete ```python``` fence is received.")
+    p.add_argument("--no-g4f-stop-at-python-fence", dest="g4f_stop_at_python_fence", action="store_false", help="Do not trim g4f output at the first python fence.")
+    p.set_defaults(g4f_async=None, g4f_stop_at_python_fence=None)
     args = p.parse_args()
 
     if args.g4f_recovery_rounds is not None:
@@ -843,6 +898,18 @@ def main() -> None:
         os.environ["AGENTLAB_G4F_RECOVERY_SLEEP_S"] = str(max(0.0, float(args.g4f_recovery_sleep)))
     if args.worker_no_kill_process_group:
         os.environ["AGENTLAB_WORKER_KILL_PROCESS_GROUP"] = "0"
+    if args.print_generation:
+        os.environ["AGENTLAB_PRINT_GENERATION"] = "1"
+    if args.print_generation_max_chars is not None:
+        os.environ["AGENTLAB_PRINT_GENERATION_MAX_CHARS"] = str(int(args.print_generation_max_chars))
+    if args.g4f_async is not None:
+        os.environ["AGENTLAB_G4F_USE_ASYNC"] = "1" if args.g4f_async else "0"
+    if args.max_response_chars is not None:
+        os.environ["AGENTLAB_MAX_RESPONSE_CHARS"] = str(int(args.max_response_chars))
+    if args.g4f_request_timeout is not None:
+        os.environ["AGENTLAB_G4F_REQUEST_TIMEOUT_S"] = str(max(0.0, float(args.g4f_request_timeout)))
+    if args.g4f_stop_at_python_fence is not None:
+        os.environ["AGENTLAB_G4F_STOP_AT_PYTHON_FENCE"] = "1" if args.g4f_stop_at_python_fence else "0"
 
     user_prompt = read_user_prompt(args).strip()
     if not user_prompt:

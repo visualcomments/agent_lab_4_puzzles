@@ -63,6 +63,7 @@ from pipeline_registry import PipelineSpec, get_pipeline, list_pipelines
 
 ROOT = Path(__file__).resolve().parent
 PYTHON = sys.executable
+_AGENTLAB_INFERENCE_MODULE = None
 
 
 def _stage(title: str) -> float:
@@ -246,6 +247,95 @@ def _discover_g4f_candidate_models(backend_api_url: Optional[str] = None) -> Lis
     return sorted(deduped, key=lambda s: (preferred.get(s, 9999), s.lower()))
 
 
+def _load_agentlab_inference_module():
+    global _AGENTLAB_INFERENCE_MODULE
+    if _AGENTLAB_INFERENCE_MODULE is not None:
+        return _AGENTLAB_INFERENCE_MODULE
+    module_path = ROOT / "AgentLaboratory" / "inference.py"
+    if not module_path.exists():
+        raise RuntimeError(f"AgentLaboratory inference module not found: {module_path}")
+    agentlab_root = module_path.parent
+    if str(agentlab_root) not in sys.path:
+        sys.path.insert(0, str(agentlab_root))
+    spec = importlib.util.spec_from_file_location("agentlab_inference_cli", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load module spec for {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _AGENTLAB_INFERENCE_MODULE = module
+    return module
+
+
+def _probe_g4f_model_pipeline(
+    model: str,
+    timeout: float,
+    prompt: str,
+    system_prompt: str,
+    provider_name: Optional[str] = None,
+) -> Tuple[bool, str, float]:
+    inference = _load_agentlab_inference_module()
+    normalized = _normalize_g4f_model_name(model)
+    model_str = f"g4f:{normalized}"
+    started = time.time()
+    old_provider = os.environ.get("G4F_PROVIDER")
+    if provider_name:
+        os.environ["G4F_PROVIDER"] = provider_name
+    try:
+        response = inference.query_model_stable(
+            model_str=model_str,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            tries=1,
+            timeout=float(timeout),
+            print_cost=False,
+        )
+        elapsed = time.time() - started
+        txt = str(response or "").strip()
+        if not txt:
+            return False, "empty response", elapsed
+        return True, txt.replace("\n", " ")[:80], elapsed
+    except Exception as exc:
+        elapsed = time.time() - started
+        return False, str(exc), elapsed
+    finally:
+        if provider_name:
+            if old_provider is None:
+                os.environ.pop("G4F_PROVIDER", None)
+            else:
+                os.environ["G4F_PROVIDER"] = old_provider
+
+
+def _probe_g4f_models_sync(
+    candidates: Sequence[str],
+    *,
+    timeout: float,
+    prompt: str,
+    system_prompt: str,
+    provider_name: Optional[str] = None,
+    on_result: Optional[Callable[[int, int, Dict[str, Any]], None]] = None,
+) -> List[Dict[str, Any]]:
+    total = len(candidates)
+    results: List[Dict[str, Any]] = []
+    for idx, model in enumerate(candidates, start=1):
+        ok, info, elapsed = _probe_g4f_model_pipeline(
+            model=model,
+            timeout=timeout,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            provider_name=provider_name,
+        )
+        result = {
+            "model": model,
+            "ok": ok,
+            "detail": info,
+            "elapsed_s": round(elapsed, 3),
+        }
+        results.append(result)
+        if on_result is not None:
+            on_result(idx, total, result)
+    return results
+
+
 def _load_g4f_async_client_class():
     tried: List[str] = []
     for base in _iter_g4f_repo_roots():
@@ -392,10 +482,15 @@ def cmd_check_g4f_models(args: argparse.Namespace) -> None:
                 print(name)
         return
 
+    probe_mode = str(getattr(args, "probe_mode", "pipeline") or "pipeline").strip().lower()
+    if probe_mode not in {"pipeline", "async"}:
+        raise SystemExit(f"Unsupported --probe-mode: {probe_mode}")
+
     if not args.list_only:
+        mode_desc = "pipeline-compatible probe" if probe_mode == "pipeline" else f"AsyncClient concurrency={args.concurrency}"
         print(
             f"[g4f-check] checking {len(candidates)} model(s) with prompt={args.prompt!r} "
-            f"using AsyncClient concurrency={args.concurrency}..."
+            f"using {mode_desc}..."
         )
 
     def _on_result(idx: int, total: int, result: Dict[str, Any]) -> None:
@@ -404,17 +499,27 @@ def cmd_check_g4f_models(args: argparse.Namespace) -> None:
         status = "OK" if result.get("ok") else "FAIL"
         print(f"[{idx}/{total}] {result['model']}: {status} ({result['elapsed_s']:.2f}s) {result['detail']}")
 
-    results = asyncio.run(
-        _probe_g4f_models_async(
+    if probe_mode == "async":
+        results = asyncio.run(
+            _probe_g4f_models_async(
+                candidates,
+                timeout=float(args.timeout),
+                prompt=args.prompt,
+                system_prompt=args.system_prompt,
+                provider_name=provider_name or None,
+                concurrency=int(args.concurrency),
+                on_result=_on_result,
+            )
+        )
+    else:
+        results = _probe_g4f_models_sync(
             candidates,
             timeout=float(args.timeout),
             prompt=args.prompt,
             system_prompt=args.system_prompt,
             provider_name=provider_name or None,
-            concurrency=int(args.concurrency),
             on_result=_on_result,
         )
-    )
     working: List[str] = [str(r["model"]) for r in results if r.get("ok")]
 
     payload = {
@@ -1191,8 +1296,10 @@ def _memory_env_for_codegen(models: str) -> dict[str, str]:
     if has_remote:
         env.setdefault("AGENTLAB_REMOTE_SUBPROCESS", os.getenv("AGENTLAB_REMOTE_SUBPROCESS", "1"))
         env.setdefault("AGENTLAB_DISABLE_TOKEN_COUNT", os.getenv("AGENTLAB_DISABLE_TOKEN_COUNT", "1"))
-        env.setdefault("AGENTLAB_MAX_RESPONSE_CHARS", os.getenv("AGENTLAB_MAX_RESPONSE_CHARS", "40000"))
-        env.setdefault("AGENTLAB_G4F_STOP_AT_PYTHON_FENCE", os.getenv("AGENTLAB_G4F_STOP_AT_PYTHON_FENCE", "1"))
+        env.setdefault("AGENTLAB_G4F_USE_ASYNC", os.getenv("AGENTLAB_G4F_USE_ASYNC", "1"))
+        env.setdefault("AGENTLAB_G4F_REQUEST_TIMEOUT_S", os.getenv("AGENTLAB_G4F_REQUEST_TIMEOUT_S", "180"))
+        env.setdefault("AGENTLAB_MAX_RESPONSE_CHARS", os.getenv("AGENTLAB_MAX_RESPONSE_CHARS", "0"))
+        env.setdefault("AGENTLAB_G4F_STOP_AT_PYTHON_FENCE", os.getenv("AGENTLAB_G4F_STOP_AT_PYTHON_FENCE", "0"))
         env.setdefault("AGENTLAB_ARTIFACT_SPILL_CHARS", os.getenv("AGENTLAB_ARTIFACT_SPILL_CHARS", "8000"))
         env.setdefault("AGENTLAB_HEAVY_IMPORTS", os.getenv("AGENTLAB_HEAVY_IMPORTS", "0"))
         env.setdefault("MALLOC_ARENA_MAX", os.getenv("MALLOC_ARENA_MAX", "2"))
@@ -1231,6 +1338,12 @@ def _run_agent_laboratory(
     g4f_recovery_max_iters: int | None = None,
     g4f_recovery_sleep: float | None = None,
     worker_no_kill_process_group: bool = False,
+    print_generation: bool = False,
+    print_generation_max_chars: int | None = None,
+    g4f_async: Optional[bool] = None,
+    max_response_chars: int | None = None,
+    g4f_request_timeout: float | None = None,
+    g4f_stop_at_python_fence: Optional[bool] = None,
 ) -> None:
     """Run AgentLaboratory perm_pipeline to generate/repair a solver."""
 
@@ -1284,6 +1397,24 @@ def _run_agent_laboratory(
     if worker_no_kill_process_group:
         env["AGENTLAB_WORKER_KILL_PROCESS_GROUP"] = "0"
         effective_codegen_env["AGENTLAB_WORKER_KILL_PROCESS_GROUP"] = "0"
+    if print_generation:
+        env["AGENTLAB_PRINT_GENERATION"] = "1"
+        effective_codegen_env["AGENTLAB_PRINT_GENERATION"] = "1"
+    if print_generation_max_chars is not None:
+        env["AGENTLAB_PRINT_GENERATION_MAX_CHARS"] = str(max(0, int(print_generation_max_chars)))
+        effective_codegen_env["AGENTLAB_PRINT_GENERATION_MAX_CHARS"] = env["AGENTLAB_PRINT_GENERATION_MAX_CHARS"]
+    if g4f_async is not None:
+        env["AGENTLAB_G4F_USE_ASYNC"] = "1" if g4f_async else "0"
+        effective_codegen_env["AGENTLAB_G4F_USE_ASYNC"] = env["AGENTLAB_G4F_USE_ASYNC"]
+    if max_response_chars is not None:
+        env["AGENTLAB_MAX_RESPONSE_CHARS"] = str(int(max_response_chars))
+        effective_codegen_env["AGENTLAB_MAX_RESPONSE_CHARS"] = env["AGENTLAB_MAX_RESPONSE_CHARS"]
+    if g4f_request_timeout is not None:
+        env["AGENTLAB_G4F_REQUEST_TIMEOUT_S"] = str(max(0.0, float(g4f_request_timeout)))
+        effective_codegen_env["AGENTLAB_G4F_REQUEST_TIMEOUT_S"] = env["AGENTLAB_G4F_REQUEST_TIMEOUT_S"]
+    if g4f_stop_at_python_fence is not None:
+        env["AGENTLAB_G4F_STOP_AT_PYTHON_FENCE"] = "1" if g4f_stop_at_python_fence else "0"
+        effective_codegen_env["AGENTLAB_G4F_STOP_AT_PYTHON_FENCE"] = env["AGENTLAB_G4F_STOP_AT_PYTHON_FENCE"]
     print("[agentlab] " + " ".join(cmd))
     if effective_codegen_env:
         print("[agentlab] low-RAM env: " + ", ".join(f"{k}={effective_codegen_env[k]}" for k in sorted(effective_codegen_env.keys())))
@@ -1517,6 +1648,12 @@ def cmd_generate_solver(args: argparse.Namespace) -> None:
         g4f_recovery_max_iters=args.g4f_recovery_max_iters,
         g4f_recovery_sleep=args.g4f_recovery_sleep,
         worker_no_kill_process_group=args.worker_no_kill_process_group,
+        print_generation=args.print_generation,
+        print_generation_max_chars=args.print_generation_max_chars,
+        g4f_async=args.g4f_async,
+        max_response_chars=args.max_response_chars,
+        g4f_request_timeout=args.g4f_request_timeout,
+        g4f_stop_at_python_fence=args.g4f_stop_at_python_fence,
     )
 
     _validate_solver(out_path, spec.validator, spec.smoke_vector or [0, 1])
@@ -1945,7 +2082,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--competition", required=True, help="Competition slug / pipeline key")
     sp.add_argument("--format", default=None, help="Override llm-puzzles format slug (for inspection)")
     sp.add_argument("--json", action="store_true", help="Print machine-readable JSON")
-    sp.add_argument("--concurrency", type=int, default=5, help="Maximum number of concurrent AsyncClient probes")
     sp.set_defaults(func=cmd_show_pipeline)
 
     sp = sub.add_parser("generate-solver", help="Generate/repair a solver with AgentLaboratory")
@@ -1973,6 +2109,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--g4f-recovery-max-iters", type=int, default=None, help="Fixer iterations per recovery round (forwarded to AgentLaboratory).")
     sp.add_argument("--g4f-recovery-sleep", type=float, default=None, help="Cooldown in seconds before each recovery round (forwarded to AgentLaboratory).")
     sp.add_argument("--worker-no-kill-process-group", action="store_true", help="Do not hard-kill the entire worker process group on timeout; only terminate the worker process itself.")
+    sp.add_argument("--print-generation", action="store_true", help="Print raw planner/coder/fixer generations.")
+    sp.add_argument("--print-generation-max-chars", type=int, default=None, help="Maximum number of characters to print per generation.")
+    sp.add_argument("--g4f-async", dest="g4f_async", action="store_true", help="Use g4f AsyncClient inside the pipeline worker path.")
+    sp.add_argument("--no-g4f-async", dest="g4f_async", action="store_false", help="Disable g4f AsyncClient and fall back to ChatCompletion.create.")
+    sp.add_argument("--max-response-chars", type=int, default=None, help="Optional hard cap on captured g4f response size. 0 disables clipping.")
+    sp.add_argument("--g4f-request-timeout", type=float, default=None, help="Optional timeout passed through to g4f requests.")
+    sp.add_argument("--g4f-stop-at-python-fence", dest="g4f_stop_at_python_fence", action="store_true", help="Trim g4f output after the first complete ```python``` fence.")
+    sp.add_argument("--no-g4f-stop-at-python-fence", dest="g4f_stop_at_python_fence", action="store_false", help="Do not trim g4f output at the first python fence.")
+    sp.set_defaults(g4f_async=None, g4f_stop_at_python_fence=None)
     sp.add_argument("--allow-baseline", action="store_true")
     sp.add_argument("--no-llm", action="store_true", help="Skip LLM: just copy baseline")
     sp.set_defaults(func=cmd_generate_solver)
@@ -2026,6 +2171,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--g4f-recovery-max-iters", type=int, default=None, help="Fixer iterations per recovery round (forwarded to AgentLaboratory).")
     sp.add_argument("--g4f-recovery-sleep", type=float, default=None, help="Cooldown in seconds before each recovery round (forwarded to AgentLaboratory).")
     sp.add_argument("--worker-no-kill-process-group", action="store_true", help="Do not hard-kill the entire worker process group on timeout; only terminate the worker process itself.")
+    sp.add_argument("--print-generation", action="store_true", help="Print raw planner/coder/fixer generations.")
+    sp.add_argument("--print-generation-max-chars", type=int, default=None, help="Maximum number of characters to print per generation.")
+    sp.add_argument("--g4f-async", dest="g4f_async", action="store_true", help="Use g4f AsyncClient inside the pipeline worker path.")
+    sp.add_argument("--no-g4f-async", dest="g4f_async", action="store_false", help="Disable g4f AsyncClient and fall back to ChatCompletion.create.")
+    sp.add_argument("--max-response-chars", type=int, default=None, help="Optional hard cap on captured g4f response size. 0 disables clipping.")
+    sp.add_argument("--g4f-request-timeout", type=float, default=None, help="Optional timeout passed through to g4f requests.")
+    sp.add_argument("--g4f-stop-at-python-fence", dest="g4f_stop_at_python_fence", action="store_true", help="Trim g4f output after the first complete ```python``` fence.")
+    sp.add_argument("--no-g4f-stop-at-python-fence", dest="g4f_stop_at_python_fence", action="store_false", help="Do not trim g4f output at the first python fence.")
+    sp.set_defaults(g4f_async=None, g4f_stop_at_python_fence=None)
     sp.add_argument("--allow-baseline", action="store_true")
     sp.add_argument("--no-llm", action="store_true")
     sp.add_argument("--format", default=None, help="Override llm-puzzles format slug")
@@ -2056,6 +2210,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--list-only", action="store_true", help="Probe models but print only the models that returned a non-empty answer")
     sp.add_argument("--discover-only", action="store_true", help="Only list discovered candidate models without probing them")
     sp.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    sp.add_argument("--probe-mode", choices=["pipeline", "async"], default="pipeline", help="How to probe candidates: pipeline-compatible worker path or AsyncClient")
     sp.add_argument("--concurrency", type=int, default=5, help="Maximum number of concurrent AsyncClient probes")
     sp.set_defaults(func=cmd_check_g4f_models)
 
