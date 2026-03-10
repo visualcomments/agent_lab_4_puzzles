@@ -357,8 +357,13 @@ genai = None  # type: ignore
 _TIKTOKEN_UNAVAILABLE = False
 _G4F_MODULE = None
 _G4F_IMPORT_ERROR = None
+<<<<<<< HEAD
 _G4F_ASYNC_CLIENT_CLASS = None
 _G4F_ASYNC_CLIENT_IMPORT_ERROR = None
+=======
+_LAST_REMOTE_MODEL = None
+_LAST_REMOTE_QUERY_FINISHED_AT = 0.0
+>>>>>>> 276eb25ee6c698fa92662165c92dfe2952004e84
 
 
 def _load_g4f_module():
@@ -789,6 +794,39 @@ def _use_remote_subprocess_isolation(model_str: str | None) -> bool:
     return _env_truthy("AGENTLAB_REMOTE_SUBPROCESS", default=True)
 
 
+def _remote_switch_sleep_s() -> float:
+    return max(0.0, _env_float("AGENTLAB_G4F_MODEL_SWITCH_SLEEP_S", 1.5))
+
+
+def _remote_repeat_sleep_s() -> float:
+    return max(0.0, _env_float("AGENTLAB_G4F_REPEAT_MODEL_SLEEP_S", 0.0))
+
+
+def _maybe_pause_before_remote_query(model_str: str | None) -> None:
+    global _LAST_REMOTE_MODEL, _LAST_REMOTE_QUERY_FINISHED_AT
+    if not _is_remote_model(model_str):
+        return
+    if _LAST_REMOTE_QUERY_FINISHED_AT <= 0:
+        return
+    required_sleep = _remote_switch_sleep_s() if _LAST_REMOTE_MODEL != model_str else _remote_repeat_sleep_s()
+    if required_sleep <= 0:
+        return
+    elapsed = max(0.0, time.monotonic() - _LAST_REMOTE_QUERY_FINISHED_AT)
+    remaining = required_sleep - elapsed
+    if remaining <= 0:
+        return
+    print(f"[g4f-cooldown] sleeping {remaining:.2f}s before {model_str}")
+    time.sleep(remaining)
+
+
+def _mark_remote_query_finished(model_str: str | None) -> None:
+    global _LAST_REMOTE_MODEL, _LAST_REMOTE_QUERY_FINISHED_AT
+    if not _is_remote_model(model_str):
+        return
+    _LAST_REMOTE_MODEL = str(model_str)
+    _LAST_REMOTE_QUERY_FINISHED_AT = time.monotonic()
+
+
 def _g4f_supports_stream_flag(g4f_mod=None) -> bool:
     g4f_mod = g4f_mod or _load_g4f_module()
     if g4f_mod is None:
@@ -983,68 +1021,71 @@ def query_model_stable(
     print_cost=True,
     version="1.5",
 ):
-    if not _use_remote_subprocess_isolation(model_str):
-        return query_model(
-            model_str=model_str,
-            prompt=prompt,
-            system_prompt=system_prompt,
-            openai_api_key=openai_api_key,
-            gemini_api_key=gemini_api_key,
-            anthropic_api_key=anthropic_api_key,
-            tries=tries,
-            timeout=timeout,
-            temp=temp,
-            print_cost=print_cost,
-            version=version,
-        )
+    _maybe_pause_before_remote_query(model_str)
+    try:
+        if not _use_remote_subprocess_isolation(model_str):
+            return query_model(
+                model_str=model_str,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                openai_api_key=openai_api_key,
+                gemini_api_key=gemini_api_key,
+                anthropic_api_key=anthropic_api_key,
+                tries=tries,
+                timeout=timeout,
+                temp=temp,
+                print_cost=print_cost,
+                version=version,
+            )
 
-    worker_path = Path(__file__).resolve().with_name("query_model_worker.py")
-    if not worker_path.exists():
-        return query_model(
-            model_str=model_str,
-            prompt=prompt,
-            system_prompt=system_prompt,
-            openai_api_key=openai_api_key,
-            gemini_api_key=gemini_api_key,
-            anthropic_api_key=anthropic_api_key,
-            tries=tries,
-            timeout=timeout,
-            temp=temp,
-            print_cost=print_cost,
-            version=version,
-        )
+        worker_path = Path(__file__).resolve().with_name("query_model_worker.py")
+        if not worker_path.exists():
+            return query_model(
+                model_str=model_str,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                openai_api_key=openai_api_key,
+                gemini_api_key=gemini_api_key,
+                anthropic_api_key=anthropic_api_key,
+                tries=tries,
+                timeout=timeout,
+                temp=temp,
+                print_cost=print_cost,
+                version=version,
+            )
 
-    with tempfile.TemporaryDirectory(prefix="agentlab_query_") as tmpdir:
-        tmpdir_path = Path(tmpdir)
-        prompt_file = tmpdir_path / "prompt.txt"
-        system_file = tmpdir_path / "system.txt"
-        out_json = tmpdir_path / "result.json"
-        prompt_file.write_text(prompt, encoding="utf-8")
-        system_file.write_text(system_prompt, encoding="utf-8")
+        with tempfile.TemporaryDirectory(prefix="agentlab_query_") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            prompt_file = tmpdir_path / "prompt.txt"
+            system_file = tmpdir_path / "system.txt"
+            out_json = tmpdir_path / "result.json"
+            prompt_file.write_text(prompt, encoding="utf-8")
+            system_file.write_text(system_prompt, encoding="utf-8")
 
-        cmd = [
-            sys.executable,
-            str(worker_path),
-            "--model",
-            str(model_str),
-            "--prompt-file",
-            str(prompt_file),
-            "--system-file",
-            str(system_file),
-            "--out-json",
-            str(out_json),
-            "--tries",
-            str(int(tries)),
-            "--timeout",
-            str(float(timeout)),
-            "--version",
-            str(version),
-        ]
-        if print_cost:
-            cmd.append("--print-cost")
-        if temp is not None:
-            cmd.extend(["--temp", str(temp)])
+            cmd = [
+                sys.executable,
+                str(worker_path),
+                "--model",
+                str(model_str),
+                "--prompt-file",
+                str(prompt_file),
+                "--system-file",
+                str(system_file),
+                "--out-json",
+                str(out_json),
+                "--tries",
+                str(int(tries)),
+                "--timeout",
+                str(float(timeout)),
+                "--version",
+                str(version),
+            ]
+            if print_cost:
+                cmd.append("--print-cost")
+            if temp is not None:
+                cmd.extend(["--temp", str(temp)])
 
+<<<<<<< HEAD
         env = dict(os.environ)
         env["AGENTLAB_REMOTE_SUBPROCESS"] = "0"
         proc_timeout = _remote_worker_timeout_s(tries=tries, timeout=timeout, model=str(model_str))
@@ -1059,12 +1100,30 @@ def query_model_stable(
         if payload.get("ok"):
             answer = payload.get("answer", "")
             return answer if isinstance(answer, str) else ""
+=======
+            env = dict(os.environ)
+            env["AGENTLAB_REMOTE_SUBPROCESS"] = "0"
+            proc_timeout = max(30, int(float(timeout)) + 15)
+            payload = _run_json_worker_subprocess(
+                cmd=cmd,
+                env=env,
+                proc_timeout=proc_timeout,
+                out_json=out_json,
+                tmpdir_path=tmpdir_path,
+                model_label=str(model_str),
+            )
+            if payload.get("ok"):
+                answer = payload.get("answer", "")
+                return answer if isinstance(answer, str) else ""
+>>>>>>> 276eb25ee6c698fa92662165c92dfe2952004e84
 
-        error = str(payload.get("error", "") or "").strip()
-        error_type = str(payload.get("error_type", "") or "").strip()
-        if error_type == "MissingLLMCredentials":
-            raise MissingLLMCredentials(error or "credentials required")
-        raise RuntimeError(error or f"{model_str}: remote worker failed")
+            error = str(payload.get("error", "") or "").strip()
+            error_type = str(payload.get("error_type", "") or "").strip()
+            if error_type == "MissingLLMCredentials":
+                raise MissingLLMCredentials(error or "credentials required")
+            raise RuntimeError(error or f"{model_str}: remote worker failed")
+    finally:
+        _mark_remote_query_finished(model_str)
 
 
 class MissingLLMCredentials(RuntimeError):

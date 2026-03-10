@@ -1302,6 +1302,8 @@ def _memory_env_for_codegen(models: str) -> dict[str, str]:
         env.setdefault("AGENTLAB_G4F_STOP_AT_PYTHON_FENCE", os.getenv("AGENTLAB_G4F_STOP_AT_PYTHON_FENCE", "0"))
         env.setdefault("AGENTLAB_ARTIFACT_SPILL_CHARS", os.getenv("AGENTLAB_ARTIFACT_SPILL_CHARS", "8000"))
         env.setdefault("AGENTLAB_HEAVY_IMPORTS", os.getenv("AGENTLAB_HEAVY_IMPORTS", "0"))
+        env.setdefault("AGENTLAB_G4F_MODEL_SWITCH_SLEEP_S", os.getenv("AGENTLAB_G4F_MODEL_SWITCH_SLEEP_S", "1.5"))
+        env.setdefault("AGENTLAB_G4F_REPEAT_MODEL_SLEEP_S", os.getenv("AGENTLAB_G4F_REPEAT_MODEL_SLEEP_S", "0"))
         env.setdefault("MALLOC_ARENA_MAX", os.getenv("MALLOC_ARENA_MAX", "2"))
     return env
 
@@ -1337,6 +1339,10 @@ def _run_agent_laboratory(
     g4f_recovery_rounds: int | None = None,
     g4f_recovery_max_iters: int | None = None,
     g4f_recovery_sleep: float | None = None,
+    g4f_switch_sleep: float | None = None,
+    g4f_repeat_model_sleep: float | None = None,
+    print_generation: bool = False,
+    print_generation_max_chars: int | None = None,
     worker_no_kill_process_group: bool = False,
     print_generation: bool = False,
     print_generation_max_chars: int | None = None,
@@ -1394,6 +1400,18 @@ def _run_agent_laboratory(
     if g4f_recovery_sleep is not None:
         env["AGENTLAB_G4F_RECOVERY_SLEEP_S"] = str(max(0.0, float(g4f_recovery_sleep)))
         effective_codegen_env["AGENTLAB_G4F_RECOVERY_SLEEP_S"] = env["AGENTLAB_G4F_RECOVERY_SLEEP_S"]
+    if g4f_switch_sleep is not None:
+        env["AGENTLAB_G4F_MODEL_SWITCH_SLEEP_S"] = str(max(0.0, float(g4f_switch_sleep)))
+        effective_codegen_env["AGENTLAB_G4F_MODEL_SWITCH_SLEEP_S"] = env["AGENTLAB_G4F_MODEL_SWITCH_SLEEP_S"]
+    if g4f_repeat_model_sleep is not None:
+        env["AGENTLAB_G4F_REPEAT_MODEL_SLEEP_S"] = str(max(0.0, float(g4f_repeat_model_sleep)))
+        effective_codegen_env["AGENTLAB_G4F_REPEAT_MODEL_SLEEP_S"] = env["AGENTLAB_G4F_REPEAT_MODEL_SLEEP_S"]
+    if print_generation:
+        env["AGENTLAB_PRINT_GENERATION"] = "1"
+        effective_codegen_env["AGENTLAB_PRINT_GENERATION"] = "1"
+    if print_generation_max_chars is not None:
+        env["AGENTLAB_PRINT_GENERATION_MAX_CHARS"] = str(max(0, int(print_generation_max_chars)))
+        effective_codegen_env["AGENTLAB_PRINT_GENERATION_MAX_CHARS"] = env["AGENTLAB_PRINT_GENERATION_MAX_CHARS"]
     if worker_no_kill_process_group:
         env["AGENTLAB_WORKER_KILL_PROCESS_GROUP"] = "0"
         effective_codegen_env["AGENTLAB_WORKER_KILL_PROCESS_GROUP"] = "0"
@@ -1647,6 +1665,10 @@ def cmd_generate_solver(args: argparse.Namespace) -> None:
         g4f_recovery_rounds=args.g4f_recovery_rounds,
         g4f_recovery_max_iters=args.g4f_recovery_max_iters,
         g4f_recovery_sleep=args.g4f_recovery_sleep,
+        g4f_switch_sleep=args.g4f_switch_sleep,
+        g4f_repeat_model_sleep=args.g4f_repeat_model_sleep,
+        print_generation=args.print_generation,
+        print_generation_max_chars=args.print_generation_max_chars,
         worker_no_kill_process_group=args.worker_no_kill_process_group,
         print_generation=args.print_generation,
         print_generation_max_chars=args.print_generation_max_chars,
@@ -1877,6 +1899,10 @@ def cmd_run(args: argparse.Namespace) -> None:
                 g4f_recovery_rounds=args.g4f_recovery_rounds,
                 g4f_recovery_max_iters=args.g4f_recovery_max_iters,
                 g4f_recovery_sleep=args.g4f_recovery_sleep,
+                g4f_switch_sleep=args.g4f_switch_sleep,
+                g4f_repeat_model_sleep=args.g4f_repeat_model_sleep,
+                print_generation=args.print_generation,
+                print_generation_max_chars=args.print_generation_max_chars,
                 worker_no_kill_process_group=args.worker_no_kill_process_group,
             )
 
@@ -2108,6 +2134,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--g4f-recovery-rounds", type=int, default=None, help="Extra recovery rounds before offline fallback (forwarded to AgentLaboratory).")
     sp.add_argument("--g4f-recovery-max-iters", type=int, default=None, help="Fixer iterations per recovery round (forwarded to AgentLaboratory).")
     sp.add_argument("--g4f-recovery-sleep", type=float, default=None, help="Cooldown in seconds before each recovery round (forwarded to AgentLaboratory).")
+    sp.add_argument("--g4f-switch-sleep", type=float, default=None, help="Cooldown in seconds before switching between remote g4f models.")
+    sp.add_argument("--g4f-repeat-model-sleep", type=float, default=None, help="Cooldown in seconds before repeating the same remote g4f model.")
+    sp.add_argument("--print-generation", action="store_true", help="Print raw planner/coder/fixer generations.")
+    sp.add_argument("--print-generation-max-chars", type=int, default=None, help="Maximum chars to print per generation (0 disables clipping).")
     sp.add_argument("--worker-no-kill-process-group", action="store_true", help="Do not hard-kill the entire worker process group on timeout; only terminate the worker process itself.")
     sp.add_argument("--print-generation", action="store_true", help="Print raw planner/coder/fixer generations.")
     sp.add_argument("--print-generation-max-chars", type=int, default=None, help="Maximum number of characters to print per generation.")
@@ -2170,6 +2200,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--g4f-recovery-rounds", type=int, default=None, help="Extra recovery rounds before offline fallback (forwarded to AgentLaboratory).")
     sp.add_argument("--g4f-recovery-max-iters", type=int, default=None, help="Fixer iterations per recovery round (forwarded to AgentLaboratory).")
     sp.add_argument("--g4f-recovery-sleep", type=float, default=None, help="Cooldown in seconds before each recovery round (forwarded to AgentLaboratory).")
+    sp.add_argument("--g4f-switch-sleep", type=float, default=None, help="Cooldown in seconds before switching between remote g4f models.")
+    sp.add_argument("--g4f-repeat-model-sleep", type=float, default=None, help="Cooldown in seconds before repeating the same remote g4f model.")
+    sp.add_argument("--print-generation", action="store_true", help="Print raw planner/coder/fixer generations.")
+    sp.add_argument("--print-generation-max-chars", type=int, default=None, help="Maximum chars to print per generation (0 disables clipping).")
     sp.add_argument("--worker-no-kill-process-group", action="store_true", help="Do not hard-kill the entire worker process group on timeout; only terminate the worker process itself.")
     sp.add_argument("--print-generation", action="store_true", help="Print raw planner/coder/fixer generations.")
     sp.add_argument("--print-generation-max-chars", type=int, default=None, help="Maximum number of characters to print per generation.")

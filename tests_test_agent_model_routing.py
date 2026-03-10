@@ -80,6 +80,10 @@ def test_run_agent_laboratory_passes_agent_model_flags(monkeypatch, tmp_path):
         coder_models='local:Qwen/demo',
         fixer_models='gpt-4o-mini',
         max_iters=3,
+        g4f_switch_sleep=2.5,
+        g4f_repeat_model_sleep=0.5,
+        print_generation=True,
+        print_generation_max_chars=321,
     )
 
     cmd = captured['cmd']
@@ -87,6 +91,10 @@ def test_run_agent_laboratory_passes_agent_model_flags(monkeypatch, tmp_path):
     assert '--planner-models' in cmd
     assert '--coder-models' in cmd
     assert '--fixer-models' in cmd
+    assert captured['env']['AGENTLAB_G4F_MODEL_SWITCH_SLEEP_S'] == '2.5'
+    assert captured['env']['AGENTLAB_G4F_REPEAT_MODEL_SLEEP_S'] == '0.5'
+    assert captured['env']['AGENTLAB_PRINT_GENERATION'] == '1'
+    assert captured['env']['AGENTLAB_PRINT_GENERATION_MAX_CHARS'] == '321'
 
 
 
@@ -100,16 +108,26 @@ def test_build_parser_supports_agent_model_flags_for_generate_and_run():
         '--planner-models', 'gpt-4',
         '--coder-models', 'local:Qwen/demo',
         '--fixer-models', 'gpt-4o-mini',
+        '--g4f-switch-sleep', '2.0',
+        '--g4f-repeat-model-sleep', '0.4',
+        '--print-generation',
+        '--print-generation-max-chars', '555',
     ])
     assert gen_args.agent_models.startswith('planner=')
     assert gen_args.planner_models == 'gpt-4'
     assert gen_args.coder_models == 'local:Qwen/demo'
     assert gen_args.fixer_models == 'gpt-4o-mini'
+    assert gen_args.g4f_switch_sleep == 2.0
+    assert gen_args.g4f_repeat_model_sleep == 0.4
+    assert gen_args.print_generation is True
+    assert gen_args.print_generation_max_chars == 555
 
     run_args = parser.parse_args([
         'run',
         '--competition', 'cayleypy-rapapport-m2',
         '--output', 'submissions/out.csv',
         '--agent-models', 'planner=gpt-4;coder=local:Qwen/demo',
+        '--print-generation',
     ])
     assert run_args.agent_models.startswith('planner=')
+    assert run_args.print_generation is True
