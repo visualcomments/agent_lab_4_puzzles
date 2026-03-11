@@ -161,3 +161,109 @@ def test_print_generation_preview_respects_env(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert '[generation:coder]' in out
     assert '1234567890ab' in out
+
+
+
+def test_extract_python_strips_comments_docstrings_and_explanations():
+    text = '''[fixer] iteration 4 trying model: g4f:gpt-4
+[generation:fixer iteration 4] model=g4f:gpt-4
+```python
+import json
+
+def solve(vec):
+    """temporary docstring that should be removed"""
+    # inline comment that should be removed
+    return [], list(vec)
+```
+
+### Explanation of Fix:
+- this trailing explanation must not leak into the extracted file
+'''
+    code = rpp.extract_python(text)
+    assert code is not None
+    assert 'def solve' in code
+    assert 'Explanation of Fix' not in code
+    assert '# inline comment' not in code
+    assert 'temporary docstring' not in code
+    ok, reason = rpp.compile_python(code)
+    assert ok is True, reason
+
+
+
+def test_extract_python_prefers_best_python_block_with_solve():
+    text = '''```text
+this is not code
+```
+
+```python
+def helper(vec):
+    return vec
+```
+
+```python
+def solve(vec):
+    return [], list(vec)
+```
+'''
+    code = rpp.extract_python(text)
+    assert code is not None
+    assert 'def solve' in code
+    assert 'def helper' not in code
+
+
+
+def test_validate_solver_contract_reports_missing_solve():
+    bad_code = """def helper(vec):
+    return vec
+"""
+    ok, reason = rpp.validate_solver_contract(bad_code)
+    assert ok is False
+    assert 'solve' in reason
+
+
+
+def test_try_generate_with_model_surfaces_contract_failures_before_validator(monkeypatch, tmp_path):
+    bad_code = """def helper(vec):
+    return vec
+"""
+    monkeypatch.setattr(rpp, '_query_code_block_with_rescue', lambda **kwargs: (bad_code, None))
+
+    validate_called = {'called': False}
+
+    def fake_validate(*args, **kwargs):
+        validate_called['called'] = True
+        return True, ''
+
+    monkeypatch.setattr(rpp, 'validate_solver_suite', fake_validate)
+    monkeypatch.setattr(rpp, '_run_fixer_loop', lambda **kwargs: (False, kwargs['last_report']))
+
+    ok, report = rpp.try_generate_with_model(
+        model='g4f:gpt-4',
+        fixer_models=['g4f:gpt-4'],
+        user_prompt='solve it',
+        plan='plan',
+        prompts={'coder': 'coder', 'fixer': 'fixer'},
+        out_path=tmp_path / 'solve.py',
+        validator_path=tmp_path / 'validator.py',
+        tests=[[1, 2, 3]],
+        max_iters=2,
+    )
+
+    assert ok is False
+    assert 'Initial solver contract check failed' in report
+    assert validate_called['called'] is False
+
+
+def test_extract_python_invalid_python_uses_heuristic_docstring_cleanup():
+    text = '''```python
+def solve(vec):
+    """temporary docstring that should still be removed even if code is invalid"""
+    # inline comment that should be removed
+    return [], list(vec
+```
+'''
+    code = rpp.extract_python(text)
+    assert code is not None
+    assert 'def solve' in code
+    assert 'temporary docstring' not in code
+    assert '# inline comment' not in code

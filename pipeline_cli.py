@@ -899,6 +899,16 @@ def _finalize_submission_output(candidate_csv: Path, out_csv: Path) -> None:
 
 
 def _format_kaggle_submit_error(exc: Exception, competition: str) -> str:
+    detail = str(exc).strip()
+    low = detail.lower()
+    if detail and (
+        'preflight failed' in low
+        or 'too old for reliable competition submission' in low
+        or 'kaggle cli is not installed' in low
+        or 'cannot access competition submissions yet' in low
+    ):
+        return detail
+
     status_code = getattr(getattr(exc, 'response', None), 'status_code', None)
     if status_code == 401:
         return (
@@ -908,7 +918,7 @@ def _format_kaggle_submit_error(exc: Exception, competition: str) -> str:
             "Pass --kaggle-json /path/to/kaggle.json (or ~/.kaggle/access_token), regenerate the token if needed, "
             "and make sure the account has joined the competition."
         )
-    return f"Kaggle submission failed: {exc}"
+    return f"Kaggle submission failed: {detail or exc}"
 
 
 def _append_run_log(path: Path, record: dict) -> None:
@@ -1015,6 +1025,19 @@ def _attach_io_stats(
     report["files"] = files
 
 
+def _print_kaggle_preflight_report(report: dict[str, Any]) -> None:
+    mode = str(report.get('mode') or '?')
+    version = str(report.get('client_version') or 'unknown')
+    access = report.get('access') if isinstance(report.get('access'), dict) else {}
+    bits = [f"client_version={version}"]
+    if isinstance(access, dict):
+        for key in ('can_list_files', 'can_list_submissions', 'rules_accepted_or_joined', 'file_count', 'submission_count'):
+            if key in access and access.get(key) is not None:
+                bits.append(f"{key}={access.get(key)}")
+    print(f"[kaggle] preflight ({mode}): " + ' '.join(bits), flush=True)
+
+
+
 def _kaggle_submit(
     *,
     competition: str,
@@ -1023,7 +1046,7 @@ def _kaggle_submit(
     kaggle_json: str | None = None,
     submit_via: str = 'auto',
     kaggle_config_dir: str | None = None,
-) -> None:
+) -> dict[str, Any]:
     """Submit to Kaggle using either the Python API or the CLI.
 
     submit_via: 'auto' | 'api' | 'cli'
@@ -1034,13 +1057,24 @@ def _kaggle_submit(
     if submit_via in {'auto', 'api'}:
         try:
             _ensure_llm_puzzles_on_path()
-            from src.kaggle_utils import ensure_auth, submit_file
+            from src.kaggle_utils import ensure_auth, preflight_submit_via_api, submit_file
+
+            api_preflight = preflight_submit_via_api(
+                competition,
+                kaggle_json_path=kaggle_json,
+                config_dir=kaggle_config_dir,
+            )
+            _print_kaggle_preflight_report(api_preflight)
 
             api = ensure_auth(kaggle_json_path=kaggle_json, config_dir=kaggle_config_dir)
             print(f"[kaggle] submitting via API: competition={competition} file={submission_csv}", flush=True)
             submit_file(api, competition=competition, filepath=str(submission_csv), message=message)
-            _poll_kaggle_submission_status(competition, kaggle_json, kaggle_config_dir)
-            return
+            status = _poll_kaggle_submission_status(competition, kaggle_json, kaggle_config_dir)
+            return {
+                'mode': 'api',
+                'preflight': api_preflight,
+                'status': status,
+            }
         except Exception as e:
             if submit_via == 'api':
                 raise SystemExit(_format_kaggle_submit_error(e, competition))
@@ -1055,6 +1089,19 @@ def _kaggle_submit(
         except Exception as e:
             print(f"[kaggle] could not prepare Kaggle credentials for CLI: {e}", flush=True)
 
+    try:
+        _ensure_llm_puzzles_on_path()
+        from src.kaggle_utils import preflight_submit_via_cli
+
+        cli_preflight = preflight_submit_via_cli(
+            competition,
+            credentials_path=kaggle_json,
+            config_dir=kaggle_config_dir,
+        )
+        _print_kaggle_preflight_report(cli_preflight)
+    except Exception as e:
+        raise SystemExit(_format_kaggle_submit_error(e, competition))
+
     # Prefer the current official CLI syntax first; retry the legacy `-c` form
     # for environments that still ship the older kaggle package/CLI wrapper.
     cli_attempts = [
@@ -1066,8 +1113,12 @@ def _kaggle_submit(
         print('[kaggle] ' + ' '.join(cmd), flush=True)
         try:
             subprocess.check_call(cmd, env=env)
-            _poll_kaggle_submission_status(competition, kaggle_json, kaggle_config_dir)
-            return
+            status = _poll_kaggle_submission_status(competition, kaggle_json, kaggle_config_dir)
+            return {
+                'mode': 'cli',
+                'preflight': cli_preflight,
+                'status': status,
+            }
         except Exception as e:
             last_error = e
             if idx == len(cli_attempts):
@@ -1075,6 +1126,7 @@ def _kaggle_submit(
             print(f"[kaggle] CLI submit attempt {idx} failed, retrying with compatibility syntax: {e}", flush=True)
     assert last_error is not None
     raise SystemExit(_format_kaggle_submit_error(last_error, competition))
+
 
 
 # ---------------------------------------------------------------------------
@@ -1184,7 +1236,7 @@ def _preferred_kaggle_cli_submit_cmd(competition: str, submission_csv: Path, mes
     return ['kaggle', 'competitions', 'submit', competition, '-f', str(submission_csv), '-m', message]
 
 
-def _poll_kaggle_submission_status(competition: str, kaggle_json: str | None, kaggle_config_dir: str | None, wait_seconds: int = 45) -> None:
+def _poll_kaggle_submission_status(competition: str, kaggle_json: str | None, kaggle_config_dir: str | None, wait_seconds: int = 45) -> Optional[dict[str, Any]]:
     """Best-effort polling of the latest Kaggle submission status.
 
     This helps catch the case where upload succeeded but Kaggle later marks the
@@ -1199,7 +1251,7 @@ def _poll_kaggle_submission_status(competition: str, kaggle_json: str | None, ka
         sub = latest_submission(api, competition)
         if not sub:
             print('[kaggle] WARNING: could not retrieve latest submission status after upload.', flush=True)
-            return
+            return None
 
         sid = sub.get('id') or sub.get('ref') or '?'
         status = sub.get('status') or sub.get('state') or 'unknown'
@@ -1208,7 +1260,7 @@ def _poll_kaggle_submission_status(competition: str, kaggle_json: str | None, ka
         final_sub = wait_for_submission_result(api, competition, target_ref=sid, wait_seconds=wait_seconds)
         if not final_sub:
             print('[kaggle] submission accepted by upload step; scoring is still pending.', flush=True)
-            return
+            return sub
 
         sid = final_sub.get('id') or final_sub.get('ref') or '?'
         status = final_sub.get('status') or final_sub.get('state') or 'unknown'
@@ -1221,8 +1273,10 @@ def _poll_kaggle_submission_status(competition: str, kaggle_json: str | None, ka
         if err not in (None, '', 'None'):
             msg += f" error={err}"
         print(msg, flush=True)
+        return final_sub
     except Exception as e:
         print(f"[kaggle] WARNING: could not poll submission status: {e}", flush=True)
+        return None
 
 
 def _build_submission(
@@ -1299,7 +1353,7 @@ def _memory_env_for_codegen(models: str) -> dict[str, str]:
         env.setdefault("AGENTLAB_G4F_USE_ASYNC", os.getenv("AGENTLAB_G4F_USE_ASYNC", "1"))
         env.setdefault("AGENTLAB_G4F_REQUEST_TIMEOUT_S", os.getenv("AGENTLAB_G4F_REQUEST_TIMEOUT_S", "180"))
         env.setdefault("AGENTLAB_MAX_RESPONSE_CHARS", os.getenv("AGENTLAB_MAX_RESPONSE_CHARS", "0"))
-        env.setdefault("AGENTLAB_G4F_STOP_AT_PYTHON_FENCE", os.getenv("AGENTLAB_G4F_STOP_AT_PYTHON_FENCE", "0"))
+        env.setdefault("AGENTLAB_G4F_STOP_AT_PYTHON_FENCE", os.getenv("AGENTLAB_G4F_STOP_AT_PYTHON_FENCE", "1"))
         env.setdefault("AGENTLAB_ARTIFACT_SPILL_CHARS", os.getenv("AGENTLAB_ARTIFACT_SPILL_CHARS", "8000"))
         env.setdefault("AGENTLAB_HEAVY_IMPORTS", os.getenv("AGENTLAB_HEAVY_IMPORTS", "0"))
         env.setdefault("MALLOC_ARENA_MAX", os.getenv("MALLOC_ARENA_MAX", "2"))
@@ -1793,6 +1847,65 @@ def cmd_validate_solver(args: argparse.Namespace) -> None:
     _validate_solver(solver_path, spec.validator, vec)
 
 
+def cmd_kaggle_preflight(args: argparse.Namespace) -> None:
+    spec = get_pipeline(args.competition)
+    competition = args.submit_competition or (spec.competition if spec is not None else args.competition)
+
+    _ensure_llm_puzzles_on_path()
+    from src.kaggle_utils import preflight_submit_via_api, preflight_submit_via_cli  # type: ignore
+
+    payload: dict[str, Any] = {
+        'competition': competition,
+        'requested_via': args.submit_via,
+        'results': {},
+    }
+    ok = False
+
+    if args.submit_via in {'auto', 'api'}:
+        try:
+            report = preflight_submit_via_api(
+                competition,
+                kaggle_json_path=args.kaggle_json,
+                config_dir=args.kaggle_config_dir,
+            )
+            payload['results']['api'] = report
+            ok = True
+            if not args.json:
+                _print_kaggle_preflight_report(report)
+        except Exception as exc:
+            payload['results']['api_error'] = str(exc)
+            if args.submit_via == 'api':
+                raise SystemExit(str(exc))
+            if not args.json:
+                print(f"[kaggle] preflight (api) failed: {exc}", flush=True)
+
+    if args.submit_via in {'auto', 'cli'}:
+        try:
+            report = preflight_submit_via_cli(
+                competition,
+                credentials_path=args.kaggle_json,
+                config_dir=args.kaggle_config_dir,
+            )
+            payload['results']['cli'] = report
+            ok = True
+            if not args.json:
+                _print_kaggle_preflight_report(report)
+        except Exception as exc:
+            payload['results']['cli_error'] = str(exc)
+            if args.submit_via == 'cli':
+                raise SystemExit(str(exc))
+            if not args.json:
+                print(f"[kaggle] preflight (cli) failed: {exc}", flush=True)
+
+    payload['ok'] = ok
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif ok:
+        print(f"[kaggle] preflight OK for '{competition}'.", flush=True)
+    else:
+        raise SystemExit(f"Kaggle preflight failed for '{competition}'.")
+
+
 def cmd_run(args: argparse.Namespace) -> None:
     # Pipeline selection by competition slug
     spec = get_pipeline(args.competition)
@@ -1957,7 +2070,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             t3 = _stage("submit to Kaggle")
             report["stages"]["submit_kaggle"] = {"start": time.time()}
             submit_comp = args.submit_competition or spec.competition
-            _kaggle_submit(
+            kaggle_submit_report = _kaggle_submit(
                 competition=submit_comp,
                 submission_csv=out_csv,
                 message=args.message,
@@ -1965,6 +2078,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                 submit_via=args.submit_via,
                 kaggle_config_dir=args.kaggle_config_dir,
             )
+            report["kaggle_submit"] = kaggle_submit_report
             report["stages"]["submit_kaggle"]["end"] = time.time()
             report["stages"]["submit_kaggle"]["seconds"] = report["stages"]["submit_kaggle"]["end"] - report["stages"]["submit_kaggle"]["start"]
             _stage_done("submit to Kaggle", t3)
@@ -2138,6 +2252,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-run-log", action="store_true", help="Disable writing run_log.json")
     sp.set_defaults(func=cmd_build_submission)
 
+
+    sp = sub.add_parser("kaggle-preflight", help="Check Kaggle submission prerequisites (version + competition access) without uploading")
+    sp.add_argument("--competition", required=True, help="Competition slug / pipeline key")
+    sp.add_argument("--kaggle-json", default=None, help="Path to a Kaggle credentials file (legacy kaggle.json or access_token)")
+    sp.add_argument("--kaggle-config-dir", default=None, help="Optional directory to place a temporary kaggle.json copy")
+    sp.add_argument("--submit-via", default="auto", choices=["auto","api","cli"], help="Which submission path to preflight: auto (check both), api, or cli")
+    sp.add_argument("--submit-competition", dest="submit_competition", default=None, help="Override Kaggle competition slug used for preflight")
+    sp.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    sp.set_defaults(func=cmd_kaggle_preflight)
 
     sp = sub.add_parser("validate-solver", help="Validate a solver with the competition-specific validator")
     sp.add_argument("--competition", required=True, help="Competition slug / pipeline key")

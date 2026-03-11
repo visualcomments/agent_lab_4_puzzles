@@ -272,4 +272,11 @@ def test_memory_env_for_codegen_defaults_to_async_and_no_clip(monkeypatch):
     env = pipeline_cli._memory_env_for_codegen('gpt-4o-mini')
     assert env['AGENTLAB_G4F_USE_ASYNC'] == '1'
     assert env['AGENTLAB_MAX_RESPONSE_CHARS'] == '0'
-    assert env['AGENTLAB_G4F_STOP_AT_PYTHON_FENCE'] == '0'
+    assert env['AGENTLAB_G4F_STOP_AT_PYTHON_FENCE'] == '1'
+
+
+
+def test_memory_env_for_codegen_defaults_to_stop_at_python_fence(monkeypatch):
+    monkeypatch.delenv('AGENTLAB_G4F_STOP_AT_PYTHON_FENCE', raising=False)
+    env = pipeline_cli._memory_env_for_codegen('g4f:gpt-4o-mini')
+    assert env['AGENTLAB_G4F_STOP_AT_PYTHON_FENCE'] == '1'

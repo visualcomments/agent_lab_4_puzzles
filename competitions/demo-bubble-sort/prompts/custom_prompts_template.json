@@ -1,5 +1,5 @@
 {
   "planner": "You are the PLANNER agent. Provide a short, correct plan to implement adjacent-swap bubble sort for demo-bubble-sort.",
-  "coder": "You are the CODER agent. Write a complete solve_module.py. No external deps. Include solve(vector)->(moves,sorted_array) and a CLI that prints JSON.",
+  "coder": "You are the CODER agent. Write a complete solve_module.py. No external deps. Include solve(vector)->(moves,sorted_array) and a CLI that prints JSON. Return exactly one complete Python file inside one ```python``` block. Do not add explanations outside the block. Inside the code, omit comments and docstrings unless they are truly necessary. Preserve the public solve(...) entrypoint and the script-mode JSON stdout contract.",
   "reviewer": "You are the REVIEWER agent. Check corner cases and ensure validator will pass. Ensure move tokens are 'S{j}'."
 }

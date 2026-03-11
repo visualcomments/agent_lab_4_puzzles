@@ -193,26 +193,25 @@ python pipeline_cli.py selftest
 
 ## Kaggle submit (optional)
 
-If you have the Kaggle API installed and configured (either via `~/.kaggle/kaggle.json` or by passing `--kaggle-json`):
+Before a live submit, you can run an explicit preflight that checks the installed Kaggle client version and whether the current account can access competition submissions for that slug:
 
 ```bash
-python pipeline_cli.py run \
-  --competition cayleypy-rapapport-m2 \
-  --puzzles /path/to/test.csv \
-  --output submission.csv \
-  --no-llm \
-  --submit \
-  --message "baseline"
+python pipeline_cli.py kaggle-preflight   --competition cayleypy-rapapport-m2   --kaggle-json /path/to/kaggle.json   --submit-via auto
+```
+
+Notes:
+
+- The repository now rejects submit attempts when the installed Kaggle client is older than `1.5.0`.
+- The preflight also probes competition submission access, so "rules not accepted / account not joined" is reported before upload.
+- The preferred CLI form stays aligned with the official docs: `kaggle competitions submit <competition> -f ... -m ...`.
+
+If you have the Kaggle API installed and configured (either via `~/.kaggle/kaggle.json` or by passing `--kaggle-json`), you can submit directly from `run`:
+
+```bash
+python pipeline_cli.py run   --competition cayleypy-rapapport-m2   --puzzles /path/to/test.csv   --output submission.csv   --no-llm   --submit   --message "baseline"
 
 # Or pass kaggle.json explicitly
-python pipeline_cli.py run \
-  --competition lrx-discover-math-gods-algorithm \
-  --output submission.csv \
-  --no-llm \
-  --submit \
-  --message "baseline" \
-  --kaggle-json /path/to/kaggle.json \
-  --submit-via api
+python pipeline_cli.py run   --competition lrx-discover-math-gods-algorithm   --output submission.csv   --no-llm   --submit   --message "baseline"   --kaggle-json /path/to/kaggle.json   --submit-via api
 ```
 
 ---

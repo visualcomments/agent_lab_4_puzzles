@@ -59,7 +59,7 @@ competitions/<slug>/
 Параметры пайплайна описаны в `pipeline_registry.py` (PipelineSpec):
 
 - `key` — ключ пайплайна (обычно равен slug соревнования)
-- `competition` — slug для Kaggle submit (`kaggle competitions submit -c ...`)
+- `competition` — slug для Kaggle submit (`kaggle competitions submit <competition> -f ... -m ...`)
 - `format_slug` — формат сабмита для `llm-puzzles/src/comp_registry.py`
 - `baseline_solver`, `validator`, `prompt_file`, `custom_prompts_file`
 - `state_columns` — какие колонки в `test.csv` пробовать как “состояние”
@@ -318,17 +318,21 @@ python pipeline_cli.py run \
 
 ### 9.3 С submit на Kaggle
 
+Сначала можно прогнать preflight без загрузки файла:
+
 ```bash
-python pipeline_cli.py run \
-  --competition lrx-discover-math-gods-algorithm \
-  --output submissions/submission.csv \
-  --no-llm \
-  --submit --message "baseline" \
-  --kaggle-json /path/to/kaggle.json \
-  --submit-via api
+python pipeline_cli.py kaggle-preflight   --competition lrx-discover-math-gods-algorithm   --kaggle-json /path/to/kaggle.json   --submit-via auto
+```
+
+После этого — живой submit:
+
+```bash
+python pipeline_cli.py run   --competition lrx-discover-math-gods-algorithm   --output submissions/submission.csv   --no-llm   --submit --message "baseline"   --kaggle-json /path/to/kaggle.json   --submit-via api
 ```
 
 > Перед `--submit` schema-check включается автоматически (если есть sample_submission).
+> Дополнительно перед upload теперь делается preflight: проверка версии Kaggle-клиента/пакета и доступа к competition submissions.
+
 
 ### Опции `run` (суммарно)
 
@@ -363,6 +367,9 @@ Kaggle submit:
 - `--submit-via auto|api|cli`
 - `--submit-competition <slug>`
 
+Отдельная проверка submit prerequisites:
+- `pipeline_cli.py kaggle-preflight --competition <slug> --submit-via auto|api|cli`
+
 Run log:
 - `--run-log <path>`
 - `--no-run-log`
@@ -393,14 +400,22 @@ Run log:
 
 ## 11) Kaggle submit: практические заметки
 
-1) Убедитесь, что вы приняли правила соревнования на Kaggle (частая причина ошибок submit).
-2) Установите `kaggle` пакет:
+1) Убедитесь, что вы приняли правила соревнования на Kaggle и что аккаунт уже joined competition (частая причина ошибок submit).
+2) Установите `kaggle` пакет и проверьте версию. Для competition submit нужен клиент не ниже `1.5.0`:
 
 ```bash
 pip install kaggle
+kaggle --version
 ```
 
-3) Рекомендуемый путь: передавать ключ через `--kaggle-json`, чтобы не класть его в `~/.kaggle`.
+3) Быстрая проверка без upload:
+
+```bash
+python pipeline_cli.py kaggle-preflight   --competition <slug>   --kaggle-json /path/to/kaggle.json   --submit-via auto
+```
+
+4) Рекомендуемый путь: передавать ключ через `--kaggle-json`, чтобы не класть его в `~/.kaggle`.
+
 
 ---
 

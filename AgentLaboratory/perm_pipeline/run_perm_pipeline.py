@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import io
 import json
 import math
 import os
@@ -27,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tokenize
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -48,6 +50,15 @@ from inference import query_model, MissingLLMCredentials, _best_effort_release_m
 
 RE_PY_BLOCK = re.compile(r"```python\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 RE_ANY_BLOCK = re.compile(r"```(?:[a-zA-Z0-9_+-]+)?\s*(.*?)```", re.DOTALL)
+RE_FENCED_BLOCK = re.compile(r"```(?P<lang>[a-zA-Z0-9_+-]*)\s*(?P<code>.*?)```", re.DOTALL)
+RE_RAW_CODE_START = re.compile(
+    r"^(?:from\s+\S+\s+import|import\s+\S+|def\s+\w+\s*\(|class\s+\w+\s*(?:\(|:)|if __name__ == [\"']__main__[\"']\s*:)",
+    re.IGNORECASE,
+)
+RE_CODE_LIKE_LINE = re.compile(
+    r"^(?:@|def\s+\w+\s*\(|class\s+\w+\s*(?:\(|:)|from\s+\S+\s+import|import\s+\S+|if\b|elif\b|else:|for\b|while\b|try:|except\b|finally:|with\b|return\b|raise\b|assert\b|pass\b|break\b|continue\b|[A-Za-z_][A-Za-z0-9_\[\], ]*\s*=)",
+    re.IGNORECASE,
+)
 
 DEFAULT_MODELS = os.getenv(
     "G4F_MODELS",
@@ -160,25 +171,225 @@ def rank_models_for_codegen(models: Sequence[str]) -> List[str]:
     return sorted(models, key=lambda m: (-model_quality_score(m), m.lower()))
 
 
+def _pos_le(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
+    return a[0] < b[0] or (a[0] == b[0] and a[1] <= b[1])
+
+
+def _span_contains(
+    span: Tuple[Tuple[int, int], Tuple[int, int]],
+    start: Tuple[int, int],
+    end: Tuple[int, int],
+) -> bool:
+    return _pos_le(span[0], start) and _pos_le(end, span[1])
+
+
+def _collect_docstring_spans(code: str) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return []
+
+    spans: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
+
+    def visit_body(body: Sequence[ast.stmt]) -> None:
+        if body and isinstance(body[0], ast.Expr):
+            value = body[0].value
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                end_lineno = getattr(value, 'end_lineno', value.lineno)
+                end_col = getattr(value, 'end_col_offset', value.col_offset)
+                spans.append(((value.lineno, value.col_offset), (end_lineno, end_col)))
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                visit_body(node.body)
+
+    visit_body(tree.body)
+    return spans
+
+
+def _heuristic_strip_comments_and_docstrings(code: str) -> str:
+    source = (code or '').strip()
+    if not source:
+        return ''
+
+    kept: List[str] = []
+    in_triple: Optional[str] = None
+    for line in source.splitlines():
+        stripped = line.lstrip()
+
+        if in_triple is not None:
+            if in_triple in stripped:
+                in_triple = None
+            continue
+
+        if stripped.startswith('#'):
+            continue
+
+        match = re.match(r"^(?:[rRuUbBfF]{0,2})?(?P<quote>'''|\"\"\")", stripped)
+        if match:
+            quote = match.group('quote')
+            tail = stripped[match.end():]
+            if quote in tail:
+                continue
+            in_triple = quote
+            continue
+
+        kept.append(line.rstrip())
+
+    cleaned = '\n'.join(kept)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned.strip()
+
+
+def _strip_python_comments_and_docstrings(code: str) -> str:
+    source = (code or '').strip()
+    if not source:
+        return ''
+
+    try:
+        ast.parse(source)
+        parsed_ok = True
+    except Exception:
+        parsed_ok = False
+
+    spans = _collect_docstring_spans(source) if parsed_ok else []
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+    except Exception:
+        return _heuristic_strip_comments_and_docstrings(source) or source
+
+    kept = []
+    for tok in tokens:
+        if tok.type == tokenize.COMMENT:
+            continue
+        if tok.type == tokenize.STRING and any(_span_contains(span, tok.start, tok.end) for span in spans):
+            continue
+        kept.append(tok)
+
+    try:
+        cleaned = tokenize.untokenize(kept)
+    except Exception:
+        return _heuristic_strip_comments_and_docstrings(source) or source
+
+    cleaned = '\n'.join(line.rstrip() for line in cleaned.splitlines())
+    if not parsed_ok and ('\"\"\"' in cleaned or "'''" in cleaned):
+        cleaned = _heuristic_strip_comments_and_docstrings(cleaned) or cleaned
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned.strip()
+
+def _looks_like_python(code: str) -> bool:
+    low = (code or '').lower()
+    indicators = (
+        'def ',
+        'class ',
+        'import ',
+        'from ',
+        '__main__',
+        'return ',
+        'for ',
+        'while ',
+        'if ',
+        'try:',
+        'with ',
+    )
+    return any(token in low for token in indicators)
+
+
+def _extract_raw_python_candidate(text: str) -> Optional[str]:
+    source = (text or '').strip()
+    if not source:
+        return None
+    if not any(token in source for token in ('def solve', 'import ', 'from __future__', 'if __name__', 'class ')):
+        return None
+
+    lines = source.splitlines()
+    start_idx: Optional[int] = None
+    for idx, line in enumerate(lines):
+        if RE_RAW_CODE_START.match(line.strip()):
+            start_idx = idx
+            break
+
+    if start_idx is None:
+        return source
+
+    kept: List[str] = []
+    for line in lines[start_idx:]:
+        stripped = line.strip()
+        if stripped.startswith('```'):
+            break
+        if not stripped:
+            kept.append(line)
+            continue
+        if RE_CODE_LIKE_LINE.match(stripped) or line.startswith((' ', '\t')) or stripped.startswith('#'):
+            kept.append(line)
+            continue
+        if kept:
+            break
+
+    candidate = '\n'.join(kept).strip()
+    return candidate or None
+
+
+def _python_candidate_score(code: str, *, lang: str = '', fenced: bool = False) -> int:
+    score = 0
+    norm_lang = (lang or '').strip().lower()
+    low = (code or '').lower()
+
+    if norm_lang in {'python', 'py', 'python3'}:
+        score += 140
+    elif norm_lang:
+        score -= 20
+
+    if fenced:
+        score += 5
+    if 'def solve' in low:
+        score += 120
+    if '__main__' in low:
+        score += 25
+    if 'json.dumps' in low:
+        score += 15
+    if _looks_like_python(code):
+        score += 20
+
+    try:
+        ast.parse(code)
+        score += 60
+    except Exception:
+        score -= 10
+
+    nonempty_lines = sum(1 for line in code.splitlines() if line.strip())
+    score += min(nonempty_lines, 80)
+    return score
+
+
 def extract_python(resp: str) -> Optional[str]:
-    text = (resp or "").strip()
+    text = (resp or '').strip()
     if not text:
         return None
 
-    m = RE_PY_BLOCK.search(text)
-    if m:
-        code = m.group(1).strip()
-        return code or None
+    candidates: List[Tuple[int, int, str]] = []
 
-    m = RE_ANY_BLOCK.search(text)
-    if m:
-        code = m.group(1).strip()
-        return code or None
+    for idx, match in enumerate(RE_FENCED_BLOCK.finditer(text)):
+        lang = (match.group('lang') or '').strip()
+        code = (match.group('code') or '').strip()
+        if not code:
+            continue
+        cleaned = _strip_python_comments_and_docstrings(code) or code
+        score = _python_candidate_score(cleaned, lang=lang, fenced=True)
+        if lang and lang.lower() not in {'python', 'py', 'python3'} and not _looks_like_python(code):
+            score -= 50
+        candidates.append((score, -idx, cleaned))
 
-    # Fallback: some models ignore the fence instruction and return raw Python.
-    if any(token in text for token in ("def solve", "import ", "from __future__", "if __name__")):
-        return text
-    return None
+    raw_candidate = _extract_raw_python_candidate(text)
+    if raw_candidate:
+        cleaned = _strip_python_comments_and_docstrings(raw_candidate) or raw_candidate
+        candidates.append((_python_candidate_score(cleaned, fenced=False), -10_000, cleaned))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    code = candidates[0][2].strip()
+    return code or None
 
 
 def _env_int(name: str, default: int) -> int:
@@ -394,6 +605,29 @@ def compile_python(code: str) -> Tuple[bool, str]:
     return True, ""
 
 
+def validate_solver_contract(code: str) -> Tuple[bool, str]:
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return False, f"SyntaxError: {e.msg} (line {e.lineno}, offset {e.offset})"
+    except Exception as e:  # pragma: no cover - defensive only
+        return False, f"ParseError: {type(e).__name__}: {e}"
+
+    solve_node = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == 'solve':
+            solve_node = node
+            break
+    if solve_node is None:
+        return False, 'missing required function solve(vec)'
+
+    arg_count = len(getattr(solve_node.args, 'posonlyargs', [])) + len(getattr(solve_node.args, 'args', []))
+    if arg_count < 1 and solve_node.args.vararg is None:
+        return False, 'solve() must accept at least one positional argument'
+
+    return True, ''
+
+
 def run_validator(validator_path: Path, solver_path: Path, vec: List[int]) -> Tuple[int, str, str]:
     cmd = [sys.executable, str(validator_path), "--solver", str(solver_path), "--vector", json.dumps(vec)]
     p = subprocess.run(cmd, capture_output=True, text=True)
@@ -433,9 +667,10 @@ def probe_model_for_codegen(model: str) -> Tuple[bool, str]:
     ok, reason = compile_python(code)
     if not ok:
         return False, reason
-    if "def solve" not in code:
-        return False, "missing solve()"
-    return True, "ok"
+    contract_ok, contract_reason = validate_solver_contract(code)
+    if not contract_ok:
+        return False, contract_reason
+    return True, 'ok'
 
 
 def order_models_for_codegen(models: Sequence[str]) -> List[str]:
@@ -537,25 +772,39 @@ def _make_iteration_progress(model: str, max_iters: int):
     )
 
 
+def _strict_output_requirements(*, prefer_minimal_patch: bool) -> str:
+    lines = [
+        'STRICT OUTPUT REQUIREMENTS:',
+        '- Return exactly one complete Python file inside a single ```python``` block.',
+        '- Do not include explanations, markdown outside the code block, bullet points, or partial snippets.',
+        '- Inside the code, omit comments and docstrings unless they are absolutely necessary.',
+        '- Preserve the public solve(vec) entrypoint and the script-mode JSON stdout contract with keys moves and sorted_array.',
+    ]
+    if prefer_minimal_patch:
+        lines.append('- Prefer a minimal patch over a rewrite whenever possible.')
+    return '\n'.join(lines)
+
+
 def build_initial_codegen_prompt(user_prompt: str, plan: str, *, baseline_code: Optional[str] = None) -> str:
     parts = [
         f"USER TASK:\n{user_prompt}",
         f"PLANNER NOTES:\n{plan}",
     ]
     if baseline_code is None:
-        parts.append("Now write the solver file.")
+        parts.append('Now write the solver file.')
     else:
         parts.extend(
             [
-                "KNOWN-GOOD BASELINE SOLVER:",
+                'KNOWN-GOOD BASELINE SOLVER:',
                 f"```python\n{baseline_code}\n```",
                 (
-                    "Modify the baseline minimally to better solve the task while preserving the public entrypoints, "
-                    "stdout contract, and dependency-free behavior. Return the complete updated solver file."
+                    'Modify the baseline minimally to better solve the task while preserving the public entrypoints, '
+                    'stdout contract, and dependency-free behavior. Return the complete updated solver file.'
                 ),
             ]
         )
-    return "\n\n".join(parts)
+    parts.append(_strict_output_requirements(prefer_minimal_patch=baseline_code is not None))
+    return '\n\n'.join(parts)
 
 
 def _query_code_block_with_rescue(
@@ -642,7 +891,8 @@ def _run_fixer_loop(
                 f"USER TASK:\n{user_prompt}\n\n"
                 f"CURRENT CODE:\n```python\n{_clip_middle(current_code, max_code_chars)}\n```\n\n"
                 f"FAILURE REPORT:\n{_clip_middle(last_report, max_report_chars)}\n\n"
-                "Return a corrected full python file."
+                'Return a corrected full python file.\n\n'
+                + _strict_output_requirements(prefer_minimal_patch=True)
             )
 
             new_code = None
@@ -671,6 +921,12 @@ def _run_fixer_loop(
 
             if not ok:
                 last_report = f"Fix iteration {it} compile check failed.\n{compile_err}\n"
+                _best_effort_release_memory(clear_local_cache=False)
+                continue
+
+            contract_ok, contract_err = validate_solver_contract(new_code)
+            if not contract_ok:
+                last_report = f"Fix iteration {it} solver contract check failed.\n{contract_err}\n"
                 _best_effort_release_memory(clear_local_cache=False)
                 continue
 
@@ -721,11 +977,15 @@ def try_generate_with_model(
     if not ok:
         last_report = f"Initial compile check failed.\n{compile_err}\n"
     else:
-        out_path.write_text(code, encoding="utf-8")
-        valid, last_report = validate_solver_suite(validator_path, out_path, tests)
-        if valid:
-            immediate_label = f"{stage_label} output validated immediately" if stage_label != "coder" else "coder output validated immediately"
-            return True, f"{model}: {immediate_label}"
+        contract_ok, contract_err = validate_solver_contract(code)
+        if not contract_ok:
+            last_report = f"Initial solver contract check failed.\n{contract_err}\n"
+        else:
+            out_path.write_text(code, encoding="utf-8")
+            valid, last_report = validate_solver_suite(validator_path, out_path, tests)
+            if valid:
+                immediate_label = f"{stage_label} output validated immediately" if stage_label != "coder" else "coder output validated immediately"
+                return True, f"{model}: {immediate_label}"
 
     progress_label = f"{stage_label}:{model}" if stage_label != "coder" else model
     return _run_fixer_loop(

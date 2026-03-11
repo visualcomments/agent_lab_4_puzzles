@@ -1,0 +1,13 @@
+Kaggle CLI:
+Kaggle CLI 2.0.0
+
+Preflight check:
+{
+  "competition": "cayleypy-rapapport-m2",
+  "requested_via": "auto",
+  "results": {
+    "api_error": "Kaggle API preflight failed while checking submission access for 'cayleypy-rapapport-m2': HTTPSConnectionPool(host='api.kaggle.com', port=443): Max retries exceeded with url: /v1/competitions.CompetitionApiService/ListSubmissions (Caused by NameResolutionError(\"HTTPSConnection(host='api.kaggle.com', port=443): Failed to resolve 'api.kaggle.com' ([Errno -3] Temporary failure in name resolution)\"))",
+    "cli_error": "Kaggle CLI preflight failed while checking submission access for 'cayleypy-rapapport-m2': exit code 1. HTTPSConnectionPool(host='api.kaggle.com', port=443): Max retries exceeded with url: /v1/competitions.CompetitionApiService/ListSubmissions (Caused by NameResolutionError(\"HTTPSConnection(host='api.kaggle.com', port=443): Failed to resolve 'api.kaggle.com' ([Errno -3] Temporary failure in name resolution)\"))"
+  },
+  "ok": false
+}

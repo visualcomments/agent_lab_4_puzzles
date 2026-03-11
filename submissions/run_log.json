@@ -96,5 +96,171 @@
         "rows": 2405
       }
     }
+  },
+  {
+    "ts": "2026-03-11T06:49:43.941097",
+    "cmd": "run",
+    "pipeline": "lrx-discover-math-gods-algorithm",
+    "competition": "lrx-discover-math-gods-algorithm",
+    "format": "lrx-discover-math-gods-algorithm",
+    "puzzles_csv": "/mnt/data/work/repo_edit/competitions/lrx-discover-math-gods-algorithm/data/test.csv",
+    "output_csv": "submissions/lrx_discover_smoke.csv",
+    "solver": "/mnt/data/work/repo_edit/generated/solve_lrx-discover-math-gods-algorithm_20260311_064943.py",
+    "args": {
+      "no_llm": true,
+      "models": "gpt-4o-mini",
+      "agent_models": null,
+      "planner_models": null,
+      "coder_models": null,
+      "fixer_models": null,
+      "max_iters": 8,
+      "vector_col": null,
+      "max_rows": 5,
+      "submit": false,
+      "submit_via": "auto",
+      "submit_competition": null
+    },
+    "stages": {
+      "generate_solver": {
+        "start": 1773211783.999289,
+        "end": 1773211784.0003812,
+        "seconds": 0.0010921955108642578
+      },
+      "validate_solver": {
+        "start": 1773211784.0004375,
+        "end": 1773211787.602804,
+        "seconds": 3.6023664474487305
+      },
+      "build_submission": {
+        "start": 1773211787.6030304,
+        "end": 1773211787.6748133,
+        "seconds": 0.07178282737731934
+      }
+    },
+    "status": "ok",
+    "files": {
+      "puzzles_csv": {
+        "path": "/mnt/data/work/repo_edit/competitions/lrx-discover-math-gods-algorithm/data/test.csv",
+        "exists": true,
+        "bytes": 74914,
+        "mtime": "2026-03-09T20:17:30",
+        "columns": [
+          "n",
+          "permutation"
+        ],
+        "rows": 500
+      },
+      "output_csv": {
+        "path": "submissions/lrx_discover_smoke.csv",
+        "exists": true,
+        "bytes": 1091,
+        "mtime": "2026-03-11T06:49:47.674758",
+        "columns": [
+          "permutation",
+          "solution"
+        ],
+        "rows": 5
+      },
+      "solver": {
+        "path": "/mnt/data/work/repo_edit/generated/solve_lrx-discover-math-gods-algorithm_20260311_064943.py",
+        "exists": true,
+        "bytes": 3930,
+        "mtime": "2026-03-11T06:49:43.999739"
+      },
+      "sample_submission_csv": {
+        "path": "/mnt/data/work/repo_edit/competitions/lrx-discover-math-gods-algorithm/data/sample_submission.csv",
+        "exists": true,
+        "bytes": 2995381,
+        "mtime": "2026-03-11T06:49:47.621935",
+        "columns": [
+          "permutation",
+          "solution"
+        ],
+        "rows": 500
+      }
+    }
+  },
+  {
+    "ts": "2026-03-11T06:53:24.317572",
+    "cmd": "run",
+    "pipeline": "lrx-discover-math-gods-algorithm",
+    "competition": "lrx-discover-math-gods-algorithm",
+    "format": "lrx-discover-math-gods-algorithm",
+    "puzzles_csv": "/mnt/data/work/repo_edit/competitions/lrx-discover-math-gods-algorithm/data/test.csv",
+    "output_csv": "submissions/lrx_discover_smoke.csv",
+    "solver": "/mnt/data/work/repo_edit/generated/solve_lrx-discover-math-gods-algorithm_20260311_065324.py",
+    "args": {
+      "no_llm": true,
+      "models": "gpt-4o-mini",
+      "agent_models": null,
+      "planner_models": null,
+      "coder_models": null,
+      "fixer_models": null,
+      "max_iters": 8,
+      "vector_col": null,
+      "max_rows": 5,
+      "submit": false,
+      "submit_via": "auto",
+      "submit_competition": null
+    },
+    "stages": {
+      "generate_solver": {
+        "start": 1773212004.3504403,
+        "end": 1773212004.3529518,
+        "seconds": 0.0025115013122558594
+      },
+      "validate_solver": {
+        "start": 1773212004.353088,
+        "end": 1773212008.1747684,
+        "seconds": 3.8216805458068848
+      },
+      "build_submission": {
+        "start": 1773212008.1749995,
+        "end": 1773212008.2381518,
+        "seconds": 0.06315231323242188
+      }
+    },
+    "status": "ok",
+    "files": {
+      "puzzles_csv": {
+        "path": "/mnt/data/work/repo_edit/competitions/lrx-discover-math-gods-algorithm/data/test.csv",
+        "exists": true,
+        "bytes": 74914,
+        "mtime": "2026-03-09T20:17:30",
+        "columns": [
+          "n",
+          "permutation"
+        ],
+        "rows": 500
+      },
+      "output_csv": {
+        "path": "submissions/lrx_discover_smoke.csv",
+        "exists": true,
+        "bytes": 1091,
+        "mtime": "2026-03-11T06:53:28.238127",
+        "columns": [
+          "permutation",
+          "solution"
+        ],
+        "rows": 5
+      },
+      "solver": {
+        "path": "/mnt/data/work/repo_edit/generated/solve_lrx-discover-math-gods-algorithm_20260311_065324.py",
+        "exists": true,
+        "bytes": 3930,
+        "mtime": "2026-03-11T06:53:24.351288"
+      },
+      "sample_submission_csv": {
+        "path": "/mnt/data/work/repo_edit/competitions/lrx-discover-math-gods-algorithm/data/sample_submission.csv",
+        "exists": true,
+        "bytes": 2995381,
+        "mtime": "2026-03-11T06:53:28.214990",
+        "columns": [
+          "permutation",
+          "solution"
+        ],
+        "rows": 500
+      }
+    }
   }
 ]
