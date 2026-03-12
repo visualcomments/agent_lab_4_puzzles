@@ -17,6 +17,7 @@ from src.comp_registry import get_config  # type: ignore
 ZIP_TO_PIPELINE = {
     'CayleyPy-pancake.zip': 'cayleypy-pancake',
     'cayley-py-444-cube.zip': 'cayley-py-444-cube',
+    'cayley-py-megaminx.zip': 'cayley-py-megaminx',
     'cayleypy-christophers-jewel.zip': 'cayleypy-christophers-jewel',
     'cayleypy-glushkov.zip': 'cayleypy-glushkov',
     'cayleypy-rapapport-m2(1).zip': 'cayleypy-rapapport-m2',

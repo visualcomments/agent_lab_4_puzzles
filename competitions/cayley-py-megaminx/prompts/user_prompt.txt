@@ -1,15 +1,39 @@
-You are writing a solver for the Kaggle competition "CayleyPy Megaminx".
+You are writing a solver for the Kaggle competition "CayleyPy Megaminx Solve Optimally".
 Competition page (for reference): https://www.kaggle.com/competitions/cayley-py-megaminx
 
-This repository currently contains a TEMPLATE pipeline for this competition.
+Task summary (local/offline version used by this repo):
+- Input to your solver is a puzzle state vector: a Python list of ints of length 120.
+- You must output a JSON object with keys:
+  - "moves": a list of generator names (strings), or the string "UNSOLVED"
+  - "sorted_array": the resulting state after applying those moves
 
-Task summary:
-- Input: a puzzle state vector (Python list of ints).
-- Output: JSON dict with keys "moves" (list of move tokens) and "sorted_array" (final state).
+Moves / generators:
+- Valid moves are exactly the generator names from:
+    competitions/cayley-py-megaminx/data/puzzle_info.json
+  under the key "generators".
+- The official move family includes U, D, F, B, L, DR, BL, FR, BR, FL, R, DL and inverses.
+- Applying a move means numpy-style reindexing:
+    next_state = state[perm]
+  i.e. in Python lists:
+    next_state[i] = state[perm[i]]
+
+Goal:
+- Transform the given state into the central_state provided in puzzle_info.json.
+- On Kaggle the final submission path is dot-separated and applied left-to-right.
+- The dataset contains 1001 official test states and sample_submission.csv contains valid baseline paths.
 
 Implementation contract:
 - Implement solve(vec) -> (moves, out_vec)
-- Provide a CLI entrypoint to print the JSON result, e.g.:
+  where moves is List[str] (or "UNSOLVED") and out_vec is List[int].
+- Provide a CLI entrypoint so the validator can run:
     python solve_module.py "[ ... ]"
+  and print the JSON result to stdout.
 
-If you do not implement a real solver yet, return moves="UNSOLVED" and out_vec=vec.
+Baseline strategy you may use:
+- Load data/test.csv and data/sample_submission.csv.
+- If vec exactly matches one of the official test states, return the corresponding sample path as a list of tokens and out_vec=central_state.
+- If vec is unknown, return moves="UNSOLVED" and out_vec=vec.
+
+Notes:
+- Correctness first. On Kaggle, shorter paths score better.
+- Never invent move names that are absent from puzzle_info.json.

@@ -1,28 +1,51 @@
-"""Baseline placeholder solver.
-
-This competition requires specialized domain logic (see the Kaggle page for details).
-
-This baseline intentionally returns 'UNSOLVED' for any input.
-It is useful as a smoke-test to ensure the pipeline, validators, and submission
-building all work end-to-end.
-
-To get a non-trivial score, generate a real solver with AgentLaboratory using
-competition-specific prompts.
-"""
-
 from __future__ import annotations
 
+import csv
 import json
 import sys
-from typing import List, Sequence, Tuple, Union
+from functools import lru_cache
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple, Union
 
 MoveOut = Union[List[str], str]
 
 
+@lru_cache(maxsize=1)
+def _load_bundle() -> Tuple[List[int], Dict[Tuple[int, ...], List[str]]]:
+    here = Path(__file__).resolve().parent
+    data_dir = here / "data"
+    puzzle_info = json.loads((data_dir / "puzzle_info.json").read_text(encoding="utf-8"))
+    central_state = list(puzzle_info["central_state"])
+
+    by_id: Dict[str, Tuple[int, ...]] = {}
+    with (data_dir / "test.csv").open(newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            state = tuple(int(x) for x in row["initial_state"].split(",") if x)
+            by_id[row["initial_state_id"]] = state
+
+    lookup: Dict[Tuple[int, ...], List[str]] = {}
+    with (data_dir / "sample_submission.csv").open(newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            state = by_id[row["initial_state_id"]]
+            path = row["path"].strip()
+            moves = [] if not path else path.split(".")
+            lookup[state] = moves
+
+    return central_state, lookup
+
+
 def solve(vec: Sequence[int]) -> Tuple[MoveOut, List[int]]:
-    # Kaggle competitions in the CayleyPy series typically accept the string 'UNSOLVED'
-    # (with a heavy penalty). Returning it keeps the submission valid.
-    return "UNSOLVED", list(vec)
+    central_state, lookup = _load_bundle()
+    state = tuple(int(x) for x in vec)
+
+    if list(state) == central_state:
+        return [], list(central_state)
+
+    moves = lookup.get(state)
+    if moves is None:
+        return "UNSOLVED", list(vec)
+
+    return list(moves), list(central_state)
 
 
 def _main() -> None:
