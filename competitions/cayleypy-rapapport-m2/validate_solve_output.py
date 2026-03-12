@@ -23,16 +23,16 @@ ALLOWED = {"I", "S", "K"}
 
 
 def _apply_I(a: List[int]) -> None:
-    if len(a) >= 2:
-        a[0], a[1] = a[1], a[0]
-
-
-def _apply_S(a: List[int]) -> None:
     n = len(a)
     i = 0
     while i + 1 < n:
         a[i], a[i + 1] = a[i + 1], a[i]
         i += 2
+
+
+def _apply_S(a: List[int]) -> None:
+    if len(a) >= 2:
+        a[0], a[1] = a[1], a[0]
 
 
 def _apply_K(a: List[int]) -> None:

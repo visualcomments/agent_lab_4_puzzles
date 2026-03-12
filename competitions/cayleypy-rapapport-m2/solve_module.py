@@ -5,9 +5,8 @@ Kaggle competition: https://www.kaggle.com/competitions/cayleypy-rapapport-m2
 This file implements a *constructive* sorting algorithm using only the
 allowed generators (moves):
 
-- I : swap positions 0 and 1
-- S : swap (0,1), (2,3), (4,5), ...
-- K : swap (1,2), (3,4), (5,6), ...
+- Competition semantics: S = swap positions 0 and 1, I = swap (0,1), (2,3), (4,5), ..., K = swap (1,2), (3,4), (5,6), ...
+- Internal construction below historically used I/S with swapped names; output moves are renamed before returning.
 
 The goal is to transform an arbitrary permutation into the sorted state.
 
@@ -45,6 +44,7 @@ from typing import List, Sequence, Tuple
 ALLOWED_MOVES = {"I", "S", "K"}
 
 Move = str
+TOKEN_RENAME = {"I": "S", "S": "I", "K": "K"}
 
 
 def _apply_I(a: List[int]) -> None:
@@ -182,7 +182,8 @@ def solve(vec: Sequence[int]) -> Tuple[List[Move], List[int]]:
             moves.extend(seq)
             cur_pos -= 1
 
-    return moves, a
+    renamed_moves = [TOKEN_RENAME[m] for m in moves]
+    return renamed_moves, a
 
 
 def _main() -> None:

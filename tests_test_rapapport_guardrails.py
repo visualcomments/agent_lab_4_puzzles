@@ -73,3 +73,18 @@ def test_rapapport_solver_only_emits_isk_and_sorts():
     moves, sorted_array = solve(vec)
     assert set(moves) <= {'I', 'S', 'K'}
     assert sorted_array == [0, 1, 2, 3, 4]
+
+
+
+def test_rapapport_sample_solution_matches_competition_semantics():
+    vec = [3, 0, 1, 4, 2]
+    for m in ['S', 'K', 'I', 'S']:
+        if m == 'S':
+            vec[0], vec[1] = vec[1], vec[0]
+        elif m == 'I':
+            for i in range(0, len(vec) - 1, 2):
+                vec[i], vec[i + 1] = vec[i + 1], vec[i]
+        elif m == 'K':
+            for i in range(1, len(vec) - 1, 2):
+                vec[i], vec[i + 1] = vec[i + 1], vec[i]
+    assert vec == [0, 1, 2, 3, 4]
