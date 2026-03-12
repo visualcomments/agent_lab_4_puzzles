@@ -113,3 +113,58 @@ def test_build_parser_supports_agent_model_flags_for_generate_and_run():
         '--agent-models', 'planner=gpt-4;coder=local:Qwen/demo',
     ])
     assert run_args.agent_models.startswith('planner=')
+
+
+
+def test_cmd_run_forwards_codegen_runtime_flags(monkeypatch, tmp_path):
+    parser = pipeline_cli.build_parser()
+    args = parser.parse_args([
+        'run',
+        '--competition', 'cayleypy-rapapport-m2',
+        '--output', str(tmp_path / 'submission.csv'),
+        '--models', 'gpt-4o-mini',
+        '--planner-models', 'gpt-4',
+        '--coder-models', 'gpt-4',
+        '--fixer-models', 'gpt-4',
+        '--max-iters', '7',
+        '--g4f-recovery-rounds', '20',
+        '--g4f-recovery-max-iters', '10',
+        '--g4f-recovery-sleep', '1.0',
+        '--print-generation',
+        '--print-generation-max-chars', '4000',
+        '--g4f-async',
+        '--max-response-chars', '30000',
+        '--g4f-request-timeout', '20',
+        '--g4f-stop-at-python-fence',
+    ])
+
+    captured = {}
+
+    def fake_run_agent_laboratory(**kwargs):
+        captured.update(kwargs)
+        Path(kwargs['out_path']).write_text('''def solve(vec):
+    return [], list(vec)
+''', encoding='utf-8')
+
+    monkeypatch.setattr(pipeline_cli, '_run_agent_laboratory', fake_run_agent_laboratory)
+    monkeypatch.setattr(pipeline_cli, '_validate_solver', lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        pipeline_cli,
+        '_build_submission',
+        lambda **kwargs: Path(kwargs['out_csv']).write_text('''id,permutation,solution
+0,1,
+''', encoding='utf-8'),
+    )
+    monkeypatch.setattr(pipeline_cli, '_append_run_log', lambda *args, **kwargs: None)
+
+    pipeline_cli.cmd_run(args)
+
+    assert captured['print_generation'] is True
+    assert captured['print_generation_max_chars'] == 4000
+    assert captured['g4f_async'] is True
+    assert captured['max_response_chars'] == 30000
+    assert captured['g4f_request_timeout'] == 20.0
+    assert captured['g4f_stop_at_python_fence'] is True
+    assert captured['g4f_recovery_rounds'] == 20
+    assert captured['g4f_recovery_max_iters'] == 10
+    assert captured['g4f_recovery_sleep'] == 1.0

@@ -1991,6 +1991,12 @@ def cmd_run(args: argparse.Namespace) -> None:
                 g4f_recovery_max_iters=args.g4f_recovery_max_iters,
                 g4f_recovery_sleep=args.g4f_recovery_sleep,
                 worker_no_kill_process_group=args.worker_no_kill_process_group,
+                print_generation=args.print_generation,
+                print_generation_max_chars=args.print_generation_max_chars,
+                g4f_async=args.g4f_async,
+                max_response_chars=args.max_response_chars,
+                g4f_request_timeout=args.g4f_request_timeout,
+                g4f_stop_at_python_fence=args.g4f_stop_at_python_fence,
             )
 
         report["stages"]["generate_solver"]["end"] = time.time()
