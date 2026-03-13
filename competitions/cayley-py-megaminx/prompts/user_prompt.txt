@@ -1,39 +1,48 @@
-You are writing a solver for the Kaggle competition "CayleyPy Megaminx Solve Optimally".
-Competition page (for reference): https://www.kaggle.com/competitions/cayley-py-megaminx
+We are solving the Kaggle competition "CayleyPy Megaminx Solve Optimally".
+Reference: https://www.kaggle.com/competitions/cayley-py-megaminx
 
-Task summary (local/offline version used by this repo):
-- Input to your solver is a puzzle state vector: a Python list of ints of length 120.
-- You must output a JSON object with keys:
-  - "moves": a list of generator names (strings), or the string "UNSOLVED"
-  - "sorted_array": the resulting state after applying those moves
+PROBLEM SUMMARY
+- State: a permutation vector of length 120.
+- Goal: transform the given state into the central solved state from competitions/cayley-py-megaminx/data/puzzle_info.json.
+- Legal moves are the generator names from puzzle_info.json.
+- Official move notation used by the competition: U, D, F, B, L, DR, BL, FR, BR, FL, R, DL and their inverses.
+- Kaggle submissions use dot-separated move names in the path column.
 
-Moves / generators:
-- Valid moves are exactly the generator names from:
-    competitions/cayley-py-megaminx/data/puzzle_info.json
-  under the key "generators".
-- The official move family includes U, D, F, B, L, DR, BL, FR, BR, FL, R, DL and inverses.
-- Applying a move means numpy-style reindexing:
-    next_state = state[perm]
-  i.e. in Python lists:
-    next_state[i] = state[perm[i]]
+INPUT / OUTPUT CONTRACT
+- Implement solve(vec) -> (moves, sorted_array)
+- vec is a Python list[int]
+- moves must be either:
+  - list[str] with legal generator names, or
+  - the string "UNSOLVED"
+- sorted_array must be the final state after applying moves
+- Script mode must print JSON: {"moves": ..., "sorted_array": ...}
 
-Goal:
-- Transform the given state into the central_state provided in puzzle_info.json.
-- On Kaggle the final submission path is dot-separated and applied left-to-right.
-- The dataset contains 1001 official test states and sample_submission.csv contains valid baseline paths.
+ALGORITHM REQUIREMENTS
+- The code must run in polynomial time.
+- Do NOT use BFS, DFS, A*, IDA*, beam search over growing depth, or whole-state-space enumeration.
+- Constant-depth lookahead over the fixed generator set (depth 1 or 2) is allowed, because that remains polynomial.
+- Do NOT invent move names; use only keys from puzzle_info.json.
 
-Implementation contract:
-- Implement solve(vec) -> (moves, out_vec)
-  where moves is List[str] (or "UNSOLVED") and out_vec is List[int].
-- Provide a CLI entrypoint so the validator can run:
-    python solve_module.py "[ ... ]"
-  and print the JSON result to stdout.
+RECOMMENDED IMPLEMENTATION ORDER
+1. DATA-AWARE EXACT BASELINE
+   If competitions/cayley-py-megaminx/data/test.csv and sample_submission.csv exist, build a dictionary:
+       initial_state string -> known valid path
+   Return that exact path for exact matches. This is deterministic, valid for the bundled dataset, and polynomial-time.
+2. GENERIC FALLBACK FOR UNSEEN STATES
+   - Load central_state and generators from puzzle_info.json.
+   - Implement apply_perm(state, perm) and apply_moves(state, moves).
+   - Score a state with a polynomial-time objective such as:
+       (a) number of positions already equal to central_state (maximize),
+       (b) longest correct prefix (maximize),
+       (c) total mismatches (minimize).
+   - Evaluate every legal 1-move candidate, and optionally every legal 2-move macro.
+   - Repeatedly choose the move or macro that improves the score the most.
+   - Stop when central_state is reached.
+   - If no progress is possible after a bounded number of polynomial steps, return "UNSOLVED".
 
-Baseline strategy you may use:
-- Load data/test.csv and data/sample_submission.csv.
-- If vec exactly matches one of the official test states, return the corresponding sample path as a list of tokens and out_vec=central_state.
-- If vec is unknown, return moves="UNSOLVED" and out_vec=vec.
-
-Notes:
-- Correctness first. On Kaggle, shorter paths score better.
-- Never invent move names that are absent from puzzle_info.json.
+IMPLEMENTATION DETAILS
+- Keep the code self-contained; use only the standard library.
+- It is fine to work on a copy of vec.
+- Always verify that sorted_array equals the state produced by the emitted moves.
+- Return exactly one complete Python file inside one ```python``` block.
+- Do not add explanations outside the code block.

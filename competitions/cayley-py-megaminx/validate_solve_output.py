@@ -1,4 +1,24 @@
 #!/usr/bin/env python3
+"""Validator for CayleyPy Megaminx solver output.
+
+Contract (same as other competitions in this repo):
+- run solver as:  python solve_module.py "[ ... ]"
+- solver prints JSON: {"moves": ..., "sorted_array": ...}
+
+Validation performed:
+- solver runs and outputs a JSON object with keys "moves" and "sorted_array"
+- moves is either:
+    * list[str] of generator names
+    * a '.'-separated string of generator names
+    * the string 'UNSOLVED' (accepted for template/baseline fallback)
+- applying the generators to the input must reach the puzzle's central_state
+  (loaded from data/puzzle_info.json)
+- sorted_array must equal the final state after applying the moves
+
+Permutation application convention:
+- generator perm is a list p where: new[i] = old[p[i]]
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -18,7 +38,7 @@ def _load_puzzle_info() -> Dict[str, Any]:
 
 
 def _apply_perm(state: List[int], perm: List[int]) -> List[int]:
-    return [state[i] for i in perm]
+    return [state[j] for j in perm]
 
 
 def _parse_moves(moves: Any) -> List[str] | None:
@@ -28,7 +48,7 @@ def _parse_moves(moves: Any) -> List[str] | None:
             return None
         if not s:
             return []
-        return [tok for tok in s.split(".") if tok]
+        return s.split(".")
     if isinstance(moves, list) and all(isinstance(m, str) for m in moves):
         return moves
     raise TypeError("moves must be list[str], a dot-separated string, or 'UNSOLVED'")
@@ -41,22 +61,9 @@ def main() -> None:
     args = ap.parse_args()
 
     solver = Path(args.solver)
-    if not solver.exists():
-        print(f"[!] solver not found: {solver}", file=sys.stderr)
-        raise SystemExit(2)
-
     vec = json.loads(args.vector)
-    if not isinstance(vec, list) or not all(isinstance(x, int) for x in vec):
-        print("[!] --vector must be a JSON list[int]", file=sys.stderr)
-        raise SystemExit(2)
 
-    try:
-        out = subprocess.check_output([sys.executable, str(solver), json.dumps(vec)], text=True)
-    except subprocess.CalledProcessError as e:
-        print("[!] solver crashed", file=sys.stderr)
-        print(e.output, file=sys.stderr)
-        raise SystemExit(1)
-
+    out = subprocess.check_output([sys.executable, str(solver), json.dumps(vec)], text=True)
     try:
         data = json.loads(out)
     except Exception:
@@ -79,11 +86,7 @@ def main() -> None:
 
     puzzle = _load_puzzle_info()
     central_state = list(puzzle["central_state"])
-    generators: Dict[str, List[int]] = puzzle["generators"]
-
-    if len(vec) != len(central_state):
-        print("[!] vector length does not match puzzle central_state length", file=sys.stderr)
-        raise SystemExit(1)
+    generators: Dict[str, List[int]] = {str(k): list(v) for k, v in dict(puzzle["generators"]).items()}
 
     moves_list = _parse_moves(data["moves"])
     if moves_list is None:
@@ -91,15 +94,11 @@ def main() -> None:
         raise SystemExit(0)
 
     state = list(vec)
-    for step, m in enumerate(moves_list, start=1):
+    for m in moves_list:
         if m not in generators:
-            print(f"[!] invalid move token at step {step}: {m}", file=sys.stderr)
+            print(f"[!] invalid move token: {m}", file=sys.stderr)
             raise SystemExit(1)
-        perm = generators[m]
-        if len(perm) != len(state):
-            print(f"[!] generator length mismatch for move {m}", file=sys.stderr)
-            raise SystemExit(1)
-        state = _apply_perm(state, perm)
+        state = _apply_perm(state, generators[m])
 
     if state != central_state:
         print("[!] applying moves does not reach central_state", file=sys.stderr)
@@ -109,7 +108,7 @@ def main() -> None:
         print("[!] sorted_array must equal the state after applying moves", file=sys.stderr)
         raise SystemExit(1)
 
-    print(f"[validate] OK moves={len(moves_list)} len={len(state)}")
+    print(f"[validate] OK moves={len(moves_list)}")
 
 
 if __name__ == "__main__":
