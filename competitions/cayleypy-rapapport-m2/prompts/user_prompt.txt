@@ -1,46 +1,216 @@
-We are solving the CayleyPy RapaportM2 Kaggle competition (1959 mystery):
+We are solving the Kaggle competition "CayleyPy RapaportM2 - solve math mystery from 1959":
 https://www.kaggle.com/competitions/cayleypy-rapapport-m2
 
-TASK
-Write a Python module solve_module.py that implements a *constructive* algorithm to sort a permutation using ONLY the following operations (moves):
+I need a Python module `solve_module.py` that sorts a permutation constructively using ONLY the competition generators.
 
-- I: swap the elements at positions 0 and 1.
-- S: swap (0,1), (2,3), (4,5), ... simultaneously.
-- K: swap (1,2), (3,4), (5,6), ... simultaneously.
+IMPORTANT: use the OFFICIAL competition semantics directly. Do NOT swap token names internally and do NOT use any `TOKEN_RENAME` hack.
 
-INPUT / OUTPUT CONTRACT
-- The function signature must be: solve(vec) -> (moves, sorted_array)
-- vec is a Python list of ints.
-- moves must be a list of strings, each one in {"I","S","K"}.
-- sorted_array must be the final array after applying the moves.
-- When executed as a script: python solve_module.py "[3,0,1,4,2]"
-  it must print JSON: {"moves": [...], "sorted_array": [...]}
+Official generator semantics (competition-aligned)
+- `S`: swap positions `(0, 1)` only.
+- `I`: swap `(0,1), (2,3), (4,5), ...` simultaneously.
+- `K`: swap `(1,2), (3,4), (5,6), ...` simultaneously.
+- Moves are applied left-to-right.
 
-GOAL
-After applying all moves to vec, the array must be sorted in nondecreasing order.
+Required API
+- Implement `solve(vec) -> (moves, sorted_array)`.
+- `vec` is a Python list of ints.
+- `moves` must be a list of strings, each in `{"I", "S", "K"}`.
+- `sorted_array` must be the actual final array obtained after applying `moves` to `vec`.
+- When run as a script:
+  `python solve_module.py "[3,0,1,4,2]"`
+  it must print JSON:
+  `{"moves": [...], "sorted_array": [...]}`
 
-STRICT OPERATIONAL CONSTRAINTS
-- You may NOT call built-in sorting (sorted(), list.sort()) or use slicing tricks to reorder.
-- You may NOT use BFS/DFS/A*/search or shortest-path algorithms.
-- You must produce a polynomial-time constructive algorithm.
-- You may create a COPY of vec to work in-place on it.
+Goal
+- After applying all returned moves to `vec`, the array must be sorted in nondecreasing order.
 
-HINT / CONSTRUCTIVE IDEA (YOU MAY USE THIS)
-Let C = (apply S, then apply K), i.e. the composite permutation "SK" acting on indices.
-C is an n-cycle whose index order is:
-  cycle = [0,2,4,6,..., (largest even), (largest odd), ..., 5,3,1]
-(i.e. evens increasing, then odds decreasing).
+Strict constraints
+- Do NOT use `sorted()` or `list.sort()`.
+- Do NOT use BFS / DFS / A* / shortest-path / brute-force search.
+- The algorithm must be constructive and polynomial-time.
+- You may copy `vec` and work in-place on the copy.
 
-Using conjugation you can swap any adjacent pair in that cycle order:
-  swap(cycle[j-1], cycle[j]) = P * I * P^{-1}
-where P = C^{-j}.
-Because I,S,K are involutions, P^{-1} is simply reverse(P).
-Also C^{-1} can be written as the move pair "K","S".
+Competition context
+- This is a move-minimization competition: the score is the sum of move counts over many test instances, so shorter valid solutions are better than merely correct ones.
+- Therefore, besides correctness, please improve the baseline with practical move-count reductions where possible.
 
-Then you can insertion-sort the array along this cycle order:
-for j=0..n-1:
-  place the correct target value into index cycle[j] using repeated adjacent swaps (cycle[k-1],cycle[k]) for k>j.
-This is O(n^3) moves and is valid.
+Clean constructive description to rely on
+- Under the OFFICIAL naming above, the two-move macro `['I', 'K']` acts as one n-cycle on indices:
+  `cycle = [0, 2, 4, 6, ..., largest_even, largest_odd, ..., 5, 3, 1]`
+- Its inverse is the macro `['K', 'I']`.
+- The generator `S` is the adjacent transposition at the front of that cycle.
+- Therefore, any adjacent swap in cycle order can be implemented by conjugation:
+  `swap(cycle[j-1], cycle[j]) = P + ['S'] + reverse(P)`
+  where `P` is either `(['K','I'] * j)` or `(['I','K'] * (n-j))`, choosing the shorter direction.
+- A valid constructive baseline is to insertion-sort along that cycle order.
 
-REQUIRED
-Return the full python file in one ```python ...``` block.
+What I want from you
+1. Start from the baseline code below.
+2. Improve it into a cleaner and stronger solution.
+3. Keep the official generator semantics throughout; no token remapping.
+4. Remove all forbidden built-ins.
+5. Preserve correctness.
+6. Try to reduce move count and runtime overhead where reasonable.
+
+Practical improvement ideas you should consider
+- Maintain a value->position map instead of repeated `list.index(...)` scans.
+- Use your own constructive target-order routine instead of `sorted()`.
+- Return the final simulated array, not a separately recomputed target.
+- Cancel consecutive equal moves online because `S^2 = I^2 = K^2 = identity`.
+- Avoid redundant macro expansions when possible.
+- Keep the implementation readable and well-factored.
+
+Baseline code to improve
+```python
+import json
+import sys
+from typing import List, Sequence, Tuple
+
+ALLOWED_MOVES = {"I", "S", "K"}
+
+
+def _apply_S(a: List[int]) -> None:
+    """Official Kaggle semantics: swap positions 0 and 1."""
+    if len(a) >= 2:
+        a[0], a[1] = a[1], a[0]
+
+
+def _apply_I(a: List[int]) -> None:
+    """Official Kaggle semantics: swap (0,1), (2,3), (4,5), ..."""
+    n = len(a)
+    i = 0
+    while i + 1 < n:
+        a[i], a[i + 1] = a[i + 1], a[i]
+        i += 2
+
+
+def _apply_K(a: List[int]) -> None:
+    """Official Kaggle semantics: swap (1,2), (3,4), (5,6), ..."""
+    n = len(a)
+    i = 1
+    while i + 1 < n:
+        a[i], a[i + 1] = a[i + 1], a[i]
+        i += 2
+
+
+def _apply_move(a: List[int], m: str) -> None:
+    if m == "S":
+        _apply_S(a)
+    elif m == "I":
+        _apply_I(a)
+    elif m == "K":
+        _apply_K(a)
+    else:
+        raise ValueError(f"Unknown move: {m!r}")
+
+
+def _apply_seq(a: List[int], seq: Sequence[str]) -> None:
+    for m in seq:
+        _apply_move(a, m)
+
+
+def _sorted_copy(vec: Sequence[int]) -> List[int]:
+    """Construct target order without using sorted() or list.sort()."""
+    out = list(vec)
+    for i in range(1, len(out)):
+        x = out[i]
+        j = i - 1
+        while j >= 0 and out[j] > x:
+            out[j + 1] = out[j]
+            j -= 1
+        out[j + 1] = x
+    return out
+
+
+def _cycle_order(n: int) -> List[int]:
+    """
+    For the official move names, the two-move macro ['I', 'K'] acts as one n-cycle:
+    [0, 2, 4, ..., largest even, largest odd, ..., 3, 1].
+    """
+    evens = list(range(0, n, 2))
+    last_odd = n - 1 if (n - 1) % 2 == 1 else n - 2
+    odds_desc = list(range(last_odd, 0, -2))
+    return evens + odds_desc
+
+
+def _swap_adjacent_in_cycle(n: int, j: int) -> List[str]:
+    """
+    Swap cycle[j-1] and cycle[j] via conjugation:
+        P + ['S'] + reverse(P)
+    where P is either (['K','I'] * j) or (['I','K'] * (n-j)), whichever is shorter.
+    """
+    if j <= 0 or j >= n:
+        raise ValueError("j must satisfy 1 <= j < n")
+
+    backward = j
+    forward = n - j
+    seq: List[str] = []
+
+    if backward <= forward:
+        for _ in range(backward):
+            seq.append("K")
+            seq.append("I")
+    else:
+        for _ in range(forward):
+            seq.append("I")
+            seq.append("K")
+
+    return seq + ["S"] + list(reversed(seq))
+
+
+def sort_using_cycle(vec: Sequence[int]) -> Tuple[List[str], List[int]]:
+    n = len(vec)
+    if n <= 1:
+        return [], list(vec)
+
+    a = list(vec)
+    target = _sorted_copy(a)
+    cycle = _cycle_order(n)
+
+    moves: List[str] = []
+    pos_in_cycle = [0] * n
+    for idx, cyc_idx in enumerate(cycle):
+        pos_in_cycle[cyc_idx] = idx
+
+    for j in range(n):
+        dest_idx = cycle[j]
+        desired_val = target[dest_idx]
+        cur_idx = a.index(desired_val)
+        cur_pos = pos_in_cycle[cur_idx]
+
+        while cur_pos > j:
+            seq = _swap_adjacent_in_cycle(n, cur_pos)
+            _apply_seq(a, seq)
+            moves.extend(seq)
+            cur_pos -= 1
+
+    return moves, a
+
+
+def solve(vec: List[int]) -> Tuple[List[str], List[int]]:
+    moves, sorted_array = sort_using_cycle(vec)
+    return moves, sorted_array
+
+
+def _main() -> None:
+    if len(sys.argv) != 2:
+        print(json.dumps({"moves": [], "sorted_array": []}))
+        return
+
+    vec = json.loads(sys.argv[1])
+    if not isinstance(vec, list):
+        print(json.dumps({"moves": [], "sorted_array": []}))
+        return
+
+    moves, sorted_array = solve(vec)
+    print(json.dumps({"moves": moves, "sorted_array": sorted_array}))
+
+
+if __name__ == "__main__":
+    _main()
+```
+
+Output requirements for your answer
+- Return the full improved `solve_module.py` in exactly one ```python ...``` block.
+- Do not include any text outside that code block.
+- The produced code must be self-contained and runnable.
