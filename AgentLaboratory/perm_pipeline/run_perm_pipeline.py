@@ -24,6 +24,7 @@ import json
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -628,18 +629,111 @@ def validate_solver_contract(code: str) -> Tuple[bool, str]:
     return True, ''
 
 
+def _validator_timeout_s() -> float:
+    return max(0.1, _env_float("AGENTLAB_VALIDATOR_TIMEOUT_S", 20.0))
+
+
+def _validator_outer_timeout_s(inner_timeout_s: float) -> float:
+    explicit = _env_float("AGENTLAB_VALIDATOR_OUTER_TIMEOUT_S", 0.0)
+    if explicit > 0:
+        return max(inner_timeout_s, explicit)
+    return max(inner_timeout_s + 5.0, inner_timeout_s * 1.25)
+
+
+def _read_text_tail(path: Path, *, max_chars: int = 4000) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    if max_chars > 0 and len(text) > max_chars:
+        return text[-max_chars:]
+    return text
+
+
+def _terminate_process_tree(proc: subprocess.Popen) -> None:
+    if os.name != "nt":
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=2)
+            return
+        except Exception:
+            pass
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    else:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+            return
+        except Exception:
+            pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
 def run_validator(validator_path: Path, solver_path: Path, vec: List[int]) -> Tuple[int, str, str]:
+    inner_timeout_s = _validator_timeout_s()
+    outer_timeout_s = _validator_outer_timeout_s(inner_timeout_s)
     cmd = [sys.executable, str(validator_path), "--solver", str(solver_path), "--vector", json.dumps(vec)]
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    return p.returncode, p.stdout, p.stderr
+
+    with tempfile.TemporaryDirectory(prefix="agentlab_validator_") as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        stdout_path = tmpdir_path / "validator_stdout.log"
+        stderr_path = tmpdir_path / "validator_stderr.log"
+        env = dict(os.environ)
+        env["AGENTLAB_SOLVER_TIMEOUT_S"] = str(inner_timeout_s)
+
+        with stdout_path.open("w", encoding="utf-8", errors="replace") as stdout_f, stderr_path.open("w", encoding="utf-8", errors="replace") as stderr_f:
+            popen_kwargs = {
+                "stdout": stdout_f,
+                "stderr": stderr_f,
+                "text": True,
+                "env": env,
+            }
+            if os.name != "nt":
+                popen_kwargs["start_new_session"] = True
+            proc = subprocess.Popen(cmd, **popen_kwargs)
+            try:
+                proc.wait(timeout=outer_timeout_s)
+            except subprocess.TimeoutExpired:
+                _terminate_process_tree(proc)
+                out = _read_text_tail(stdout_path)
+                err_tail = _read_text_tail(stderr_path)
+                err_msg = (
+                    f"[timeout] validator exceeded {outer_timeout_s:.1f}s while checking solver "
+                    f"(inner solver timeout {inner_timeout_s:.1f}s).\n{err_tail}"
+                ).strip()
+                return 124, out, err_msg
+
+        out = _read_text_tail(stdout_path)
+        err = _read_text_tail(stderr_path)
+        return proc.returncode, out, err
 
 
 def validate_solver_suite(validator_path: Path, solver_path: Path, tests: Iterable[List[int]]) -> Tuple[bool, str]:
-    for idx, vec in enumerate(tests):
+    tests_list = list(tests)
+    total = len(tests_list)
+    for idx, vec in enumerate(tests_list):
+        log_status(
+            f"[validator] smoke test {idx + 1}/{total} using {solver_path.name} "
+            f"(timeout={_validator_timeout_s():.1f}s)"
+        )
         rc, out, err = run_validator(validator_path, solver_path, vec)
         if rc != 0:
             report = (
                 f"=== TEST {idx} FAILED ===\n"
+                f"RETURN CODE: {rc}\n"
                 f"VECTOR: {vec}\n"
                 f"STDOUT:\n{out}\n"
                 f"STDERR:\n{err}\n"

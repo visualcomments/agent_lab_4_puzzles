@@ -2,6 +2,7 @@ from pathlib import Path
 import json
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -267,3 +268,47 @@ def solve(vec):
     assert 'def solve' in code
     assert 'temporary docstring' not in code
     assert '# inline comment' not in code
+
+
+def test_run_validator_times_out_hanging_solver(monkeypatch, tmp_path):
+    solver_path = tmp_path / 'hang_solver.py'
+    solver_path.write_text(
+        'import time\nimport sys\n'
+        'time.sleep(30)\n',
+        encoding='utf-8',
+    )
+    validator_path = ROOT / 'competitions' / 'cayley-py-megaminx' / 'validate_solve_output.py'
+
+    monkeypatch.setenv('AGENTLAB_VALIDATOR_TIMEOUT_S', '0.2')
+    monkeypatch.setenv('AGENTLAB_VALIDATOR_OUTER_TIMEOUT_S', '1.0')
+
+    start = time.monotonic()
+    rc, out, err = rpp.run_validator(validator_path, solver_path, [0, 1, 2, 3])
+    elapsed = time.monotonic() - start
+
+    assert rc != 0
+    assert elapsed < 3.0
+    assert out.strip() == ''
+    assert 'timed out' in err.lower() or 'timeout' in err.lower()
+
+
+def test_run_validator_outer_timeout_kills_stuck_validator(monkeypatch, tmp_path):
+    solver_path = tmp_path / 'dummy_solver.py'
+    solver_path.write_text('print("{}")\n', encoding='utf-8')
+    validator_path = tmp_path / 'hang_validator.py'
+    validator_path.write_text(
+        'import time\n'
+        'time.sleep(30)\n',
+        encoding='utf-8',
+    )
+
+    monkeypatch.setenv('AGENTLAB_VALIDATOR_TIMEOUT_S', '0.2')
+    monkeypatch.setenv('AGENTLAB_VALIDATOR_OUTER_TIMEOUT_S', '0.5')
+
+    start = time.monotonic()
+    rc, out, err = rpp.run_validator(validator_path, solver_path, [0, 1, 2, 3])
+    elapsed = time.monotonic() - start
+
+    assert rc == 124
+    assert elapsed < 3.0
+    assert '[timeout] validator exceeded' in err

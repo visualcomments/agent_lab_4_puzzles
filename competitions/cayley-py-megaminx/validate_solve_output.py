@@ -23,10 +23,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float((os.environ.get(name, str(default)) or str(default)).strip())
+    except Exception:
+        return default
 
 
 def _load_puzzle_info() -> Dict[str, Any]:
@@ -63,7 +71,27 @@ def main() -> None:
     solver = Path(args.solver)
     vec = json.loads(args.vector)
 
-    out = subprocess.check_output([sys.executable, str(solver), json.dumps(vec)], text=True)
+    solver_timeout_s = _env_float("AGENTLAB_SOLVER_TIMEOUT_S", 15.0)
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(solver), json.dumps(vec)],
+            capture_output=True,
+            text=True,
+            timeout=solver_timeout_s if solver_timeout_s > 0 else None,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"[!] solver timed out after {solver_timeout_s:.1f}s", file=sys.stderr)
+        raise SystemExit(124)
+
+    if completed.returncode != 0:
+        print(f"[!] solver process failed with exit code {completed.returncode}", file=sys.stderr)
+        if completed.stdout:
+            print(completed.stdout, file=sys.stderr)
+        if completed.stderr:
+            print(completed.stderr, file=sys.stderr)
+        raise SystemExit(completed.returncode or 1)
+
+    out = completed.stdout
     try:
         data = json.loads(out)
     except Exception:
