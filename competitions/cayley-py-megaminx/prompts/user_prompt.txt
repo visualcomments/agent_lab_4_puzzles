@@ -1,48 +1,111 @@
-We are solving the Kaggle competition "CayleyPy Megaminx Solve Optimally".
-Reference: https://www.kaggle.com/competitions/cayley-py-megaminx
+We are solving the Kaggle competition "CayleyPy Megaminx Solve Optimally":
+https://www.kaggle.com/competitions/cayley-py-megaminx
 
-PROBLEM SUMMARY
+I need a Python module `solve_module.py` that improves an existing Megaminx solver baseline while using ONLY the official competition generators and the official competition data semantics.
+
+IMPORTANT: use the OFFICIAL competition semantics directly from `puzzle_info.json`. Do NOT rename moves internally, do NOT introduce any token-remapping layer, and do NOT invent move names.
+
+Official competition facts and semantics
 - State: a permutation vector of length 120.
-- Goal: transform the given state into the central solved state from competitions/cayley-py-megaminx/data/puzzle_info.json.
-- Legal moves are the generator names from puzzle_info.json.
-- Official move notation used by the competition: U, D, F, B, L, DR, BL, FR, BR, FL, R, DL and their inverses.
-- Kaggle submissions use dot-separated move names in the path column.
+- Goal: transform the given state into the central solved state from `puzzle_info.json`.
+- In the bundled competition data, the central state is the sorted vector `0,1,2,...,119`, but your code should LOAD it from `puzzle_info.json` rather than hardcoding assumptions.
+- Legal move names are exactly the keys from `puzzle_info.json`.
+- In the bundled Megaminx data, the official generator names are:
+  `U, -U, D, -D, F, -F, B, -B, L, -L, DR, -DR, BL, -BL, FR, -FR, BR, -BR, FL, -FL, R, -R, DL, -DL`
+- Moves are applied left-to-right.
+- Kaggle submissions use dot-separated move names in the `path` column.
+- Do NOT assume moves are self-inverse; inverse moves are explicit generator names.
 
-INPUT / OUTPUT CONTRACT
-- Implement solve(vec) -> (moves, sorted_array)
-- vec is a Python list[int]
-- moves must be either:
-  - list[str] with legal generator names, or
-  - the string "UNSOLVED"
-- sorted_array must be the final state after applying moves
-- Script mode must print JSON: {"moves": ..., "sorted_array": ...}
+Required API
+- Implement `solve(vec) -> (moves, sorted_array)`.
+- `vec` is a Python list of ints.
+- `moves` must be either:
+  - a list of legal generator names from `puzzle_info.json`, or
+  - the string `"UNSOLVED"` only if your bounded constructive fallback genuinely gets stuck.
+- `sorted_array` must be the ACTUAL final state produced by applying `moves` to `vec`.
+- When run as a script:
+  `python solve_module.py "[3,0,1,...]"`
+  it must print JSON:
+  `{"moves": ..., "sorted_array": ...}`
 
-ALGORITHM REQUIREMENTS
-- The code must run in polynomial time.
-- Do NOT use BFS, DFS, A*, IDA*, beam search over growing depth, or whole-state-space enumeration.
-- Constant-depth lookahead over the fixed generator set (depth 1 or 2) is allowed, because that remains polynomial.
-- Do NOT invent move names; use only keys from puzzle_info.json.
+Goal
+- After applying all returned moves to `vec`, the final state must equal `central_state` exactly.
+- If an exact bundled solution is available from the competition files, prefer returning that valid path rather than a weaker heuristic path.
+- `sorted_array` must always match the emitted moves exactly; do not return a separately recomputed target.
 
-RECOMMENDED IMPLEMENTATION ORDER
-1. DATA-AWARE EXACT BASELINE
-   If competitions/cayley-py-megaminx/data/test.csv and sample_submission.csv exist, build a dictionary:
-       initial_state string -> known valid path
-   Return that exact path for exact matches. This is deterministic, valid for the bundled dataset, and polynomial-time.
-2. GENERIC FALLBACK FOR UNSEEN STATES
-   - Load central_state and generators from puzzle_info.json.
-   - Implement apply_perm(state, perm) and apply_moves(state, moves).
-   - Score a state with a polynomial-time objective such as:
-       (a) number of positions already equal to central_state (maximize),
-       (b) longest correct prefix (maximize),
-       (c) total mismatches (minimize).
-   - Evaluate every legal 1-move candidate, and optionally every legal 2-move macro.
-   - Repeatedly choose the move or macro that improves the score the most.
-   - Stop when central_state is reached.
-   - If no progress is possible after a bounded number of polynomial steps, return "UNSOLVED".
+Strict constraints
+- Do NOT use BFS / DFS / A* / IDA* / shortest-path / brute-force search.
+- Do NOT use beam search with growing depth or any whole-state-space enumeration.
+- Constant-depth lookahead over the fixed move set (depth 1 or 2) is allowed, because that remains polynomial-time.
+- The algorithm must remain constructive and polynomial-time.
+- Use only the Python standard library.
+- You may copy `vec` and work in-place on the copy.
+- Do NOT invent any generator names not present in `puzzle_info.json`.
+- Keep the official competition naming throughout.
 
-IMPLEMENTATION DETAILS
-- Keep the code self-contained; use only the standard library.
-- It is fine to work on a copy of vec.
-- Always verify that sorted_array equals the state produced by the emitted moves.
-- Return exactly one complete Python file inside one ```python``` block.
-- Do not add explanations outside the code block.
+Competition context
+- This is a move-minimization competition: the score is the sum of move counts over the test states, so shorter valid solutions are better than merely correct ones.
+- The competition bundle contains `test.csv`, `sample_submission.csv`, and `puzzle_info.json`.
+- `sample_submission.csv` provides valid but highly non-optimal paths for the bundled test set; this is a strong deterministic baseline for exact bundled states and should be exploited.
+- The bundled test set has 1001 states; the first is the special “superflip” sample and the rest are generated by random scramble sequences of increasing length.
+
+Clean data-aware constructive baseline to rely on
+- A safe baseline is:
+  1. If the bundled competition files exist, load `test.csv` and `sample_submission.csv` and build an exact lookup
+     `initial_state -> known valid path`
+     by joining through `initial_state_id`.
+  2. For an exact match, return that path immediately after parsing and validating it.
+  3. Otherwise, load `central_state` and `generators` from `puzzle_info.json`.
+  4. Implement `apply_perm(state, perm)` and `apply_moves(state, moves)` using the official permutations.
+  5. Use a bounded polynomial-time fallback that evaluates every legal 1-move candidate and optionally every legal 2-move macro, scores the resulting states, and repeatedly chooses the best improvement.
+  6. Stop when `central_state` is reached.
+  7. If no progress is possible after a bounded number of polynomial steps, return `"UNSOLVED"`.
+
+What I want from you
+1. Start from the existing baseline code below (or the attached baseline `solve_module.py` if it is provided in the conversation).
+2. Improve that baseline into a cleaner, stronger, and more data-aware solution.
+3. Keep the official Megaminx generator semantics throughout; no token remapping and no fake aliases.
+4. Preserve correctness and the required script interface.
+5. Reduce move count and runtime overhead where reasonably possible.
+6. Keep the implementation self-contained, readable, and well-factored.
+
+Practical improvement ideas you should consider
+- Build the exact bundled lookup correctly by joining `test.csv` and `sample_submission.csv` on `initial_state_id`, instead of relying on fragile assumptions.
+- Cache data loading so `puzzle_info.json`, test states, parsed paths, and generator permutations are not repeatedly re-read.
+- Maintain the current state incrementally rather than reparsing or recomputing unnecessarily.
+- Precompute legal 1-move candidates and 2-move macros once.
+- Use a deterministic scoring function for fallback, for example combining:
+  - number of positions already equal to `central_state` (maximize),
+  - total mismatches (minimize),
+  - longest correct prefix (maximize),
+  - optional stable tie-breakers for deterministic output.
+- Verify the final state by actually simulating the emitted move list.
+- Return the final simulated array, not a guessed or separately reconstructed target.
+- Simplify the emitted move stream online where valid:
+  - cancel `m` followed by `inverse(m)`,
+  - cancel `inverse(m)` followed by `m`,
+  - compress repeated turns of the same face modulo 5 when it reduces length,
+  - avoid obvious immediate undo patterns.
+- Since Megaminx face turns have order 5, use that algebra carefully when shortening paths:
+  - `x^5 = identity`,
+  - `x^4 = x^{-1}`,
+  - `x^3 = x^{-2}`,
+  where `x` is a face move and `x^{-1}` is the official inverse token from `puzzle_info.json`.
+- Keep the path simplifier competition-safe: it must preserve the exact resulting state.
+- Prefer exact bundled solutions over heuristic fallback whenever available.
+- Keep the implementation readable and well-factored rather than turning it into a monolith.
+
+Baseline code to improve
+- Use the existing Megaminx baseline code supplied below.
+- If the baseline code is attached in the conversation instead of pasted here, improve that attached baseline.
+- If no baseline is available, implement the strongest version you can under the rules above, but still structure it as a clean baseline-improvement style solution.
+
+```python
+# Paste the current baseline solve_module.py here.
+# The task is to IMPROVE this baseline, not ignore it.
+```
+
+Output requirements for your answer
+- Return the full improved `solve_module.py` in exactly one ```python ...``` block.
+- Do not include any text outside that code block.
+- The produced code must be self-contained and runnable.
