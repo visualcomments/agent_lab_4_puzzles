@@ -1222,8 +1222,30 @@ def _validate_solver(solver_path: Path, validator_path: Path, smoke_vector: Sequ
 
 def _ensure_llm_puzzles_on_path() -> None:
     lp_dir = ROOT / "llm-puzzles"
-    if str(lp_dir) not in sys.path:
-        sys.path.insert(0, str(lp_dir))
+    lp_dir_str = str(lp_dir)
+    if lp_dir_str not in sys.path:
+        sys.path.insert(0, lp_dir_str)
+
+    # Guard against accidentally importing an unrelated third-party/site-package
+    # named ``src``. The llm-puzzles adapters are expected to resolve from
+    # <repo>/llm-puzzles/src, but without an __init__.py that package can be
+    # shadowed by another regular package on sys.path. If a foreign ``src`` has
+    # already been imported, clear it so the next import resolves to the local
+    # llm-puzzles package we just prepended.
+    src_mod = sys.modules.get("src")
+    if src_mod is None:
+        return
+
+    src_file = getattr(src_mod, "__file__", None)
+    src_paths = [str(p) for p in getattr(src_mod, "__path__", [])]
+    if src_file and src_file.startswith(lp_dir_str):
+        return
+    if any(path.startswith(lp_dir_str) for path in src_paths):
+        return
+
+    for name in list(sys.modules):
+        if name == "src" or name.startswith("src."):
+            sys.modules.pop(name, None)
 
 
 def _legacy_kaggle_cli_submit_cmd(competition: str, submission_csv: Path, message: str) -> list[str]:
