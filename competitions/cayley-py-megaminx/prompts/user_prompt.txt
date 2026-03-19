@@ -26,47 +26,342 @@ COMPETITION CONTEXT YOU MUST USE
 IMPORTANT SOLVER DESIGN RULES
 - Preserve the current exact-match bundled lookup behavior. If the input vector matches a bundled test state, return a valid path for that exact state.
 - The baseline already has an optimized bundled lookup pipeline. Do not throw that away.
+- Improve the baseline in ways that reduce move count and/or runtime overhead while keeping correctness.
 - Prefer deterministic polynomial-time optimizations over generic exponential search.
 - Small fixed-radius exact optimization is allowed, because the radius is constant and does not grow with input size.
 - Whole-state-space search, IDA*, A*, BFS, DFS, beam search over growing depth, or brute force over full states are forbidden.
 
+WHAT TO IMPROVE
+You should look for safe, high-leverage improvements such as:
+- stronger cancellation of inverse pairs and repeated face powers using the correct face order;
+- better canonicalization of commuting moves using the actual generator commutation structure derived from `puzzle_info.json`;
+- stronger short-word exact replacement tables for local path fragments;
+- better local dynamic programming / window optimization for dot-separated move sequences;
+- multi-pass normalization until convergence when it is still polynomial and practical;
+- caching of permutations and short words to keep runtime low;
+- preserving exact bundled-data validity while improving path compression quality.
 
 VERY IMPORTANT
 - Do NOT replace the current approach with a generic heuristic that can return invalid or unsolved outputs for bundled states.
 - Do NOT return `UNSOLVED` for bundled competition rows if the baseline can solve them.
 - Prefer exact bundled lookup first, then safe deterministic fallback only if necessary.
 - Keep the implementation self-contained and standard-library only.
-here is `puzzle_info.json`:
-{
-  "central_state": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119],
-  "generators": {
-    "U": [3, 4, 5, 18, 19, 20, 0, 1, 2, 9, 10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 23, 6, 7, 8, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 62, 63, 74, 75, 64, 65, 66, 67, 68, 69, 70, 71, 76, 77, 72, 73, 60, 61, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119],
-    "-U": [6, 7, 8, 0, 1, 2, 21, 22, 23, 9, 10, 11, 12, 13, 14, 15, 16, 17, 3, 4, 5, 18, 19, 20, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 76, 77, 60, 61, 64, 65, 66, 67, 68, 69, 70, 71, 74, 75, 62, 63, 72, 73, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119],
-    "D": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 54, 55, 56, 36, 37, 38, 42, 43, 44, 45, 46, 47, 48, 49, 50, 39, 40, 41, 57, 58, 59, 51, 52, 53, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 114, 115, 92, 93, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 94, 95, 112, 113, 116, 117, 110, 111, 118, 119],
-    "-D": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 39, 40, 41, 51, 52, 53, 42, 43, 44, 45, 46, 47, 48, 49, 50, 57, 58, 59, 36, 37, 38, 54, 55, 56, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 94, 95, 110, 111, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 116, 117, 112, 113, 92, 93, 114, 115, 118, 119],
-    "F": [8, 6, 7, 3, 4, 5, 31, 32, 30, 1, 2, 0, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 34, 35, 33, 10, 11, 9, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 65, 64, 62, 63, 87, 86, 78, 79, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 61, 60, 80, 81, 82, 83, 84, 85, 67, 66, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119],
-    "-F": [11, 9, 10, 3, 4, 5, 1, 2, 0, 35, 33, 34, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 8, 6, 7, 32, 30, 31, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 79, 78, 62, 63, 61, 60, 87, 86, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 66, 67, 80, 81, 82, 83, 84, 85, 65, 64, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119],
-    "B": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 40, 41, 39, 25, 26, 24, 30, 31, 32, 33, 34, 35, 36, 37, 38, 53, 51, 52, 42, 43, 44, 28, 29, 27, 48, 49, 50, 46, 47, 45, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 111, 110, 96, 97, 100, 101, 102, 103, 104, 105, 99, 98, 108, 109, 113, 112, 107, 106, 114, 115, 116, 117, 118, 119],
-    "-B": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 29, 27, 28, 47, 45, 46, 30, 31, 32, 33, 34, 35, 36, 37, 38, 26, 24, 25, 42, 43, 44, 53, 51, 52, 48, 49, 50, 40, 41, 39, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 98, 99, 107, 106, 100, 101, 102, 103, 104, 105, 113, 112, 108, 109, 97, 96, 111, 110, 114, 115, 116, 117, 118, 119],
-    "L": [10, 11, 9, 2, 0, 1, 6, 7, 8, 13, 14, 12, 16, 17, 15, 4, 5, 3, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 78, 79, 64, 65, 66, 67, 80, 81, 62, 63, 72, 73, 74, 75, 76, 77, 68, 69, 70, 71, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119],
-    "-L": [4, 5, 3, 17, 15, 16, 6, 7, 8, 2, 0, 1, 11, 9, 10, 14, 12, 13, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 70, 71, 64, 65, 66, 67, 78, 79, 80, 81, 72, 73, 74, 75, 76, 77, 62, 63, 68, 69, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119],
-    "DR": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 46, 47, 45, 52, 53, 51, 43, 44, 42, 59, 57, 58, 54, 55, 56, 49, 50, 48, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 102, 103, 112, 113, 104, 105, 106, 107, 108, 109, 110, 111, 116, 117, 114, 115, 118, 119, 100, 101],
-    "-DR": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 50, 48, 49, 44, 42, 43, 59, 57, 58, 47, 45, 46, 54, 55, 56, 52, 53, 51, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 118, 119, 100, 101, 104, 105, 106, 107, 108, 109, 110, 111, 102, 103, 114, 115, 112, 113, 116, 117],
-    "BL": [0, 1, 2, 16, 17, 15, 6, 7, 8, 9, 10, 11, 12, 13, 14, 25, 26, 24, 5, 3, 4, 21, 22, 23, 28, 29, 27, 19, 20, 18, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 83, 82, 72, 73, 71, 70, 76, 77, 78, 79, 80, 81, 99, 98, 74, 75, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 85, 84, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119],
-    "-BL": [0, 1, 2, 19, 20, 18, 6, 7, 8, 9, 10, 11, 12, 13, 14, 5, 3, 4, 29, 27, 28, 21, 22, 23, 17, 15, 16, 26, 24, 25, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 75, 74, 72, 73, 84, 85, 76, 77, 78, 79, 80, 81, 71, 70, 99, 98, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 83, 82, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119],
-    "FR": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 49, 50, 48, 31, 32, 30, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 58, 59, 57, 51, 52, 53, 34, 35, 33, 56, 54, 55, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 108, 109, 87, 86, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 119, 118, 110, 111, 112, 113, 89, 88, 116, 117, 115, 114],
-    "-FR": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 35, 33, 34, 56, 54, 55, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 32, 30, 31, 51, 52, 53, 58, 59, 57, 50, 48, 49, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 89, 88, 115, 114, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 86, 87, 110, 111, 112, 113, 119, 118, 116, 117, 109, 108],
-    "BR": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 28, 29, 27, 20, 18, 19, 24, 25, 26, 46, 47, 45, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 22, 23, 21, 43, 44, 42, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 85, 84, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 107, 106, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 105, 104, 73, 72, 102, 103, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119],
-    "-BR": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 22, 23, 21, 44, 42, 43, 24, 25, 26, 20, 18, 19, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 47, 45, 46, 29, 27, 28, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 105, 104, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 73, 72, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 106, 107, 103, 102, 85, 84, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119],
-    "FL": [0, 1, 2, 3, 4, 5, 6, 7, 8, 34, 35, 33, 10, 11, 9, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 55, 56, 54, 13, 14, 12, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 38, 36, 37, 57, 58, 59, 60, 61, 62, 63, 64, 65, 89, 88, 67, 66, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 92, 93, 69, 68, 91, 90, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119],
-    "-FL": [0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 12, 13, 38, 36, 37, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 11, 9, 10, 55, 56, 54, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 35, 33, 34, 57, 58, 59, 60, 61, 62, 63, 64, 65, 69, 68, 91, 90, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 67, 66, 93, 92, 88, 89, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119],
-    "R": [0, 1, 2, 3, 4, 5, 23, 21, 22, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 43, 44, 42, 24, 25, 26, 27, 28, 29, 7, 8, 6, 33, 34, 35, 36, 37, 38, 39, 40, 41, 49, 50, 48, 45, 46, 47, 31, 32, 30, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 76, 77, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 104, 105, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 108, 109, 102, 103, 100, 101, 106, 107, 64, 65, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119],
-    "-R": [0, 1, 2, 3, 4, 5, 32, 30, 31, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 7, 8, 6, 24, 25, 26, 27, 28, 29, 50, 48, 49, 33, 34, 35, 36, 37, 38, 39, 40, 41, 23, 21, 22, 45, 46, 47, 44, 42, 43, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 108, 109, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 64, 65, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 104, 105, 102, 103, 76, 77, 106, 107, 100, 101, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119],
-    "DL": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 37, 38, 36, 13, 14, 12, 18, 19, 20, 21, 22, 23, 16, 17, 15, 27, 28, 29, 30, 31, 32, 33, 34, 35, 41, 39, 40, 25, 26, 24, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 90, 91, 80, 81, 84, 85, 86, 87, 88, 89, 94, 95, 92, 93, 96, 97, 82, 83, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119],
-    "-DL": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 17, 15, 16, 26, 24, 25, 18, 19, 20, 21, 22, 23, 41, 39, 40, 27, 28, 29, 30, 31, 32, 33, 34, 35, 14, 12, 13, 37, 38, 36, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 82, 83, 96, 97, 84, 85, 86, 87, 88, 89, 80, 81, 92, 93, 90, 91, 94, 95, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119]
-  }
-}
 
+BASELINE CODE TO IMPROVE
+```python
+from __future__ import annotations
+
+import csv
+import json
+import sys
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple, Union
+
+MoveOut = Union[List[str], str]
+_HERE = Path(__file__).resolve().parent
+_CACHE: tuple[list[int], Dict[str, List[int]], Dict[str, str]] | None = None
+_SHORT_WORD_CACHE: tuple[dict[str, set[str]], dict[str, int], dict[bytes, tuple[str, ...]]] | None = None
+
+
+def _candidate_data_dirs() -> list[Path]:
+    candidates = [
+        _HERE / 'data',
+        _HERE.parent / 'competitions' / 'cayley-py-megaminx' / 'data',
+        _HERE.parent.parent / 'competitions' / 'cayley-py-megaminx' / 'data',
+    ]
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        out.append(resolved)
+    return out
+
+
+def _candidate_comp_dirs() -> list[Path]:
+    candidates = [
+        _HERE,
+        _HERE.parent / 'competitions' / 'cayley-py-megaminx',
+        _HERE.parent.parent / 'competitions' / 'cayley-py-megaminx',
+    ]
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        out.append(resolved)
+    return out
+
+
+def _find_data_dir() -> Path:
+    for data_dir in _candidate_data_dirs():
+        if (data_dir / 'puzzle_info.json').exists():
+            return data_dir
+    searched = '\n'.join(str(p) for p in _candidate_data_dirs())
+    raise FileNotFoundError(f'Could not locate cayley-py-megaminx data directory. Searched:\n{searched}')
+
+
+def _find_comp_dir() -> Path:
+    for comp_dir in _candidate_comp_dirs():
+        if (comp_dir / 'solve_module.py').exists() or (comp_dir / 'data' / 'puzzle_info.json').exists():
+            return comp_dir
+    searched = '\n'.join(str(p) for p in _candidate_comp_dirs())
+    raise FileNotFoundError(f'Could not locate cayley-py-megaminx competition directory. Searched:\n{searched}')
+
+
+def _load_submission_lookup(test_csv: Path, submission_csv: Path) -> Dict[str, str]:
+    lookup: Dict[str, str] = {}
+    with test_csv.open(newline='', encoding='utf-8') as tf, submission_csv.open(newline='', encoding='utf-8') as sf:
+        test_rows = list(csv.DictReader(tf))
+        submission_rows = list(csv.DictReader(sf))
+    limit = min(len(test_rows), len(submission_rows))
+    for idx in range(limit):
+        state_key = (test_rows[idx].get('initial_state') or '').strip()
+        path = (submission_rows[idx].get('path') or '').strip()
+        if state_key:
+            lookup[state_key] = path
+    return lookup
+
+
+def _parse_face(move: str) -> tuple[str, int]:
+    return (move[1:], -1) if move.startswith('-') else (move, 1)
+
+
+def _emit_face(face: str, exp: int) -> list[tuple[str, int]]:
+    value = exp % 5
+    if value == 0:
+        return []
+    if value == 1:
+        return [(face, 1)]
+    if value == 2:
+        return [(face, 2)]
+    if value == 3:
+        return [(face, -2)]
+    if value == 4:
+        return [(face, -1)]
+    raise ValueError(exp)
+
+
+def _emit_tokens(block: tuple[str, int]) -> list[str]:
+    face, exp = block
+    return [face] * exp if exp > 0 else ['-' + face] * (-exp)
+
+
+def _compose_perm(a: Sequence[int], b: Sequence[int]) -> list[int]:
+    return [a[j] for j in b]
+
+
+def _compose_perm_bytes(a: bytes, b: bytes) -> bytes:
+    return bytes(a[j] for j in b)
+
+
+def _short_word_data(generators: Dict[str, List[int]]) -> tuple[dict[str, set[str]], dict[str, int], dict[bytes, tuple[str, ...]]]:
+    global _SHORT_WORD_CACHE
+    if _SHORT_WORD_CACHE is not None:
+        return _SHORT_WORD_CACHE
+
+    faces = [name for name in generators if not name.startswith('-')]
+    commute: dict[str, set[str]] = {face: {face} for face in faces}
+    for a in faces:
+        for b in faces:
+            if _compose_perm(generators[a], generators[b]) == _compose_perm(generators[b], generators[a]):
+                commute[a].add(b)
+    order = {face: idx for idx, face in enumerate(sorted(faces))}
+
+    perms_bytes = {name: bytes(perm) for name, perm in generators.items()}
+    identity = bytes(range(len(next(iter(generators.values())))))
+    inverse = {name: (name[1:] if name.startswith('-') else '-' + name) for name in generators}
+
+    table: dict[bytes, tuple[str, ...]] = {identity: ()}
+    frontier: list[tuple[bytes, str | None]] = [(identity, None)]
+    for _depth in range(1, 5):
+        new_frontier: list[tuple[bytes, str | None]] = []
+        for state, last in frontier:
+            base = table[state]
+            for move in generators:
+                if last is not None and move == inverse[last]:
+                    continue
+                nxt = _compose_perm_bytes(state, perms_bytes[move])
+                if nxt in table:
+                    continue
+                table[nxt] = base + (move,)
+                new_frontier.append((nxt, move))
+        frontier = new_frontier
+
+    _SHORT_WORD_CACHE = (commute, order, table)
+    return _SHORT_WORD_CACHE
+
+
+def _reduce_commuting_word(moves: Sequence[str], generators: Dict[str, List[int]]) -> list[str]:
+    commute, order, _table = _short_word_data(generators)
+    blocks = [_parse_face(move) for move in moves]
+    changed = True
+    while changed:
+        changed = False
+        merged: list[tuple[str, int]] = []
+        i = 0
+        while i < len(blocks):
+            face, exp = blocks[i]
+            j = i + 1
+            while j < len(blocks) and blocks[j][0] == face:
+                exp += blocks[j][1]
+                j += 1
+            norm = _emit_face(face, exp)
+            if norm != blocks[i:j]:
+                changed = True
+            merged.extend(norm)
+            i = j
+        blocks = merged
+        i = 0
+        while i + 1 < len(blocks):
+            left, right = blocks[i], blocks[i + 1]
+            if right[0] in commute[left[0]] and order[left[0]] > order[right[0]]:
+                blocks[i], blocks[i + 1] = right, left
+                changed = True
+                if i:
+                    i -= 1
+            else:
+                i += 1
+
+    out: list[str] = []
+    for block in blocks:
+        out.extend(_emit_tokens(block))
+    return out
+
+
+def _optimize_local_windows(moves: Sequence[str], generators: Dict[str, List[int]], max_window: int = 10) -> list[str]:
+    if not moves:
+        return []
+    _commute, _order, table = _short_word_data(generators)
+    perms_bytes = {name: bytes(perm) for name, perm in generators.items()}
+    identity = bytes(range(len(next(iter(generators.values())))))
+
+    n = len(moves)
+    dp = [10 ** 9] * (n + 1)
+    nxt = [0] * (n + 1)
+    word: list[tuple[str, ...] | None] = [None] * (n + 1)
+    dp[n] = 0
+
+    for i in range(n - 1, -1, -1):
+        dp[i] = 1 + dp[i + 1]
+        nxt[i] = i + 1
+        word[i] = (moves[i],)
+        effect = identity
+        for j in range(i + 1, min(n, i + max_window) + 1):
+            effect = _compose_perm_bytes(effect, perms_bytes[moves[j - 1]])
+            best = table.get(effect)
+            if best is not None and len(best) + dp[j] < dp[i]:
+                dp[i] = len(best) + dp[j]
+                nxt[i] = j
+                word[i] = best
+
+    out: list[str] = []
+    i = 0
+    while i < n:
+        chunk = word[i]
+        if chunk is None:
+            break
+        out.extend(chunk)
+        i = nxt[i]
+    return out
+
+
+def _build_optimized_lookup(test_csv: Path, sample_csv: Path, generators: Dict[str, List[int]]) -> Dict[str, str]:
+    lookup: Dict[str, str] = {}
+    with test_csv.open(newline='', encoding='utf-8') as tf, sample_csv.open(newline='', encoding='utf-8') as sf:
+        test_rows = list(csv.DictReader(tf))
+        sample_rows = list(csv.DictReader(sf))
+    limit = min(len(test_rows), len(sample_rows))
+    for idx in range(limit):
+        state_key = (test_rows[idx].get('initial_state') or '').strip()
+        path = (sample_rows[idx].get('path') or '').strip()
+        if not state_key:
+            continue
+        moves = [] if not path else path.split('.')
+        optimized = _reduce_commuting_word(moves, generators)
+        optimized = _optimize_local_windows(optimized, generators, max_window=10)
+        optimized = _reduce_commuting_word(optimized, generators)
+        lookup[state_key] = '.'.join(optimized)
+    return lookup
+
+
+def _load_bundle() -> tuple[list[int], Dict[str, List[int]], Dict[str, str]]:
+    global _CACHE
+    if _CACHE is not None:
+        return _CACHE
+
+    data_dir = _find_data_dir()
+    comp_dir = _find_comp_dir()
+    puzzle = json.loads((data_dir / 'puzzle_info.json').read_text(encoding='utf-8'))
+    central = list(puzzle['central_state'])
+    generators = {str(k): list(v) for k, v in dict(puzzle['generators']).items()}
+
+    optimized_lookup_json = data_dir / 'optimized_lookup.json'
+    lookup: Dict[str, str] = {}
+    if optimized_lookup_json.exists():
+        payload = json.loads(optimized_lookup_json.read_text(encoding='utf-8'))
+        raw_lookup = payload.get('lookup') if isinstance(payload, dict) else None
+        if isinstance(raw_lookup, dict):
+            lookup = {str(k): str(v) for k, v in raw_lookup.items()}
+
+    test_csv = data_dir / 'test.csv'
+    optimized_submission = comp_dir / 'submissions' / 'optimized_submission.csv'
+    sample_csv = data_dir / 'sample_submission.csv'
+
+    if not lookup and test_csv.exists() and optimized_submission.exists():
+        lookup = _load_submission_lookup(test_csv, optimized_submission)
+    if not lookup and test_csv.exists() and sample_csv.exists():
+        lookup = _build_optimized_lookup(test_csv, sample_csv, generators)
+
+    _CACHE = (central, generators, lookup)
+    return _CACHE
+
+
+def _apply_perm(state: List[int], perm: List[int]) -> List[int]:
+    return [state[j] for j in perm]
+
+
+def _apply_moves(vec: Sequence[int], moves: Sequence[str], generators: Dict[str, List[int]]) -> List[int]:
+    state = list(vec)
+    for move in moves:
+        perm = generators.get(move)
+        if perm is None:
+            raise KeyError(move)
+        state = _apply_perm(state, perm)
+    return state
+
+
+def solve(vec: Sequence[int]) -> Tuple[MoveOut, List[int]]:
+    central, generators, lookup = _load_bundle()
+    state = list(vec)
+    if state == central:
+        return [], list(state)
+    state_key = ','.join(str(int(x)) for x in state)
+    path = lookup.get(state_key)
+    if path is not None:
+        moves = [] if not path else path.split('.')
+        return moves, _apply_moves(state, moves, generators)
+    return 'UNSOLVED', list(state)
+
+
+def _main() -> None:
+    if len(sys.argv) < 2:
+        print('Usage: python solve_module.py "[...]"', file=sys.stderr)
+        raise SystemExit(2)
+    vec = json.loads(sys.argv[1])
+    if not isinstance(vec, list):
+        raise SystemExit('Input must be a JSON list')
+    moves, out_vec = solve(vec)
+    print(json.dumps({'moves': moves, 'sorted_array': out_vec}))
+
+
+if __name__ == '__main__':
+    _main()
+```
 
 Output requirements for your answer
 - Return the full improved `solve_module.py` in exactly one ```python ...``` block.
