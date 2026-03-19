@@ -1,108 +1,418 @@
 We are solving the Kaggle competition "CayleyPy Megaminx Solve Optimally":
 https://www.kaggle.com/competitions/cayley-py-megaminx
 
-I need a Python module `solve_module.py` that improves an existing Megaminx solver baseline while using ONLY the official competition generators and the official competition data semantics.
+I need a Python module `solve_module.py` that takes an already working Megaminx baseline and improves it aggressively for lower Kaggle score while keeping full correctness on the official bundled dataset.
 
-IMPORTANT: use the OFFICIAL competition semantics directly from `puzzle_info.json`. Do NOT rename moves internally, do NOT introduce any token-remapping layer, and do NOT invent move names.
+ABSOLUTE REQUIREMENTS
+- Start from the exact baseline code below.
+- Preserve the public API `solve(vec) -> (moves, sorted_array)`.
+- `vec` is a Python list[int].
+- `moves` must be a list[str] of legal move names from `puzzle_info.json`.
+- `sorted_array` must be the actual final array obtained by applying `moves` to `vec`.
+- Script mode must print JSON: `{"moves": [...], "sorted_array": [...]}`.
+- Use ONLY official competition move names from `puzzle_info.json`.
+- Do NOT rename move tokens internally.
+- Do NOT invent extra generators, macros, placeholder tokens, or hidden aliases.
+- Move application semantics are the official competition semantics: left-to-right permutation reindexing.
 
-Official competition facts and semantics
-- State: a permutation vector of length 120.
-- Goal: transform the given state into the central solved state from `puzzle_info.json`.
-- In the bundled competition data, the central state is the sorted vector `0,1,2,...,119`, but your code should LOAD it from `puzzle_info.json` rather than hardcoding assumptions.
-- Legal move names are exactly the keys from `puzzle_info.json`.
-- In the bundled Megaminx data, the official generator names are:
-  `U, -U, D, -D, F, -F, B, -B, L, -L, DR, -DR, BL, -BL, FR, -FR, BR, -BR, FL, -FL, R, -R, DL, -DL`
-- Moves are applied left-to-right.
-- Kaggle submissions use dot-separated move names in the `path` column.
-- Do NOT assume moves are self-inverse; inverse moves are explicit generator names.
+COMPETITION FACTS YOU MUST USE
+- The state is a permutation vector of length 120.
+- The solved state is `central_state` from `puzzle_info.json`.
+- The allowed face turns are exactly the Megaminx generators from `puzzle_info.json` and their inverses.
+- Submission rows are dot-separated move names.
+- The test bundle has 1001 valid initial states.
+- The metric is the SUM of solution lengths over all rows, so shorter valid paths are strictly better.
+- `sample_submission.csv` contains valid but highly non-optimal solution paths, which means path compression / exact path rewriting is a legitimate baseline-improvement strategy.
 
-Required API
-- Implement `solve(vec) -> (moves, sorted_array)`.
-- `vec` is a Python list of ints.
-- `moves` must be either:
-  - a list of legal generator names from `puzzle_info.json`, or
-  - the string `"UNSOLVED"` only if your bounded constructive fallback genuinely gets stuck.
-- `sorted_array` must be the ACTUAL final state produced by applying `moves` to `vec`.
-- When run as a script:
-  `python solve_module.py "[3,0,1,...]"`
-  it must print JSON:
-  `{"moves": ..., "sorted_array": ...}`
+KEY STRATEGIC DIRECTION
+The current baseline is already doing the right high-level thing:
+1. load the official bundle;
+2. prefer exact bundled state -> path lookup;
+3. optimize those known valid paths instead of trying to solve Megaminx from scratch for every row;
+4. replay the optimized path to produce the final state.
 
-Goal
-- After applying all returned moves to `vec`, the final state must equal `central_state` exactly.
-- If an exact bundled solution is available from the competition files, prefer returning that valid path rather than a weaker heuristic path.
-- `sorted_array` must always match the emitted moves exactly; do not return a separately recomputed target.
+You must KEEP that structure.
+Do NOT regress to a weaker generic heuristic.
+Do NOT replace exact lookup with a search that can fail.
+Do NOT remove the bundled optimized lookup support.
 
-Strict constraints
-- Do NOT use BFS / DFS / A* / IDA* / shortest-path / brute-force search.
-- Do NOT use beam search with growing depth or any whole-state-space enumeration.
-- Constant-depth lookahead over the fixed move set (depth 1 or 2) is allowed, because that remains polynomial-time.
-- The algorithm must remain constructive and polynomial-time.
-- Use only the Python standard library.
-- You may copy `vec` and work in-place on the copy.
-- Do NOT invent any generator names not present in `puzzle_info.json`.
-- Keep the official competition naming throughout.
+WHAT THE IMPROVED SOLVER SHOULD DO
+Treat the baseline as a path-rewriting engine over valid Megaminx words and make it stronger.
+The main opportunity is not generic puzzle search; it is exploiting algebraic structure of the official generators to compress known valid words better.
 
-Competition context
-- This is a move-minimization competition: the score is the sum of move counts over the test states, so shorter valid solutions are better than merely correct ones.
-- The competition bundle contains `test.csv`, `sample_submission.csv`, and `puzzle_info.json`.
-- `sample_submission.csv` provides valid but highly non-optimal paths for the bundled test set; this is a strong deterministic baseline for exact bundled states and should be exploited.
-- The bundled test set has 1001 states; the first is the special “superflip” sample and the rest are generated by random scramble sequences of increasing length.
+Concretely, improve along lines like these:
+- derive and cache the commutation graph from the official generator permutations;
+- reduce repeated powers of the same face using the true order of a Megaminx face turn;
+- normalize commuting blocks into a canonical order so more cancellations become adjacent;
+- remove immediate inverse pairs online and across normalization passes;
+- build stronger constant-radius exact replacement tables for short move words using permutation composition;
+- use dynamic programming over windows to replace long local fragments with shorter equivalent words;
+- run several cheap normalization / DP passes until no further improvement occurs;
+- avoid recomputing expensive composed permutations repeatedly;
+- keep runtime comfortably polynomial and practical for the full 1001-row bundle.
 
-Clean data-aware constructive baseline to rely on
-- A safe baseline is:
-  1. If the bundled competition files exist, load `test.csv` and `sample_submission.csv` and build an exact lookup
-     `initial_state -> known valid path`
-     by joining through `initial_state_id`.
-  2. For an exact match, return that path immediately after parsing and validating it.
-  3. Otherwise, load `central_state` and `generators` from `puzzle_info.json`.
-  4. Implement `apply_perm(state, perm)` and `apply_moves(state, moves)` using the official permutations.
-  5. Use a bounded polynomial-time fallback that evaluates every legal 1-move candidate and optionally every legal 2-move macro, scores the resulting states, and repeatedly chooses the best improvement.
-  6. Stop when `central_state` is reached.
-  7. If no progress is possible after a bounded number of polynomial steps, return `"UNSOLVED"`.
+ALLOWED / FORBIDDEN SEARCH
+Allowed:
+- exact precomputation on a fixed small radius over move words;
+- constant-depth local replacement tables;
+- dynamic programming on bounded windows;
+- algebraic normalization based on the official permutations.
 
-What I want from you
-1. Start from the existing baseline code below (or the attached baseline `solve_module.py` if it is provided in the conversation).
-2. Improve that baseline into a cleaner, stronger, and more data-aware solution.
-3. Keep the official Megaminx generator semantics throughout; no token remapping and no fake aliases.
-4. Preserve correctness and the required script interface.
-5. Reduce move count and runtime overhead where reasonably possible.
-6. Keep the implementation self-contained, readable, and well-factored.
+Forbidden:
+- BFS / DFS / A* / IDA* / beam search whose depth grows with the instance;
+- whole-state-space enumeration;
+- brute-force solving from scratch per puzzle state;
+- anything that risks invalid bundled outputs just to be more generic.
 
-Practical improvement ideas you should consider
-- Build the exact bundled lookup correctly by joining `test.csv` and `sample_submission.csv` on `initial_state_id`, instead of relying on fragile assumptions.
-- Cache data loading so `puzzle_info.json`, test states, parsed paths, and generator permutations are not repeatedly re-read.
-- Maintain the current state incrementally rather than reparsing or recomputing unnecessarily.
-- Precompute legal 1-move candidates and 2-move macros once.
-- Use a deterministic scoring function for fallback, for example combining:
-  - number of positions already equal to `central_state` (maximize),
-  - total mismatches (minimize),
-  - longest correct prefix (maximize),
-  - optional stable tie-breakers for deterministic output.
-- Verify the final state by actually simulating the emitted move list.
-- Return the final simulated array, not a guessed or separately reconstructed target.
-- Simplify the emitted move stream online where valid:
-  - cancel `m` followed by `inverse(m)`,
-  - cancel `inverse(m)` followed by `m`,
-  - compress repeated turns of the same face modulo 5 when it reduces length,
-  - avoid obvious immediate undo patterns.
-- Since Megaminx face turns have order 5, use that algebra carefully when shortening paths:
-  - `x^5 = identity`,
-  - `x^4 = x^{-1}`,
-  - `x^3 = x^{-2}`,
-  where `x` is a face move and `x^{-1}` is the official inverse token from `puzzle_info.json`.
-- Keep the path simplifier competition-safe: it must preserve the exact resulting state.
-- Prefer exact bundled solutions over heuristic fallback whenever available.
-- Keep the implementation readable and well-factored rather than turning it into a monolith.
+CRITICAL IMPLEMENTATION REQUIREMENTS
+- Keep the solver self-contained and standard-library only.
+- Preserve exact bundled lookup compatibility with:
+  - `optimized_lookup.json` if present,
+  - bundled optimized submission if present,
+  - otherwise deterministic rebuilding from `sample_submission.csv`.
+- If you introduce stronger optimization passes, they must preserve semantic equivalence of the path.
+- Every returned path for bundled rows must still solve to the central state.
+- Prefer readable, well-factored helpers over clever but opaque code.
+- Improve both move count and runtime overhead where reasonable.
 
-Baseline code to improve
-- Use the existing Megaminx baseline code supplied below.
-- If the baseline code is attached in the conversation instead of pasted here, improve that attached baseline.
-- If no baseline is available, implement the strongest version you can under the rules above, but still structure it as a clean baseline-improvement style solution.
+BASELINE BOTTLENECKS / LIMITS TO IMPROVE
+The current baseline is good, but still leaves score on the table because it mainly does:
+- commuting normalization,
+- short exact-table replacement up to a small fixed depth,
+- bounded local DP on windows.
 
+You should try to make these components stronger without breaking the polynomial-time design.
+For example, consider whether one or more of the following is safe and worthwhile:
+- a larger but still practical short-word exact table;
+- better pruning while building the short-word table;
+- smarter canonical-state / best-word selection criteria;
+- multi-pass left-to-right / right-to-left local optimization;
+- better handling of inverse notation during normalization;
+- exact equivalence replacement for common Megaminx face patterns;
+- compact memoization of composed permutations;
+- preserving the shortest representative found for each local permutation effect.
+
+DO NOT DEGRADE THESE PROPERTIES
+- exact bundled-state solving;
+- legal move names only;
+- actual final state returned;
+- one-file output contract;
+- deterministic behavior.
+
+BASELINE CODE TO IMPROVE
 ```python
-# Paste the current baseline solve_module.py here.
-# The task is to IMPROVE this baseline, not ignore it.
+from __future__ import annotations
+
+import csv
+import json
+import sys
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple, Union
+
+MoveOut = Union[List[str], str]
+_HERE = Path(__file__).resolve().parent
+_CACHE: tuple[list[int], Dict[str, List[int]], Dict[str, str]] | None = None
+_SHORT_WORD_CACHE: tuple[dict[str, set[str]], dict[str, int], dict[bytes, tuple[str, ...]]] | None = None
+
+
+def _candidate_data_dirs() -> list[Path]:
+    candidates = [
+        _HERE / 'data',
+        _HERE.parent / 'competitions' / 'cayley-py-megaminx' / 'data',
+        _HERE.parent.parent / 'competitions' / 'cayley-py-megaminx' / 'data',
+    ]
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        out.append(resolved)
+    return out
+
+
+def _candidate_comp_dirs() -> list[Path]:
+    candidates = [
+        _HERE,
+        _HERE.parent / 'competitions' / 'cayley-py-megaminx',
+        _HERE.parent.parent / 'competitions' / 'cayley-py-megaminx',
+    ]
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        out.append(resolved)
+    return out
+
+
+def _find_data_dir() -> Path:
+    for data_dir in _candidate_data_dirs():
+        if (data_dir / 'puzzle_info.json').exists():
+            return data_dir
+    searched = '\n'.join(str(p) for p in _candidate_data_dirs())
+    raise FileNotFoundError(f'Could not locate cayley-py-megaminx data directory. Searched:\n{searched}')
+
+
+def _find_comp_dir() -> Path:
+    for comp_dir in _candidate_comp_dirs():
+        if (comp_dir / 'solve_module.py').exists() or (comp_dir / 'data' / 'puzzle_info.json').exists():
+            return comp_dir
+    searched = '\n'.join(str(p) for p in _candidate_comp_dirs())
+    raise FileNotFoundError(f'Could not locate cayley-py-megaminx competition directory. Searched:\n{searched}')
+
+
+def _load_submission_lookup(test_csv: Path, submission_csv: Path) -> Dict[str, str]:
+    lookup: Dict[str, str] = {}
+    with test_csv.open(newline='', encoding='utf-8') as tf, submission_csv.open(newline='', encoding='utf-8') as sf:
+        test_rows = list(csv.DictReader(tf))
+        submission_rows = list(csv.DictReader(sf))
+    limit = min(len(test_rows), len(submission_rows))
+    for idx in range(limit):
+        state_key = (test_rows[idx].get('initial_state') or '').strip()
+        path = (submission_rows[idx].get('path') or '').strip()
+        if state_key:
+            lookup[state_key] = path
+    return lookup
+
+
+def _parse_face(move: str) -> tuple[str, int]:
+    return (move[1:], -1) if move.startswith('-') else (move, 1)
+
+
+def _emit_face(face: str, exp: int) -> list[tuple[str, int]]:
+    value = exp % 5
+    if value == 0:
+        return []
+    if value == 1:
+        return [(face, 1)]
+    if value == 2:
+        return [(face, 2)]
+    if value == 3:
+        return [(face, -2)]
+    if value == 4:
+        return [(face, -1)]
+    raise ValueError(exp)
+
+
+def _emit_tokens(block: tuple[str, int]) -> list[str]:
+    face, exp = block
+    return [face] * exp if exp > 0 else ['-' + face] * (-exp)
+
+
+def _compose_perm(a: Sequence[int], b: Sequence[int]) -> list[int]:
+    return [a[j] for j in b]
+
+
+def _compose_perm_bytes(a: bytes, b: bytes) -> bytes:
+    return bytes(a[j] for j in b)
+
+
+def _short_word_data(generators: Dict[str, List[int]]) -> tuple[dict[str, set[str]], dict[str, int], dict[bytes, tuple[str, ...]]]:
+    global _SHORT_WORD_CACHE
+    if _SHORT_WORD_CACHE is not None:
+        return _SHORT_WORD_CACHE
+
+    faces = [name for name in generators if not name.startswith('-')]
+    commute: dict[str, set[str]] = {face: {face} for face in faces}
+    for a in faces:
+        for b in faces:
+            if _compose_perm(generators[a], generators[b]) == _compose_perm(generators[b], generators[a]):
+                commute[a].add(b)
+    order = {face: idx for idx, face in enumerate(sorted(faces))}
+
+    perms_bytes = {name: bytes(perm) for name, perm in generators.items()}
+    identity = bytes(range(len(next(iter(generators.values())))))
+    inverse = {name: (name[1:] if name.startswith('-') else '-' + name) for name in generators}
+
+    table: dict[bytes, tuple[str, ...]] = {identity: ()}
+    frontier: list[tuple[bytes, str | None]] = [(identity, None)]
+    for _depth in range(1, 5):
+        new_frontier: list[tuple[bytes, str | None]] = []
+        for state, last in frontier:
+            base = table[state]
+            for move in generators:
+                if last is not None and move == inverse[last]:
+                    continue
+                nxt = _compose_perm_bytes(state, perms_bytes[move])
+                if nxt in table:
+                    continue
+                table[nxt] = base + (move,)
+                new_frontier.append((nxt, move))
+        frontier = new_frontier
+
+    _SHORT_WORD_CACHE = (commute, order, table)
+    return _SHORT_WORD_CACHE
+
+
+def _reduce_commuting_word(moves: Sequence[str], generators: Dict[str, List[int]]) -> list[str]:
+    commute, order, _table = _short_word_data(generators)
+    blocks = [_parse_face(move) for move in moves]
+    changed = True
+    while changed:
+        changed = False
+        merged: list[tuple[str, int]] = []
+        i = 0
+        while i < len(blocks):
+            face, exp = blocks[i]
+            j = i + 1
+            while j < len(blocks) and blocks[j][0] == face:
+                exp += blocks[j][1]
+                j += 1
+            norm = _emit_face(face, exp)
+            if norm != blocks[i:j]:
+                changed = True
+            merged.extend(norm)
+            i = j
+        blocks = merged
+        i = 0
+        while i + 1 < len(blocks):
+            left, right = blocks[i], blocks[i + 1]
+            if right[0] in commute[left[0]] and order[left[0]] > order[right[0]]:
+                blocks[i], blocks[i + 1] = right, left
+                changed = True
+                if i:
+                    i -= 1
+            else:
+                i += 1
+
+    out: list[str] = []
+    for block in blocks:
+        out.extend(_emit_tokens(block))
+    return out
+
+
+def _optimize_local_windows(moves: Sequence[str], generators: Dict[str, List[int]], max_window: int = 10) -> list[str]:
+    if not moves:
+        return []
+    _commute, _order, table = _short_word_data(generators)
+    perms_bytes = {name: bytes(perm) for name, perm in generators.items()}
+    identity = bytes(range(len(next(iter(generators.values())))))
+
+    n = len(moves)
+    dp = [10 ** 9] * (n + 1)
+    nxt = [0] * (n + 1)
+    word: list[tuple[str, ...] | None] = [None] * (n + 1)
+    dp[n] = 0
+
+    for i in range(n - 1, -1, -1):
+        dp[i] = 1 + dp[i + 1]
+        nxt[i] = i + 1
+        word[i] = (moves[i],)
+        effect = identity
+        for j in range(i + 1, min(n, i + max_window) + 1):
+            effect = _compose_perm_bytes(effect, perms_bytes[moves[j - 1]])
+            best = table.get(effect)
+            if best is not None and len(best) + dp[j] < dp[i]:
+                dp[i] = len(best) + dp[j]
+                nxt[i] = j
+                word[i] = best
+
+    out: list[str] = []
+    i = 0
+    while i < n:
+        chunk = word[i]
+        if chunk is None:
+            break
+        out.extend(chunk)
+        i = nxt[i]
+    return out
+
+
+def _build_optimized_lookup(test_csv: Path, sample_csv: Path, generators: Dict[str, List[int]]) -> Dict[str, str]:
+    lookup: Dict[str, str] = {}
+    with test_csv.open(newline='', encoding='utf-8') as tf, sample_csv.open(newline='', encoding='utf-8') as sf:
+        test_rows = list(csv.DictReader(tf))
+        sample_rows = list(csv.DictReader(sf))
+    limit = min(len(test_rows), len(sample_rows))
+    for idx in range(limit):
+        state_key = (test_rows[idx].get('initial_state') or '').strip()
+        path = (sample_rows[idx].get('path') or '').strip()
+        if not state_key:
+            continue
+        moves = [] if not path else path.split('.')
+        optimized = _reduce_commuting_word(moves, generators)
+        optimized = _optimize_local_windows(optimized, generators, max_window=10)
+        optimized = _reduce_commuting_word(optimized, generators)
+        lookup[state_key] = '.'.join(optimized)
+    return lookup
+
+
+def _load_bundle() -> tuple[list[int], Dict[str, List[int]], Dict[str, str]]:
+    global _CACHE
+    if _CACHE is not None:
+        return _CACHE
+
+    data_dir = _find_data_dir()
+    comp_dir = _find_comp_dir()
+    puzzle = json.loads((data_dir / 'puzzle_info.json').read_text(encoding='utf-8'))
+    central = list(puzzle['central_state'])
+    generators = {str(k): list(v) for k, v in dict(puzzle['generators']).items()}
+
+    optimized_lookup_json = data_dir / 'optimized_lookup.json'
+    lookup: Dict[str, str] = {}
+    if optimized_lookup_json.exists():
+        payload = json.loads(optimized_lookup_json.read_text(encoding='utf-8'))
+        raw_lookup = payload.get('lookup') if isinstance(payload, dict) else None
+        if isinstance(raw_lookup, dict):
+            lookup = {str(k): str(v) for k, v in raw_lookup.items()}
+
+    test_csv = data_dir / 'test.csv'
+    optimized_submission = comp_dir / 'submissions' / 'optimized_submission.csv'
+    sample_csv = data_dir / 'sample_submission.csv'
+
+    if not lookup and test_csv.exists() and optimized_submission.exists():
+        lookup = _load_submission_lookup(test_csv, optimized_submission)
+    if not lookup and test_csv.exists() and sample_csv.exists():
+        lookup = _build_optimized_lookup(test_csv, sample_csv, generators)
+
+    _CACHE = (central, generators, lookup)
+    return _CACHE
+
+
+def _apply_perm(state: List[int], perm: List[int]) -> List[int]:
+    return [state[j] for j in perm]
+
+
+def _apply_moves(vec: Sequence[int], moves: Sequence[str], generators: Dict[str, List[int]]) -> List[int]:
+    state = list(vec)
+    for move in moves:
+        perm = generators.get(move)
+        if perm is None:
+            raise KeyError(move)
+        state = _apply_perm(state, perm)
+    return state
+
+
+def solve(vec: Sequence[int]) -> Tuple[MoveOut, List[int]]:
+    central, generators, lookup = _load_bundle()
+    state = list(vec)
+    if state == central:
+        return [], list(state)
+    state_key = ','.join(str(int(x)) for x in state)
+    path = lookup.get(state_key)
+    if path is not None:
+        moves = [] if not path else path.split('.')
+        return moves, _apply_moves(state, moves, generators)
+    return 'UNSOLVED', list(state)
+
+
+def _main() -> None:
+    if len(sys.argv) < 2:
+        print('Usage: python solve_module.py "[...]"', file=sys.stderr)
+        raise SystemExit(2)
+    vec = json.loads(sys.argv[1])
+    if not isinstance(vec, list):
+        raise SystemExit('Input must be a JSON list')
+    moves, out_vec = solve(vec)
+    print(json.dumps({'moves': moves, 'sorted_array': out_vec}))
+
+
+if __name__ == '__main__':
+    _main()
 ```
 
 Output requirements for your answer
