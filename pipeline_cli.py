@@ -41,10 +41,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import hashlib
 import itertools
 import importlib
 import importlib.util
 import json
+import py_compile
 import os
 import shutil
 import zipfile
@@ -57,8 +59,10 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+import re
 
 from pipeline_registry import PipelineSpec, get_pipeline, list_pipelines
+import llm_code_contract as code_contract
 
 
 ROOT = Path(__file__).resolve().parent
@@ -84,7 +88,9 @@ def _gpu_diag_hint(selected_models: str) -> None:
     Why this exists:
     - Many users expect that selecting a remote model name (e.g. GPT-4 via g4f) uses the local GPU.
       It does not: those requests go to provider endpoints.
-    - GPU is only used when running *local* compute (e.g., Transformers local inference) inside this runtime.
+    - GPU is only used inside this runtime for `local:*` Transformers inference.
+    - Backends like `ollama:*`, `vllm:*`, `lmstudio:*`, `openai-compatible:*`, and `g4fapi:*`
+      may still use GPU, but on the external/local server process rather than in this Python process.
     """
     dev = (os.getenv("AGENTLAB_DEVICE") or "").strip()
     use_gpu = (os.getenv("AGENTLAB_USE_GPU") or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -93,6 +99,11 @@ def _gpu_diag_hint(selected_models: str) -> None:
 
     models = [m.strip() for m in (selected_models or "").split(",") if m.strip()]
     has_local = any(m.startswith("local:") for m in models)
+    has_external_local_server = any(
+        m.startswith(prefix)
+        for m in models
+        for prefix in ("ollama:", "vllm:", "lmstudio:", "openai-compatible:", "openai_compatible:", "compat:", "g4fapi:")
+    )
 
     # Torch/CUDA availability (best effort)
     try:
@@ -110,11 +121,16 @@ def _gpu_diag_hint(selected_models: str) -> None:
     except Exception:
         print("[gpu] requested via env, but torch is not available in this environment.")
 
-    if not has_local:
+    if not has_local and not has_external_local_server:
         print(
             "[gpu] NOTE: your --models list contains no 'local:*' models. "
             "g4f/OpenAI/Claude/Gemini backends run remotely, so local GPU memory will stay near 0. "
-            "If you want to actually use GPU, pass e.g. --models 'local:Qwen/Qwen2.5-0.5B-Instruct' (and ensure torch+transformers are installed)."
+            "If you want in-process GPU inference, pass e.g. --models 'local:Qwen/Qwen2.5-0.5B-Instruct' (and ensure torch+transformers are installed)."
+        )
+    elif has_external_local_server and not has_local:
+        print(
+            "[gpu] NOTE: your selected models use an external/local server backend (ollama/vllm/LM Studio/OpenAI-compatible/g4fapi). "
+            "GPU may be used by that server, but this Python process will still appear mostly CPU-only."
         )
 
 def _normalize_g4f_model_name(model: str) -> str:
@@ -233,15 +249,18 @@ def _discover_g4f_candidate_models(backend_api_url: Optional[str] = None) -> Lis
                 names.append(item.strip())
 
     preferred = {
-        "gpt-4o-mini": 0,
-        "gpt-4": 1,
-        "gpt-4o": 2,
+        "r1-1776": 0,
+        "gpt-4o": 1,
+        "gpt-4": 2,
         "claude-3.5-sonnet": 3,
-        "claude-3-haiku": 4,
-        "command-r": 5,
-        "command-r-plus": 6,
-        "deepseek-chat": 7,
-        "aria": 8,
+        "command-r-plus": 4,
+        "deepseek-chat": 5,
+        "command-r": 6,
+        "aria": 7,
+        "command-a": 8,
+        "command-r7b": 9,
+        "gpt-4o-mini": 10,
+        "claude-3-haiku": 11,
     }
     deduped = _dedupe_keep_order(names)
     return sorted(deduped, key=lambda s: (preferred.get(s, 9999), s.lower()))
@@ -304,6 +323,158 @@ def _probe_g4f_model_pipeline(
             else:
                 os.environ["G4F_PROVIDER"] = old_provider
 
+
+
+
+
+def _split_accidental_joined_kaggle_token(argv: Sequence[str]) -> List[str]:
+    """Split tokens like ``4000kaggle competitions submit ...``.
+
+    This catches the common shell line-continuation mistake where a trailing
+    backslash joins the next line directly onto the previous token.
+    """
+    out: List[str] = []
+    for idx, token in enumerate(argv):
+        if (
+            token != "kaggle"
+            and token.endswith("kaggle")
+            and idx + 2 < len(argv)
+            and argv[idx + 1] == "competitions"
+            and argv[idx + 2] == "submit"
+        ):
+            prefix = token[: -len("kaggle")]
+            if prefix:
+                out.append(prefix)
+            out.append("kaggle")
+            continue
+        out.append(token)
+    return out
+
+
+def _find_option_value(argv: Sequence[str], *names: str) -> Optional[str]:
+    for idx, token in enumerate(argv[:-1]):
+        if token in names:
+            return argv[idx + 1]
+    return None
+
+
+def _replace_option_value(argv: List[str], names: Sequence[str], value: str) -> List[str]:
+    out = list(argv)
+    for idx, token in enumerate(out[:-1]):
+        if token in names:
+            out[idx + 1] = value
+            return out
+    if names:
+        out.extend([names[0], value])
+    return out
+
+
+def _parse_embedded_kaggle_submit_tail(tail: Sequence[str]) -> Dict[str, str]:
+    if len(tail) < 3 or list(tail[:3]) != ["kaggle", "competitions", "submit"]:
+        raise ValueError("not a kaggle competitions submit tail")
+
+    competition: Optional[str] = None
+    file_path: Optional[str] = None
+    message: Optional[str] = None
+    idx = 3
+    while idx < len(tail):
+        tok = tail[idx]
+        if tok in {"-c", "--competition"}:
+            if idx + 1 >= len(tail):
+                raise ValueError("missing value after -c/--competition")
+            competition = tail[idx + 1]
+            idx += 2
+            continue
+        if tok in {"-f", "--file"}:
+            if idx + 1 >= len(tail):
+                raise ValueError("missing value after -f/--file")
+            file_path = tail[idx + 1]
+            idx += 2
+            continue
+        if tok in {"-m", "--message"}:
+            if idx + 1 >= len(tail):
+                raise ValueError("missing value after -m/--message")
+            message = tail[idx + 1]
+            idx += 2
+            continue
+        if tok.startswith("-"):
+            raise ValueError(f"unsupported kaggle submit option: {tok}")
+        if competition is None:
+            competition = tok
+            idx += 1
+            continue
+        raise ValueError(f"unexpected extra kaggle submit token: {tok}")
+
+    if not competition:
+        raise ValueError("missing Kaggle competition slug")
+    if not file_path:
+        raise ValueError("missing Kaggle submission file (-f)")
+    if not message:
+        raise ValueError("missing Kaggle submission message (-m)")
+    return {"competition": competition, "file": file_path, "message": message}
+
+
+def _rewrite_embedded_kaggle_submit(argv: Sequence[str]) -> Tuple[List[str], Optional[str]]:
+    """Rewrite accidental ``... run ... kaggle competitions submit ...`` tails.
+
+    Returns ``(argv, note)`` where ``note`` is a human-readable explanation if
+    a rewrite took place.
+    """
+    normalized = _split_accidental_joined_kaggle_token(list(argv))
+    if not normalized or normalized[0] != "run":
+        return normalized, None
+
+    start = -1
+    for idx in range(1, len(normalized) - 2):
+        if normalized[idx:idx + 3] == ["kaggle", "competitions", "submit"]:
+            start = idx
+            break
+    if start < 0:
+        return normalized, None
+
+    base = normalized[:start]
+    tail = normalized[start:]
+    parsed = _parse_embedded_kaggle_submit_tail(tail)
+
+    requested_output = _find_option_value(base, "--output")
+    if requested_output and requested_output != parsed["file"]:
+        base = _replace_option_value(base, ["--output"], parsed["file"])
+    elif not requested_output:
+        base.extend(["--output", parsed["file"]])
+
+    if "--submit" not in base:
+        base.append("--submit")
+    if "--message" in base:
+        base = _replace_option_value(base, ["--message"], parsed["message"])
+    else:
+        base.extend(["--message", parsed["message"]])
+
+    if "--submit-competition" in base:
+        base = _replace_option_value(base, ["--submit-competition"], parsed["competition"])
+    else:
+        base.extend(["--submit-competition", parsed["competition"]])
+
+    if "--submit-via" not in base:
+        base.extend(["--submit-via", "cli"])
+
+    note = (
+        "[cli] detected an embedded 'kaggle competitions submit ...' tail after "
+        "'pipeline_cli.py run'. Bash line continuation joined both commands, so "
+        "the CLI rewrote it to the built-in form: --submit --submit-via cli "
+        f"--submit-competition {parsed['competition']} --message {parsed['message']!r}."
+    )
+    return base, note
+
+
+def _format_unknown_args_error(unknown: Sequence[str]) -> str:
+    msg = "unrecognized arguments: " + " ".join(unknown)
+    if len(unknown) >= 3 and list(unknown[:3]) == ["kaggle", "competitions", "submit"]:
+        msg += (
+            "\nHint: you appended a raw 'kaggle competitions submit ...' command to "
+            "'pipeline_cli.py run'. Use either two separate shell commands joined by '&&', "
+            "or use the built-in submit flags: --submit --message '...'."
+        )
+    return msg
 
 def _probe_g4f_models_sync(
     candidates: Sequence[str],
@@ -521,6 +692,8 @@ def cmd_check_g4f_models(args: argparse.Namespace) -> None:
             on_result=_on_result,
         )
     working: List[str] = [str(r["model"]) for r in results if r.get("ok")]
+    if "r1-1776" in working:
+        working = ["r1-1776"] + [name for name in working if name != "r1-1776"]
 
     payload = {
         "provider": provider_name or None,
@@ -588,13 +761,15 @@ def _extract_named_member_from_zip(zip_path: Path, member_name: str, out_path: P
 def _prefer_sample_submission_from_zip(spec: PipelineSpec) -> Optional[Path]:
     """Materialize sample_submission.csv from the competition ZIP when available.
 
-    This keeps the local schema in sync with the actual competition bundle and
-    avoids stale checked-in samples.
+    Important: extract into a cache path rather than overwriting the checked-in
+    repository fixture. This keeps schema checks aligned with the actual
+    competition bundle without mutating tracked files during selftests or CLI
+    runs.
     """
     zip_path = _resolve_competition_zip(spec)
     if zip_path is None:
         return None
-    target = ROOT / "competitions" / spec.key / "data" / "sample_submission.csv"
+    target = ROOT / "_cache" / "competition_bundle_schema" / spec.key / "sample_submission.csv"
     try:
         return _extract_named_member_from_zip(zip_path, "sample_submission.csv", target)
     except Exception:
@@ -675,6 +850,357 @@ def _resolve_default_puzzles(spec: PipelineSpec) -> Path:
         "  - OR put a Kaggle-style ZIP with `test.csv` at repo root (./<slug>.zip)\n"
         "    or into `competition_files/<slug>.zip` and re-run.\n"
     )
+
+
+def _variant_prompt_path(base: Optional[Path], variant: Optional[str], *, role: str) -> Optional[Path]:
+    if base is None or not variant:
+        return base
+    parent = base.parent
+    suffix = base.suffix
+    stem = base.stem
+
+    if role == "prompt":
+        candidates = [
+            parent / f"{stem}_{variant}{suffix}",
+            parent / f"user_prompt_{variant}{suffix}",
+        ]
+    else:
+        candidates = [
+            parent / f"custom_prompts_{variant}{suffix}",
+            parent / f"{stem}_{variant}{suffix}",
+        ]
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+    raise SystemExit(
+        f"Requested --prompt-variant={variant!r}, but no matching {role} file was found near {base}. "
+        f"Tried: {', '.join(str(c) for c in candidates)}"
+    )
+
+
+def _resolve_prompt_bundle(spec: PipelineSpec, args: argparse.Namespace) -> tuple[Path, Optional[Path]]:
+    variant = getattr(args, "prompt_variant", None)
+    prompt_file = Path(args.prompt_file) if getattr(args, "prompt_file", None) else _variant_prompt_path(spec.prompt_file, variant, role="prompt")
+    if prompt_file is None:
+        raise SystemExit(f"No prompt_file configured for {spec.key}; pass --prompt-file.")
+    custom_prompts = Path(args.custom_prompts) if getattr(args, "custom_prompts", None) else _variant_prompt_path(spec.custom_prompts_file, variant, role="custom prompts")
+    return prompt_file, custom_prompts
+
+
+def _safe_read_text(path: Optional[Path]) -> str:
+    if path is None or not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding='utf-8', errors='ignore')
+    except Exception:
+        return ""
+
+
+def _prompt_bundle_requests_from_scratch(prompt_file: Path, custom_prompts: Optional[Path] = None) -> bool:
+    text = ("\n".join([_safe_read_text(prompt_file), _safe_read_text(custom_prompts)])).lower()
+    strong_markers = [
+        'no_baseline_patch_bias',
+        'no reference baseline will be shown',
+        'do not expect any baseline section',
+        'do not rely on, patch, wrap, or extend any baseline',
+        'do not rely on, patch, wrap, or extend any baseline implementation',
+        'write the code from scratch',
+        'fresh solver from scratch',
+    ]
+    if any(marker in text for marker in strong_markers):
+        return True
+
+    stems = [prompt_file.stem.lower()]
+    if custom_prompts is not None:
+        stems.append(custom_prompts.stem.lower())
+    if any(stem.endswith('_regular') or stem == 'regular' for stem in stems):
+        return True
+
+    return False
+
+
+def _prompt_bundle_uses_baseline(prompt_file: Path, custom_prompts: Optional[Path] = None) -> bool:
+    if _prompt_bundle_requests_from_scratch(prompt_file, custom_prompts):
+        return False
+    text = ("\n".join([_safe_read_text(prompt_file), _safe_read_text(custom_prompts)])).lower()
+    return 'baseline' in text
+
+
+def _prompt_bundle_supports_ranked_reuse(prompt_file: Path, custom_prompts: Optional[Path] = None) -> bool:
+    return _prompt_bundle_uses_baseline(prompt_file, custom_prompts) or _prompt_bundle_requests_from_scratch(prompt_file, custom_prompts)
+
+
+def _prompt_bundle_requires_json_code_envelope(prompt_file: Path, custom_prompts: Optional[Path] = None) -> bool:
+    return code_contract.prompt_requests_code_json_envelope(
+        _safe_read_text(prompt_file),
+        _safe_read_text(custom_prompts),
+    )
+
+
+def _adaptive_baseline_bundle_slug(prompt_file: Path, custom_prompts: Optional[Path] = None) -> str:
+    pieces = [prompt_file.stem]
+    if custom_prompts is not None:
+        pieces.append(custom_prompts.stem)
+    raw = '__'.join(pieces).strip().lower()
+    slug = re.sub(r'[^a-z0-9._-]+', '-', raw).strip('-._')
+    return slug or 'default'
+
+
+def _adaptive_baseline_paths(spec: PipelineSpec, prompt_file: Path, custom_prompts: Optional[Path] = None) -> dict[str, Path]:
+    slug = _adaptive_baseline_bundle_slug(prompt_file, custom_prompts)
+    root = ROOT / 'competitions' / spec.key / 'generated' / 'adaptive_baselines'
+    return {
+        'root': root,
+        'solver': root / f'{slug}.py',
+        'meta': root / f'{slug}.json',
+    }
+
+
+def _read_json_file(path: Path) -> Optional[dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _load_competition_self_improver(spec: PipelineSpec):
+    module_path = ROOT / 'competitions' / spec.key / 'prompt_self_improver.py'
+    if not module_path.exists():
+        return None
+    module_name = f"competition_prompt_self_improver_{re.sub(r'[^a-zA-Z0-9_]+', '_', spec.key)}"
+    loaded = sys.modules.get(module_name)
+    if loaded is not None:
+        return loaded
+    spec_obj = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec_obj is None or spec_obj.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec_obj)
+    sys.modules[module_name] = module
+    spec_obj.loader.exec_module(module)
+    return module
+
+
+def _prepare_competition_self_improvement_prompt_bundle(
+    *,
+    spec: PipelineSpec,
+    base_prompt_file: Path,
+    base_custom_prompts: Optional[Path],
+    baseline_solver: Path,
+    round_idx: int,
+    score_history: Sequence[Dict[str, Any]],
+    best_metric: Optional[Dict[str, Any]],
+    prompt_history: Sequence[Dict[str, Any]],
+    output_dir: Path,
+) -> Optional[dict[str, Any]]:
+    module = _load_competition_self_improver(spec)
+    if module is None or not hasattr(module, 'build_round_prompt_bundle'):
+        return None
+    return module.build_round_prompt_bundle(
+        base_prompt_file=base_prompt_file,
+        base_custom_prompts=base_custom_prompts,
+        baseline_solver=baseline_solver,
+        round_idx=round_idx,
+        score_history=score_history,
+        best_metric=best_metric,
+        prompt_history=prompt_history,
+        output_dir=output_dir,
+    )
+
+
+def _write_prompt_evolution_history(out_path: Path, history: Sequence[Dict[str, Any]]) -> None:
+    if not history:
+        return
+    try:
+        target = out_path.with_name(out_path.stem + '_prompt_evolution.json')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(list(history), ensure_ascii=False, indent=2), encoding='utf-8')
+    except Exception:
+        return
+
+
+def _parse_score_value(raw: Any) -> Optional[float]:
+    if raw in (None, '', 'None'):
+        return None
+    try:
+        return float(str(raw).strip())
+    except Exception:
+        return None
+
+
+def _extract_kaggle_score_info(round_result: Optional[dict[str, Any]]) -> dict[str, Any]:
+    info: dict[str, Any] = {
+        'submission_id': None,
+        'status': None,
+        'public_score': None,
+        'private_score': None,
+        'leaderboard_score': None,
+        'leaderboard_score_source': None,
+        'error_description': None,
+    }
+    if not isinstance(round_result, dict):
+        return info
+    submit_report = round_result.get('kaggle_submit') if isinstance(round_result.get('kaggle_submit'), dict) else None
+    status = submit_report.get('status') if isinstance(submit_report, dict) and isinstance(submit_report.get('status'), dict) else None
+    if not isinstance(status, dict):
+        return info
+
+    public_score = _parse_score_value(status.get('public_score', status.get('publicScore')))
+    private_score = _parse_score_value(status.get('private_score', status.get('privateScore')))
+    leaderboard_score = public_score if public_score is not None else private_score
+    leaderboard_source = 'public_score' if public_score is not None else ('private_score' if private_score is not None else None)
+
+    info.update({
+        'submission_id': status.get('id') or status.get('ref'),
+        'status': status.get('status') or status.get('state'),
+        'public_score': public_score,
+        'private_score': private_score,
+        'leaderboard_score': leaderboard_score,
+        'leaderboard_score_source': leaderboard_source,
+        'error_description': status.get('error_description') or status.get('errorDescription'),
+    })
+    return info
+
+
+def _adaptive_metric_from_round(*, local_score: Optional[int], round_result: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    kaggle_info = _extract_kaggle_score_info(round_result)
+    leaderboard_score = kaggle_info.get('leaderboard_score')
+    if leaderboard_score is not None:
+        return {
+            'source': f"kaggle_{kaggle_info.get('leaderboard_score_source') or 'score'}",
+            'value': float(leaderboard_score),
+            'submission_id': kaggle_info.get('submission_id'),
+            'status': kaggle_info.get('status'),
+            'public_score': kaggle_info.get('public_score'),
+            'private_score': kaggle_info.get('private_score'),
+        }
+    if local_score is not None:
+        return {
+            'source': 'local_score',
+            'value': float(local_score),
+        }
+    return None
+
+
+_ADAPTIVE_METRIC_PRIORITY = {
+    'kaggle_public_score': 3,
+    'kaggle_private_score': 2,
+    'kaggle_score': 2,
+    'local_score': 1,
+}
+
+
+def _is_better_metric(current_metric: Optional[dict[str, Any]], candidate_metric: Optional[dict[str, Any]]) -> bool:
+    if not candidate_metric:
+        return False
+    if not isinstance(current_metric, dict) or not current_metric:
+        return True
+
+    current_priority = int(_ADAPTIVE_METRIC_PRIORITY.get(str(current_metric.get('source') or ''), 0))
+    candidate_priority = int(_ADAPTIVE_METRIC_PRIORITY.get(str(candidate_metric.get('source') or ''), 0))
+    if candidate_priority != current_priority:
+        return candidate_priority > current_priority
+
+    current_value = _parse_score_value(current_metric.get('value'))
+    candidate_value = _parse_score_value(candidate_metric.get('value'))
+    if current_value is None:
+        return candidate_value is not None
+    if candidate_value is None:
+        return False
+    return candidate_value < current_value
+
+
+def _should_promote_adaptive_baseline(current_meta: Optional[dict[str, Any]], candidate_metric: Optional[dict[str, Any]]) -> bool:
+    if not candidate_metric:
+        return False
+    if not isinstance(current_meta, dict):
+        return True
+
+    current_metric = current_meta.get('selection_metric') if isinstance(current_meta.get('selection_metric'), dict) else None
+    return _is_better_metric(current_metric, candidate_metric)
+
+
+def _resolve_effective_baseline(spec: PipelineSpec, prompt_file: Path, custom_prompts: Optional[Path] = None) -> tuple[Path, dict[str, Any]]:
+    uses_baseline = _prompt_bundle_uses_baseline(prompt_file, custom_prompts)
+    from_scratch = _prompt_bundle_requests_from_scratch(prompt_file, custom_prompts)
+    supports_ranked_reuse = _prompt_bundle_supports_ranked_reuse(prompt_file, custom_prompts)
+    paths = _adaptive_baseline_paths(spec, prompt_file, custom_prompts)
+    meta = _read_json_file(paths['meta'])
+    adaptive_solver = paths['solver']
+    effective_baseline = spec.baseline_solver
+    adaptive_valid: Optional[bool] = None
+    adaptive_invalid_reason: Optional[str] = None
+
+    if supports_ranked_reuse and adaptive_solver.exists():
+        adaptive_valid, adaptive_invalid_reason = _probe_solver_validation_failure(
+            adaptive_solver,
+            spec.validator,
+            _resolve_smoke_vectors(spec),
+        )
+        if adaptive_valid:
+            effective_baseline = adaptive_solver
+
+    mode = 'baseline_patch' if uses_baseline else ('reference_only' if from_scratch else 'disabled')
+    info = {
+        'enabled': supports_ranked_reuse,
+        'from_scratch': from_scratch,
+        'uses_baseline': uses_baseline,
+        'mode': mode,
+        'bundle_slug': _adaptive_baseline_bundle_slug(prompt_file, custom_prompts),
+        'effective_baseline': str(effective_baseline),
+        'default_baseline': str(spec.baseline_solver),
+        'adaptive_solver': str(adaptive_solver),
+        'adaptive_meta': str(paths['meta']),
+        'adaptive_exists': adaptive_solver.exists(),
+        'adaptive_valid': adaptive_valid,
+        'adaptive_invalid_reason': adaptive_invalid_reason,
+        'selection_metric': meta.get('selection_metric') if isinstance(meta, dict) else None,
+    }
+    return effective_baseline, info
+
+
+def _persist_adaptive_baseline(
+    *,
+    spec: PipelineSpec,
+    prompt_file: Path,
+    custom_prompts: Optional[Path],
+    solver_path: Path,
+    round_idx: int,
+    local_score: Optional[int],
+    round_result: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    metric = _adaptive_metric_from_round(local_score=local_score, round_result=round_result)
+    if metric is None:
+        return None
+
+    paths = _adaptive_baseline_paths(spec, prompt_file, custom_prompts)
+    current_meta = _read_json_file(paths['meta'])
+    if not _should_promote_adaptive_baseline(current_meta, metric):
+        return None
+
+    paths['root'].mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(solver_path, paths['solver'])
+    kaggle_info = _extract_kaggle_score_info(round_result)
+    manifest = {
+        'competition': spec.key,
+        'competition_slug': spec.competition,
+        'prompt_bundle': _adaptive_baseline_bundle_slug(prompt_file, custom_prompts),
+        'updated_at': datetime.now().isoformat(),
+        'solver_path': str(paths['solver']),
+        'source_solver_path': str(solver_path),
+        'round': round_idx,
+        'local_score': local_score,
+        'selection_metric': metric,
+        'kaggle': kaggle_info,
+        'prompt_file': str(prompt_file),
+        'custom_prompts': str(custom_prompts) if custom_prompts is not None else None,
+        'default_baseline': str(spec.baseline_solver),
+    }
+    paths['meta'].write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+    return manifest
 
 
 def _resolve_sample_submission(spec: PipelineSpec) -> Optional[Path]:
@@ -851,7 +1377,10 @@ def _validate_submission_move_tokens(
             max_tokens = max(max_tokens, len(tokens))
             for token in tokens:
                 if token == 'UNSOLVED':
-                    continue
+                    raise ValueError(
+                        f"Row {row_idx}: UNSOLVED is not a legal Kaggle move sequence. "
+                        "Use a valid dot-separated path or fall back to a known-good baseline."
+                    )
                 if token not in allowed_moves:
                     raise ValueError(
                         f"Row {row_idx}: unknown move {token!r}. "
@@ -881,8 +1410,20 @@ def _resolve_submission_move_column(competition_slug: str) -> tuple[str, str]:
     return str(cfg.moves_key or 'moves'), str(cfg.move_joiner or '.')
 
 
+def _append_label_before_suffixes(path: Path, label: str) -> Path:
+    suffixes = ''.join(path.suffixes)
+    if suffixes:
+        base_name = path.name[:-len(suffixes)]
+        return path.with_name(f'{base_name}{label}{suffixes}')
+    return path.with_name(path.name + label)
+
+
 def _candidate_output_path(out_csv: Path) -> Path:
-    return out_csv.with_name(out_csv.name + '.candidate')
+    return _append_label_before_suffixes(out_csv, '.candidate')
+
+
+def _round_submission_output_path(out_csv: Path, round_idx: int) -> Path:
+    return _append_label_before_suffixes(out_csv, f'.round{max(1, int(round_idx))}')
 
 
 def _backup_output_path(out_csv: Path) -> Path:
@@ -1035,6 +1576,195 @@ def _print_kaggle_preflight_report(report: dict[str, Any]) -> None:
             if key in access and access.get(key) is not None:
                 bits.append(f"{key}={access.get(key)}")
     print(f"[kaggle] preflight ({mode}): " + ' '.join(bits), flush=True)
+
+
+
+def _has_kaggle_env_credentials(env: Optional[dict[str, str]] = None) -> bool:
+    source = env or os.environ
+    if source.get('KAGGLE_API_TOKEN') or source.get('KAGGLE_TOKEN'):
+        return True
+    return bool(source.get('KAGGLE_USERNAME') and source.get('KAGGLE_KEY'))
+
+
+
+def _autodiscover_kaggle_credentials_file(*, explicit_path: str | None = None) -> Optional[dict[str, str]]:
+    """Best-effort recovery for notebook/Colab uploads with arbitrary filenames.
+
+    Common failure mode: the user uploads `kaggle_something.json`, but the notebook
+    later hardcodes `~/.kaggle/kaggle.json` or `--kaggle-json ~/.kaggle/kaggle.json`.
+    We only auto-recover when we can identify a *single* valid credentials file.
+    """
+    try:
+        _ensure_llm_puzzles_on_path()
+        from src.kaggle_utils import _load_kaggle_credentials  # type: ignore
+    except Exception:
+        return None
+
+    resolved_explicit = str(Path(explicit_path).expanduser().resolve()) if explicit_path else None
+    search_roots: list[Path] = []
+    for root in [Path.cwd(), ROOT, Path('/content')]:
+        try:
+            rr = root.expanduser().resolve()
+        except Exception:
+            continue
+        if rr.exists() and rr not in search_roots:
+            search_roots.append(rr)
+
+    patterns = [
+        'kaggle.json',
+        'kaggle*.json',
+        '*kaggle*.json',
+        'access_token',
+        '*access_token*',
+        '*.json',
+        '*.token',
+        '*.txt',
+    ]
+
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for root in search_roots:
+        for pattern in patterns:
+            try:
+                paths = sorted(root.glob(pattern))
+            except Exception:
+                continue
+            for path in paths:
+                try:
+                    resolved = str(path.resolve())
+                except Exception:
+                    continue
+                if resolved in seen or resolved == resolved_explicit:
+                    continue
+                seen.add(resolved)
+                if not path.is_file():
+                    continue
+                try:
+                    stat = path.stat()
+                except Exception:
+                    continue
+                if stat.st_size <= 0 or stat.st_size > 128 * 1024:
+                    continue
+                try:
+                    creds = _load_kaggle_credentials(resolved)
+                except Exception:
+                    continue
+                name = path.name.lower()
+                score = 0
+                if root == Path.cwd().resolve():
+                    score += 20
+                if name == 'kaggle.json':
+                    score += 10
+                if 'kaggle' in name:
+                    score += 5
+                candidates.append({
+                    'path': resolved,
+                    'score': score,
+                    'kind': str(creds.get('kind') or ''),
+                    'name': path.name,
+                })
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (-int(item['score']), str(item['name']), str(item['path'])))
+    top_score = int(candidates[0]['score'])
+    top = [c for c in candidates if int(c['score']) == top_score]
+    if len(top) != 1:
+        return None
+
+    winner = top[0]
+    return {
+        'credentials_path': str(winner['path']),
+        'kind': str(winner['kind']),
+        'source': 'autodiscovered_file',
+    }
+
+
+
+def _resolve_kaggle_submit_availability(
+    *,
+    kaggle_json: str | None,
+    kaggle_config_dir: str | None,
+) -> dict[str, Any]:
+    explicit_path = str(Path(kaggle_json).expanduser().resolve()) if kaggle_json else None
+    if kaggle_json:
+        explicit_exists = Path(kaggle_json).expanduser().exists()
+        if explicit_exists:
+            return {
+                'enabled': True,
+                'source': 'explicit_file',
+                'credentials_path': explicit_path,
+            }
+        recovered = _autodiscover_kaggle_credentials_file(explicit_path=explicit_path)
+        if recovered is not None:
+            return {
+                'enabled': True,
+                'source': str(recovered.get('source') or 'autodiscovered_file'),
+                'credentials_path': str(recovered['credentials_path']),
+                'recovered_from_missing_explicit': explicit_path,
+            }
+        return {
+            'enabled': False,
+            'source': 'explicit_file_missing',
+            'credentials_path': explicit_path,
+            'reason': f'Kaggle credentials file was not found: {explicit_path}',
+            'nonfatal': False,
+        }
+
+    if _has_kaggle_env_credentials():
+        return {
+            'enabled': True,
+            'source': 'environment',
+            'credentials_path': None,
+        }
+
+    try:
+        _ensure_llm_puzzles_on_path()
+        from src.kaggle_utils import _discover_default_credentials_path  # type: ignore
+
+        discovered = _discover_default_credentials_path(kaggle_config_dir)
+    except Exception:
+        discovered = None
+
+    if discovered:
+        return {
+            'enabled': True,
+            'source': 'default_file',
+            'credentials_path': str(Path(discovered).expanduser().resolve()),
+        }
+
+    recovered = _autodiscover_kaggle_credentials_file(explicit_path=None)
+    if recovered is not None:
+        return {
+            'enabled': True,
+            'source': str(recovered.get('source') or 'autodiscovered_file'),
+            'credentials_path': str(recovered['credentials_path']),
+        }
+
+    return {
+        'enabled': False,
+        'source': 'missing_credentials',
+        'credentials_path': None,
+        'reason': (
+            'No Kaggle credentials were found. Live submission will be skipped. '
+            'Pass --kaggle-json /path/to/kaggle.json (or ~/.kaggle/access_token), '
+            'set KAGGLE_USERNAME/KAGGLE_KEY or KAGGLE_API_TOKEN, or place credentials under ~/.kaggle/.'
+        ),
+        'nonfatal': True,
+    }
+
+
+
+def _nonfatal_kaggle_submit_report(exc: BaseException, competition: str) -> dict[str, Any]:
+    return {
+        'mode': 'error',
+        'submitted': False,
+        'competition': competition,
+        'error_type': type(exc).__name__,
+        'error': _format_kaggle_submit_error(exc, competition),
+        'nonfatal': True,
+    }
 
 
 
@@ -1206,46 +1936,150 @@ def _extract_state(row: Dict[str, str], spec: PipelineSpec, vector_col_override:
     )
 
 
-def _validate_solver(solver_path: Path, validator_path: Path, smoke_vector: Sequence[int]) -> None:
-    print(f"[validate] {validator_path.name} ...")
-    subprocess.check_call(
-        [
+def _solver_validation_timeout_s() -> float:
+    raw = os.getenv("AGENTLAB_VALIDATOR_TIMEOUT_S", os.getenv("PIPELINE_SOLVER_TIMEOUT_S", "20"))
+    try:
+        return max(1.0, float(raw))
+    except Exception:
+        return 20.0
+
+
+def _resolve_smoke_vectors(spec: PipelineSpec, extra_rows: int = 2) -> list[list[int]]:
+    vectors: list[list[int]] = []
+    seen: set[tuple[int, ...]] = set()
+
+    def _add(vec: Sequence[int] | None) -> None:
+        if vec is None:
+            return
+        norm = [int(x) for x in vec]
+        sig = tuple(norm)
+        if sig in seen:
+            return
+        seen.add(sig)
+        vectors.append(norm)
+
+    _add(spec.smoke_vector)
+
+    if extra_rows <= 0:
+        return vectors
+
+    try:
+        puzzles_csv = _resolve_default_puzzles(spec)
+        _ensure_csv_field_size_limit()
+        with puzzles_csv.open(newline='', encoding='utf-8', errors='ignore') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    vec = _extract_state(row, spec)
+                except Exception:
+                    continue
+                if not vec:
+                    continue
+                _add(vec)
+                if len(vectors) >= 1 + extra_rows:
+                    break
+    except Exception:
+        pass
+
+    return vectors
+
+
+def _normalize_smoke_vectors(smoke_vector: Sequence[int] | Sequence[Sequence[int]]) -> list[list[int]]:
+    if not smoke_vector:
+        return []
+    first = smoke_vector[0]  # type: ignore[index]
+    if isinstance(first, (list, tuple)):
+        return [[int(x) for x in vec] for vec in smoke_vector]  # type: ignore[arg-type]
+    return [[int(x) for x in smoke_vector]]  # type: ignore[arg-type]
+
+
+def _probe_solver_validation_failure(
+    solver_path: Path,
+    validator_path: Path,
+    smoke_vector: Sequence[int] | Sequence[Sequence[int]],
+) -> tuple[bool, Optional[str]]:
+    if not solver_path.exists():
+        return False, f'missing solver file: {solver_path}'
+    try:
+        py_compile.compile(str(solver_path), doraise=True)
+    except Exception as exc:
+        return False, f'py_compile failed: {type(exc).__name__}: {exc}'
+
+    try:
+        solver_text = solver_path.read_text(encoding='utf-8', errors='ignore')
+    except Exception:
+        solver_text = ''
+    if 'def solve(' not in solver_text and 'async def solve(' not in solver_text:
+        return False, 'py_compile failed: missing solve() entrypoint'
+
+    smoke_vectors = _normalize_smoke_vectors(smoke_vector)
+    if not smoke_vectors:
+        return True, None
+
+    timeout_s = _solver_validation_timeout_s()
+    for one_vec in smoke_vectors:
+        cmd = [
+            PYTHON,
+            str(validator_path),
+            '--solver',
+            str(solver_path),
+            '--vector',
+            json.dumps(list(one_vec)),
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        except subprocess.TimeoutExpired as exc:
+            return False, f'validator timeout after {timeout_s:g}s: {type(exc).__name__}'
+        if proc.returncode != 0:
+            details = '\n'.join(part.strip() for part in [proc.stdout or '', proc.stderr or ''] if part.strip())
+            details = details[:1200]
+            return False, details or f'validator exited with status {proc.returncode}'
+    return True, None
+
+
+def _validate_solver(solver_path: Path, validator_path: Path, smoke_vector: Sequence[int] | Sequence[Sequence[int]]) -> None:
+    smoke_vectors = _normalize_smoke_vectors(smoke_vector)
+    total = len(smoke_vectors)
+    if total == 0:
+        raise ValueError("at least one smoke vector is required")
+
+    timeout_s = _solver_validation_timeout_s()
+    for idx, one_vec in enumerate(smoke_vectors, start=1):
+        label = validator_path.name if total == 1 else f"{validator_path.name} [{idx}/{total}]"
+        print(f"[validate] {label} ...")
+        cmd = [
             PYTHON,
             str(validator_path),
             "--solver",
             str(solver_path),
             "--vector",
-            json.dumps(list(smoke_vector)),
+            json.dumps(list(one_vec)),
         ]
-    )
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        except subprocess.TimeoutExpired as exc:
+            out = exc.stdout or ""
+            err = exc.stderr or ""
+            if out:
+                print(out, end="" if out.endswith("\n") else "\n")
+            if err:
+                print(err, end="" if err.endswith("\n") else "\n", file=sys.stderr)
+            raise RuntimeError(
+                f"Validator timed out after {timeout_s:g}s for {solver_path}. "
+                "This usually means solve(vec) got stuck during smoke validation."
+            ) from exc
+        if proc.returncode != 0:
+            if proc.stdout:
+                print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n")
+            if proc.stderr:
+                print(proc.stderr, end="" if proc.stderr.endswith("\n") else "\n", file=sys.stderr)
+            raise subprocess.CalledProcessError(proc.returncode, cmd, output=proc.stdout, stderr=proc.stderr)
 
 
 def _ensure_llm_puzzles_on_path() -> None:
     lp_dir = ROOT / "llm-puzzles"
-    lp_dir_str = str(lp_dir)
-    if lp_dir_str not in sys.path:
-        sys.path.insert(0, lp_dir_str)
-
-    # Guard against accidentally importing an unrelated third-party/site-package
-    # named ``src``. The llm-puzzles adapters are expected to resolve from
-    # <repo>/llm-puzzles/src, but without an __init__.py that package can be
-    # shadowed by another regular package on sys.path. If a foreign ``src`` has
-    # already been imported, clear it so the next import resolves to the local
-    # llm-puzzles package we just prepended.
-    src_mod = sys.modules.get("src")
-    if src_mod is None:
-        return
-
-    src_file = getattr(src_mod, "__file__", None)
-    src_paths = [str(p) for p in getattr(src_mod, "__path__", [])]
-    if src_file and src_file.startswith(lp_dir_str):
-        return
-    if any(path.startswith(lp_dir_str) for path in src_paths):
-        return
-
-    for name in list(sys.modules):
-        if name == "src" or name.startswith("src."):
-            sys.modules.pop(name, None)
+    if str(lp_dir) not in sys.path:
+        sys.path.insert(0, str(lp_dir))
 
 
 def _legacy_kaggle_cli_submit_cmd(competition: str, submission_csv: Path, message: str) -> list[str]:
@@ -1375,14 +2209,25 @@ def _memory_env_for_codegen(models: str) -> dict[str, str]:
         env.setdefault("AGENTLAB_G4F_USE_ASYNC", os.getenv("AGENTLAB_G4F_USE_ASYNC", "1"))
         env.setdefault("AGENTLAB_G4F_REQUEST_TIMEOUT_S", os.getenv("AGENTLAB_G4F_REQUEST_TIMEOUT_S", "180"))
         env.setdefault("AGENTLAB_MAX_RESPONSE_CHARS", os.getenv("AGENTLAB_MAX_RESPONSE_CHARS", "0"))
-        env.setdefault("AGENTLAB_G4F_STOP_AT_PYTHON_FENCE", os.getenv("AGENTLAB_G4F_STOP_AT_PYTHON_FENCE", "1"))
+        env.setdefault("AGENTLAB_G4F_STOP_AT_PYTHON_FENCE", os.getenv("AGENTLAB_G4F_STOP_AT_PYTHON_FENCE", "0"))
         env.setdefault("AGENTLAB_ARTIFACT_SPILL_CHARS", os.getenv("AGENTLAB_ARTIFACT_SPILL_CHARS", "8000"))
         env.setdefault("AGENTLAB_HEAVY_IMPORTS", os.getenv("AGENTLAB_HEAVY_IMPORTS", "0"))
         env.setdefault("MALLOC_ARENA_MAX", os.getenv("MALLOC_ARENA_MAX", "2"))
     return env
 
 
-def _agent_model_cli_args(*, agent_models: str | None = None, planner_models: str | None = None, coder_models: str | None = None, fixer_models: str | None = None) -> list[str]:
+def _agent_model_cli_args(
+    *,
+    agent_models: str | None = None,
+    planner_models: str | None = None,
+    coder_models: str | None = None,
+    fixer_models: str | None = None,
+    search_mode: str | None = None,
+    plan_beam_width: int | None = None,
+    frontier_width: int | None = None,
+    archive_size: int | None = None,
+    refine_rounds: int | None = None,
+) -> list[str]:
     args: list[str] = []
     if agent_models:
         args.extend(["--agent-models", agent_models])
@@ -1392,6 +2237,16 @@ def _agent_model_cli_args(*, agent_models: str | None = None, planner_models: st
         args.extend(["--coder-models", coder_models])
     if fixer_models:
         args.extend(["--fixer-models", fixer_models])
+    if search_mode:
+        args.extend(["--search-mode", search_mode])
+    if plan_beam_width is not None:
+        args.extend(["--plan-beam-width", str(max(1, int(plan_beam_width)))])
+    if frontier_width is not None:
+        args.extend(["--frontier-width", str(max(1, int(frontier_width)))])
+    if archive_size is not None:
+        args.extend(["--archive-size", str(max(1, int(archive_size)))])
+    if refine_rounds is not None:
+        args.extend(["--refine-rounds", str(max(0, int(refine_rounds)))])
     return args
 
 
@@ -1407,10 +2262,16 @@ def _run_agent_laboratory(
     planner_models: str | None = None,
     coder_models: str | None = None,
     fixer_models: str | None = None,
+    search_mode: str | None = None,
+    plan_beam_width: int | None = None,
+    frontier_width: int | None = None,
+    archive_size: int | None = None,
+    refine_rounds: int | None = None,
     max_iters: int = 8,
     no_llm: bool = False,
     allow_baseline: bool = True,
     g4f_recovery_rounds: int | None = None,
+    baseline_patch_max_iters: int | None = None,
     g4f_recovery_max_iters: int | None = None,
     g4f_recovery_sleep: float | None = None,
     worker_no_kill_process_group: bool = False,
@@ -1420,8 +2281,15 @@ def _run_agent_laboratory(
     max_response_chars: int | None = None,
     g4f_request_timeout: float | None = None,
     g4f_stop_at_python_fence: Optional[bool] = None,
+    strict_codegen: bool = False,
+    attempt_archive_dir: Optional[Path] = None,
 ) -> None:
-    """Run AgentLaboratory perm_pipeline to generate/repair a solver."""
+    """Run AgentLaboratory perm_pipeline to generate/repair a solver.
+
+    strict_codegen is intentionally separate from allow_baseline: during
+    self-improvement a provider/backend failure must be treated as a failed
+    candidate, not as a valid baseline-sized improvement attempt.
+    """
 
     pipeline_script = ROOT / "AgentLaboratory" / "perm_pipeline" / "run_perm_pipeline.py"
     if not pipeline_script.exists():
@@ -1449,14 +2317,26 @@ def _run_agent_laboratory(
             planner_models=planner_models,
             coder_models=coder_models,
             fixer_models=fixer_models,
+            search_mode=search_mode,
+            plan_beam_width=plan_beam_width,
+            frontier_width=frontier_width,
+            archive_size=archive_size,
+            refine_rounds=refine_rounds,
         )
     )
 
-    # run_perm_pipeline.py already falls back to baseline unless --strict is used.
+    # Basic self-improvement scenario: fail loud on codegen/provider failure.
+    # Without --strict, run_perm_pipeline.py writes the baseline solver and exits 0,
+    # which makes the outer loop spend many rounds scoring identical candidates.
+    if strict_codegen:
+        cmd.append("--strict")
     if no_llm:
         cmd.append("--no-llm")
     if custom_prompts:
         cmd.extend(["--custom-prompts", str(custom_prompts)])
+    if attempt_archive_dir is not None:
+        attempt_archive_dir.mkdir(parents=True, exist_ok=True)
+        cmd.extend(["--attempt-archive-dir", str(attempt_archive_dir)])
 
     env = os.environ.copy()
     effective_codegen_env = _memory_env_for_codegen(llm)
@@ -1464,6 +2344,9 @@ def _run_agent_laboratory(
     if g4f_recovery_rounds is not None:
         env["AGENTLAB_G4F_RECOVERY_ROUNDS"] = str(max(0, int(g4f_recovery_rounds)))
         effective_codegen_env["AGENTLAB_G4F_RECOVERY_ROUNDS"] = env["AGENTLAB_G4F_RECOVERY_ROUNDS"]
+    if baseline_patch_max_iters is not None:
+        env["AGENTLAB_BASELINE_PATCH_MAX_ITERS"] = str(max(1, int(baseline_patch_max_iters)))
+        effective_codegen_env["AGENTLAB_BASELINE_PATCH_MAX_ITERS"] = env["AGENTLAB_BASELINE_PATCH_MAX_ITERS"]
     if g4f_recovery_max_iters is not None:
         env["AGENTLAB_G4F_RECOVERY_MAX_ITERS"] = str(max(1, int(g4f_recovery_max_iters)))
         effective_codegen_env["AGENTLAB_G4F_RECOVERY_MAX_ITERS"] = env["AGENTLAB_G4F_RECOVERY_MAX_ITERS"]
@@ -1495,6 +2378,635 @@ def _run_agent_laboratory(
     if effective_codegen_env:
         print("[agentlab] low-RAM env: " + ", ".join(f"{k}={effective_codegen_env[k]}" for k in sorted(effective_codegen_env.keys())))
     subprocess.check_call(cmd, cwd=str(ROOT), env=env)
+
+
+
+def _file_sha256(path: Optional[Path]) -> Optional[str]:
+    """Return a stable full-file SHA256 digest for guard/lineage metadata."""
+    if path is None or not path.exists() or not path.is_file():
+        return None
+    h = hashlib.sha256()
+    with path.open('rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _infer_submission_columns(submission_csv: Path) -> tuple[str, str]:
+    """Infer (id_column, move_column) from a submission-like CSV."""
+    _ensure_csv_field_size_limit()
+    with submission_csv.open(newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+    if not fieldnames:
+        raise ValueError(f'Could not read header from {submission_csv}')
+    id_field = fieldnames[0]
+    move_field: Optional[str] = None
+    for candidate in ('path', 'moves', 'solution'):
+        if candidate in fieldnames:
+            move_field = candidate
+            break
+    if move_field is None:
+        for name in fieldnames:
+            if str(name).strip().lower() not in {'id', 'initial_state_id'}:
+                move_field = name
+                break
+    if move_field is None:
+        raise ValueError(f'Could not infer moves column in {submission_csv}')
+    return id_field, move_field
+
+
+def _split_move_path(value: Any) -> list[str]:
+    """Split a Megaminx path using the actual dot-delimited format, with whitespace fallback."""
+    text = str(value or '').strip()
+    if not text or text.upper() == 'UNSOLVED':
+        return []
+    if '.' in text:
+        return [part for part in text.split('.') if part]
+    return [part for part in text.split() if part]
+
+
+def _submission_path_digest(submission_csv: Optional[Path]) -> Optional[str]:
+    """Hash normalized id/path rows so identical submissions cannot masquerade as new work."""
+    if submission_csv is None or not submission_csv.exists():
+        return None
+    id_field, move_field = _infer_submission_columns(submission_csv)
+    h = hashlib.sha256()
+    with submission_csv.open(newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rid = str(row.get(id_field, '')).strip()
+            path_value = str(row.get(move_field, '')).strip()
+            h.update(rid.encode('utf-8'))
+            h.update(b'\x1f')
+            h.update(path_value.encode('utf-8'))
+            h.update(b'\n')
+    return h.hexdigest()
+
+
+def _submission_guard_stats(submission_csv: Optional[Path]) -> dict[str, Any]:
+    """Return row/move stats used by self-improvement acceptance and run reports."""
+    out: dict[str, Any] = {
+        'exists': bool(submission_csv and submission_csv.exists()),
+        'row_count': 0,
+        'empty_rows': 0,
+        'unsolved_rows': 0,
+        'total_move_tokens': 0,
+        'mean_move_tokens': None,
+        'max_move_tokens': 0,
+        'digest': None,
+    }
+    if submission_csv is None or not submission_csv.exists():
+        return out
+    try:
+        id_field, move_field = _infer_submission_columns(submission_csv)
+        lengths: list[int] = []
+        with submission_csv.open(newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                value = str(row.get(move_field) or '').strip()
+                out['row_count'] += 1
+                if not value:
+                    out['empty_rows'] += 1
+                if value.upper() == 'UNSOLVED':
+                    out['unsolved_rows'] += 1
+                n = len(_split_move_path(value))
+                lengths.append(n)
+                out['total_move_tokens'] += n
+        if lengths:
+            out['mean_move_tokens'] = out['total_move_tokens'] / len(lengths)
+            out['max_move_tokens'] = max(lengths)
+        out['digest'] = _submission_path_digest(submission_csv)
+        out['id_column'] = id_field
+        out['move_column'] = move_field
+    except Exception as exc:
+        out['csv_error'] = f'{type(exc).__name__}: {exc}'
+    return out
+
+
+def _write_per_row_delta(
+    *,
+    baseline_csv: Optional[Path],
+    candidate_csv: Optional[Path],
+    out_csv: Path,
+    out_json: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Write per-row move-count deltas for candidate-vs-current-best acceptance debugging.
+
+    Delta is candidate_len - baseline_len, so negative values are improvements.
+    """
+    summary: dict[str, Any] = {
+        'baseline_csv': str(baseline_csv) if baseline_csv else None,
+        'candidate_csv': str(candidate_csv) if candidate_csv else None,
+        'delta_csv': str(out_csv),
+        'rows_compared': 0,
+        'improved_rows': 0,
+        'regressed_rows': 0,
+        'unchanged_rows': 0,
+        'total_saved_moves': 0,
+        'total_added_moves': 0,
+        'net_delta_moves': 0,
+        'ok': False,
+    }
+    if baseline_csv is None or candidate_csv is None or not baseline_csv.exists() or not candidate_csv.exists():
+        summary['error'] = 'missing baseline or candidate CSV'
+        return summary
+
+    base_id, base_move = _infer_submission_columns(baseline_csv)
+    cand_id, cand_move = _infer_submission_columns(candidate_csv)
+    baseline: dict[str, tuple[int, str]] = {}
+    candidate: dict[str, tuple[int, str]] = {}
+    with baseline_csv.open(newline='', encoding='utf-8') as f:
+        for row in csv.DictReader(f):
+            rid = str(row.get(base_id, '')).strip()
+            path_value = str(row.get(base_move, '')).strip()
+            baseline[rid] = (len(_split_move_path(path_value)), path_value)
+    with candidate_csv.open(newline='', encoding='utf-8') as f:
+        for row in csv.DictReader(f):
+            rid = str(row.get(cand_id, '')).strip()
+            path_value = str(row.get(cand_move, '')).strip()
+            candidate[rid] = (len(_split_move_path(path_value)), path_value)
+
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with out_csv.open('w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=['id', 'baseline_len', 'candidate_len', 'delta', 'status'])
+        writer.writeheader()
+        for rid in sorted(set(baseline) | set(candidate)):
+            b = baseline.get(rid)
+            c = candidate.get(rid)
+            if b is None or c is None:
+                status = 'missing_candidate' if c is None else 'missing_baseline'
+                delta = None
+                b_len = b[0] if b is not None else None
+                c_len = c[0] if c is not None else None
+            else:
+                b_len, c_len = b[0], c[0]
+                delta = c_len - b_len
+                summary['rows_compared'] += 1
+                summary['net_delta_moves'] += delta
+                if delta < 0:
+                    summary['improved_rows'] += 1
+                    summary['total_saved_moves'] += -delta
+                    status = 'improved'
+                elif delta > 0:
+                    summary['regressed_rows'] += 1
+                    summary['total_added_moves'] += delta
+                    status = 'regressed'
+                else:
+                    summary['unchanged_rows'] += 1
+                    status = 'unchanged'
+            writer.writerow({'id': rid, 'baseline_len': b_len, 'candidate_len': c_len, 'delta': delta, 'status': status})
+    summary['ok'] = True
+    if out_json is not None:
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        out_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+    return summary
+
+def _submission_path_score(submission_csv: Path) -> int:
+    stats = _submission_guard_stats(submission_csv)
+    if stats.get('csv_error'):
+        raise ValueError(f"Could not score submission {submission_csv}: {stats.get('csv_error')}")
+    return int(stats.get('total_move_tokens') or 0)
+
+
+def _score_solver_with_submission(
+    *,
+    spec: PipelineSpec,
+    solver_path: Path,
+    puzzles_csv: Path,
+    competition_format_slug: str,
+    vector_col_override: Optional[str] = None,
+    max_rows: Optional[int] = None,
+) -> int:
+    score, _ = _score_solver_with_submission_artifact(
+        spec=spec,
+        solver_path=solver_path,
+        puzzles_csv=puzzles_csv,
+        competition_format_slug=competition_format_slug,
+        vector_col_override=vector_col_override,
+        max_rows=max_rows,
+    )
+    return score
+
+
+def _score_solver_with_submission_artifact(
+    *,
+    spec: PipelineSpec,
+    solver_path: Path,
+    puzzles_csv: Path,
+    competition_format_slug: str,
+    vector_col_override: Optional[str] = None,
+    max_rows: Optional[int] = None,
+) -> tuple[int, Path]:
+    temp_csv = solver_path.parent / f'.score_{solver_path.stem}.csv'
+    _build_submission(
+        puzzles_csv=puzzles_csv,
+        out_csv=temp_csv,
+        competition_format_slug=competition_format_slug,
+        solver_path=solver_path,
+        spec=spec,
+        vector_col_override=vector_col_override,
+        max_rows=max_rows,
+        no_progress=True,
+    )
+    return _submission_path_score(temp_csv), temp_csv
+
+
+def _score_solver_with_optional_artifact(
+    *,
+    spec: PipelineSpec,
+    solver_path: Path,
+    puzzles_csv: Path,
+    competition_format_slug: str,
+    vector_col_override: Optional[str] = None,
+    max_rows: Optional[int] = None,
+) -> tuple[int, Optional[Path]]:
+    """Score a solver and return the submission artifact when available.
+
+    Normal production runs use the artifact-producing scorer. Some older unit tests
+    monkeypatch only _score_solver_with_submission, so this compatibility wrapper
+    falls back to that function when artifact generation is unavailable.
+    """
+    artifact_error: Optional[Exception] = None
+    try:
+        return _score_solver_with_submission_artifact(
+            spec=spec,
+            solver_path=solver_path,
+            puzzles_csv=puzzles_csv,
+            competition_format_slug=competition_format_slug,
+            vector_col_override=vector_col_override,
+            max_rows=max_rows,
+        )
+    except Exception as exc:
+        artifact_error = exc
+    try:
+        score = _score_solver_with_submission(
+            spec=spec,
+            solver_path=solver_path,
+            puzzles_csv=puzzles_csv,
+            competition_format_slug=competition_format_slug,
+            vector_col_override=vector_col_override,
+            max_rows=max_rows,
+        )
+        return score, None
+    except Exception:
+        if artifact_error is not None:
+            raise artifact_error
+        raise
+
+
+def _generate_solver_with_optional_improvement(
+    *,
+    spec: PipelineSpec,
+    out_path: Path,
+    prompt_file: Path,
+    custom_prompts: Optional[Path],
+    llm: str,
+    agent_models: str | None,
+    planner_models: str | None,
+    coder_models: str | None,
+    fixer_models: str | None,
+    search_mode: str | None,
+    plan_beam_width: int | None,
+    frontier_width: int | None,
+    archive_size: int | None,
+    refine_rounds: int | None,
+    max_iters: int,
+    allow_baseline: bool,
+    g4f_recovery_rounds: int | None,
+    baseline_patch_max_iters: int | None = None,
+    g4f_recovery_max_iters: int | None,
+    g4f_recovery_sleep: float | None,
+    worker_no_kill_process_group: bool,
+    print_generation: bool,
+    print_generation_max_chars: int | None,
+    g4f_async: Optional[bool],
+    max_response_chars: int | None,
+    g4f_request_timeout: float | None,
+    g4f_stop_at_python_fence: Optional[bool],
+    keep_improving: bool,
+    improvement_rounds: int,
+    puzzles_csv_for_score: Optional[Path],
+    competition_format_slug: str,
+    vector_col_override: Optional[str] = None,
+    max_rows: Optional[int] = None,
+    validated_round_hook: Optional[Callable[[int, Path], Optional[Dict[str, Any]]]] = None,
+    initial_baseline: Optional[Path] = None,
+    candidate_round_hook: Optional[Callable[[Dict[str, Any]], None]] = None,
+    self_improve_prompts: bool = False,
+    reject_identical_candidates: bool = True,
+    write_per_row_delta: bool = True,
+) -> dict[str, Any]:
+    smoke_vectors = _resolve_smoke_vectors(spec)
+    scoring_enabled = bool(keep_improving and puzzles_csv_for_score is not None)
+    rounds = max(1, int(improvement_rounds) if keep_improving else 1)
+    baseline_origin = initial_baseline or spec.baseline_solver
+    baseline_for_round = baseline_origin
+    best_score: Optional[int] = None
+    best_metric: Optional[dict[str, Any]] = None
+    best_submission_csv: Optional[Path] = None
+    best_solver_digest: Optional[str] = _file_sha256(baseline_origin)
+    best_submission_digest: Optional[str] = None
+    score_history: list[dict[str, Any]] = []
+    generation_failure_streak = 0
+    live_candidate_seen = False
+    try:
+        max_codegen_failures_before_live_candidate = int(os.getenv('SELF_IMPROVE_MAX_CODEGEN_FAILURES_BEFORE_LIVE', '3') or '3')
+    except Exception:
+        max_codegen_failures_before_live_candidate = 3
+
+    if scoring_enabled:
+        try:
+            best_score, best_submission_csv = _score_solver_with_optional_artifact(
+                spec=spec,
+                solver_path=baseline_origin,
+                puzzles_csv=puzzles_csv_for_score,
+                competition_format_slug=competition_format_slug,
+                vector_col_override=vector_col_override,
+                max_rows=max_rows,
+            )
+            best_submission_digest = _submission_path_digest(best_submission_csv)
+            best_metric = _adaptive_metric_from_round(local_score=best_score, round_result=None)
+            print(f'[improve] baseline local score = {best_score}', flush=True)
+        except Exception as e:
+            scoring_enabled = False
+            print(f'[improve] WARNING: could not score baseline locally; continuing without score-guided selection: {e}', flush=True)
+
+    best_candidate_path: Optional[Path] = None
+    best_round: Optional[int] = None
+    submitted_rounds: list[int] = []
+    prompt_evolution_history: list[dict[str, Any]] = []
+
+    for round_idx in range(1, rounds + 1):
+        candidate_path = out_path if (not keep_improving and round_idx == 1) else out_path.parent / f'{out_path.stem}.round{round_idx}{out_path.suffix}'
+        candidate_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f'[improve] round {round_idx}/{rounds}: baseline={baseline_for_round} -> candidate={candidate_path}', flush=True)
+
+        try:
+            prompt_file_for_round = prompt_file
+            custom_prompts_for_round = custom_prompts
+            round_archive_dir = out_path.parent / f'{out_path.stem}_candidate_archive' / f'round_{round_idx:04d}'
+            if self_improve_prompts:
+                prompt_bundle_dir = out_path.parent / f'{out_path.stem}_prompt_rounds'
+                prepared_prompt = _prepare_competition_self_improvement_prompt_bundle(
+                    spec=spec,
+                    base_prompt_file=prompt_file,
+                    base_custom_prompts=custom_prompts,
+                    baseline_solver=baseline_for_round,
+                    round_idx=round_idx,
+                    score_history=score_history,
+                    best_metric=best_metric,
+                    prompt_history=prompt_evolution_history,
+                    output_dir=prompt_bundle_dir,
+                )
+                if prepared_prompt is not None:
+                    prompt_file_for_round = Path(prepared_prompt['prompt_file'])
+                    custom_prompts_for_round = Path(prepared_prompt['custom_prompts_file']) if prepared_prompt.get('custom_prompts_file') else None
+                    meta = prepared_prompt.get('meta') if isinstance(prepared_prompt.get('meta'), dict) else None
+                    if meta is not None:
+                        prompt_evolution_history.append(meta)
+            _run_agent_laboratory(
+                prompt_file=prompt_file_for_round,
+                out_path=candidate_path,
+                validator=spec.validator,
+                baseline=baseline_for_round,
+                custom_prompts=custom_prompts_for_round,
+                llm=llm,
+                agent_models=agent_models,
+                planner_models=planner_models,
+                coder_models=coder_models,
+                fixer_models=fixer_models,
+                search_mode=search_mode,
+                plan_beam_width=plan_beam_width,
+                frontier_width=frontier_width,
+                archive_size=archive_size,
+                refine_rounds=refine_rounds,
+                max_iters=max_iters,
+                no_llm=False,
+                allow_baseline=allow_baseline,
+                g4f_recovery_rounds=g4f_recovery_rounds,
+                baseline_patch_max_iters=baseline_patch_max_iters,
+                g4f_recovery_max_iters=g4f_recovery_max_iters,
+                g4f_recovery_sleep=g4f_recovery_sleep,
+                worker_no_kill_process_group=worker_no_kill_process_group,
+                print_generation=print_generation,
+                print_generation_max_chars=print_generation_max_chars,
+                g4f_async=g4f_async,
+                max_response_chars=max_response_chars,
+                g4f_request_timeout=g4f_request_timeout,
+                g4f_stop_at_python_fence=g4f_stop_at_python_fence,
+                strict_codegen=bool(keep_improving or self_improve_prompts),
+                attempt_archive_dir=round_archive_dir if keep_improving else None,
+            )
+
+            candidate_solver_digest = _file_sha256(candidate_path)
+            if reject_identical_candidates and keep_improving and candidate_solver_digest and best_solver_digest and candidate_solver_digest == best_solver_digest:
+                generation_failure_streak += 1
+                rejection_reasons = ['no_novelty_identical_solver_pre_score']
+                score_history.append({
+                    'round': round_idx,
+                    'score': None,
+                    'metric': None,
+                    'accepted': False,
+                    'path': str(candidate_path),
+                    'candidate_solver_sha256': candidate_solver_digest,
+                    'baseline_solver_sha256': best_solver_digest,
+                    'rejection_reasons': rejection_reasons,
+                    'failure_kind': rejection_reasons[0],
+                    'candidate_archive_dir': str(round_archive_dir),
+                })
+                print(f'[improve] round {round_idx} rejected before scoring: candidate solver is byte-identical to current best.', flush=True)
+                if (not live_candidate_seen) and max_codegen_failures_before_live_candidate > 0 and generation_failure_streak >= max_codegen_failures_before_live_candidate:
+                    print(f'[improve] stopping early after {generation_failure_streak} consecutive codegen/no-novelty failures before any live candidate.', flush=True)
+                    break
+                continue
+
+            live_candidate_seen = True
+            generation_failure_streak = 0
+            _validate_solver(candidate_path, spec.validator, smoke_vectors)
+
+            round_hook_result: Optional[Dict[str, Any]] = None
+            if validated_round_hook is not None:
+                round_hook_result = validated_round_hook(round_idx, candidate_path)
+                if isinstance(round_hook_result, dict) and round_hook_result.get('submitted'):
+                    submitted_rounds.append(round_idx)
+
+            candidate_score: Optional[int] = None
+            candidate_submission_csv: Optional[Path] = None
+            candidate_submission_digest: Optional[str] = None
+            candidate_solver_digest = _file_sha256(candidate_path)
+            per_row_delta_summary: Optional[dict[str, Any]] = None
+            if scoring_enabled and puzzles_csv_for_score is not None:
+                candidate_score, candidate_submission_csv = _score_solver_with_optional_artifact(
+                    spec=spec,
+                    solver_path=candidate_path,
+                    puzzles_csv=puzzles_csv_for_score,
+                    competition_format_slug=competition_format_slug,
+                    vector_col_override=vector_col_override,
+                    max_rows=max_rows,
+                )
+                candidate_submission_digest = _submission_path_digest(candidate_submission_csv)
+                print(f'[improve] round {round_idx}: local score = {candidate_score}', flush=True)
+                if write_per_row_delta and best_submission_csv is not None and candidate_submission_csv is not None:
+                    delta_csv = candidate_path.parent / f'{candidate_path.stem}.round{round_idx}.per_row_delta.csv'
+                    delta_json = candidate_path.parent / f'{candidate_path.stem}.round{round_idx}.per_row_delta.summary.json'
+                    per_row_delta_summary = _write_per_row_delta(
+                        baseline_csv=best_submission_csv,
+                        candidate_csv=candidate_submission_csv,
+                        out_csv=delta_csv,
+                        out_json=delta_json,
+                    )
+                    if per_row_delta_summary.get('ok'):
+                        print(
+                            f"[improve] round {round_idx}: per-row delta improved={per_row_delta_summary.get('improved_rows')} "
+                            f"regressed={per_row_delta_summary.get('regressed_rows')} net_delta={per_row_delta_summary.get('net_delta_moves')}",
+                            flush=True,
+                        )
+
+            novelty_report = {
+                'reject_identical_candidates': bool(reject_identical_candidates),
+                'candidate_solver_sha256': candidate_solver_digest,
+                'baseline_solver_sha256': best_solver_digest,
+                'candidate_submission_digest': candidate_submission_digest,
+                'baseline_submission_digest': best_submission_digest,
+                'identical_solver': bool(candidate_solver_digest and best_solver_digest and candidate_solver_digest == best_solver_digest),
+                'identical_submission': bool(candidate_submission_digest and best_submission_digest and candidate_submission_digest == best_submission_digest),
+                'per_row_delta': per_row_delta_summary,
+            }
+
+            if candidate_round_hook is not None:
+                try:
+                    candidate_round_hook({
+                        'round': round_idx,
+                        'candidate_path': str(candidate_path),
+                        'candidate_score': candidate_score,
+                        'post_validation': round_hook_result,
+                        'baseline_path': str(baseline_for_round),
+                        'candidate_submission_csv': str(candidate_submission_csv) if candidate_submission_csv else None,
+                        'candidate_solver_sha256': candidate_solver_digest,
+                        'candidate_submission_digest': candidate_submission_digest,
+                        'novelty_report': novelty_report,
+                    })
+                except KeyboardInterrupt:
+                    raise
+                except Exception as hook_exc:
+                    print(f'[improve] WARNING: candidate_round_hook failed for round {round_idx}: {type(hook_exc).__name__}: {hook_exc}', flush=True)
+
+            candidate_metric = _adaptive_metric_from_round(local_score=candidate_score, round_result=round_hook_result)
+
+            accepted = False
+            rejection_reasons: list[str] = []
+            if reject_identical_candidates and keep_improving:
+                if novelty_report.get('identical_solver'):
+                    rejection_reasons.append('no_novelty_identical_solver')
+                if novelty_report.get('identical_submission'):
+                    rejection_reasons.append('no_novelty_identical_submission')
+                if per_row_delta_summary and per_row_delta_summary.get('ok') and int(per_row_delta_summary.get('improved_rows') or 0) <= 0:
+                    rejection_reasons.append('no_per_row_improvement')
+            if not keep_improving:
+                accepted = True
+            elif scoring_enabled:
+                accepted = _is_better_metric(best_metric, candidate_metric)
+            else:
+                accepted = not rejection_reasons
+            if rejection_reasons:
+                accepted = False
+
+            score_history.append({
+                'round': round_idx,
+                'score': candidate_score,
+                'metric': candidate_metric,
+                'accepted': accepted,
+                'path': str(candidate_path),
+                'post_validation': round_hook_result,
+                'novelty_report': novelty_report,
+                'rejection_reasons': rejection_reasons,
+                'failure_kind': rejection_reasons[0] if rejection_reasons else (None if accepted else 'score_not_improved'),
+                'candidate_archive_dir': str(round_archive_dir),
+            })
+
+            if accepted:
+                generation_failure_streak = 0
+                if candidate_path != out_path:
+                    shutil.copyfile(candidate_path, out_path)
+                baseline_for_round = out_path
+                best_candidate_path = out_path
+                best_round = round_idx
+                if scoring_enabled:
+                    best_score = candidate_score
+                    best_metric = candidate_metric
+                    best_submission_csv = candidate_submission_csv
+                    best_solver_digest = candidate_solver_digest
+                    best_submission_digest = candidate_submission_digest
+                    metric_source = (candidate_metric or {}).get('source')
+                    metric_value = (candidate_metric or {}).get('value')
+                    print(f'[improve] accepted round {round_idx} as new best {metric_source}={metric_value}.', flush=True)
+                elif keep_improving:
+                    print(f'[improve] accepted round {round_idx} as the latest validated solver.', flush=True)
+            elif scoring_enabled:
+                current_metric_source = (best_metric or {}).get('source')
+                current_metric_value = (best_metric or {}).get('value')
+                reason_text = ';'.join(rejection_reasons) if rejection_reasons else 'score_not_improved'
+                print(f'[improve] round {round_idx} rejected ({reason_text}); current best {current_metric_source}={current_metric_value}; keeping round {best_round} output and continuing.', flush=True)
+        except KeyboardInterrupt:
+            raise
+        except SystemExit as e:
+            if not keep_improving:
+                raise
+            score_history.append({
+                'round': round_idx,
+                'score': None,
+                'accepted': False,
+                'path': str(candidate_path),
+                'error': str(e),
+            })
+            print(f'[improve] round {round_idx} failed with SystemExit; continuing from best known solver: {e}', flush=True)
+            continue
+        except Exception as e:
+            if not keep_improving:
+                raise
+            generation_failure_streak += 1
+            score_history.append({
+                'round': round_idx,
+                'score': None,
+                'accepted': False,
+                'path': str(candidate_path),
+                'error': f'{type(e).__name__}: {e}',
+                'failure_kind': 'generation_or_validation_exception',
+                'candidate_archive_dir': str(round_archive_dir),
+            })
+            print(f'[improve] round {round_idx} failed; continuing from best known solver: {type(e).__name__}: {e}', flush=True)
+            if (not live_candidate_seen) and max_codegen_failures_before_live_candidate > 0 and generation_failure_streak >= max_codegen_failures_before_live_candidate:
+                print(f'[improve] stopping early after {generation_failure_streak} consecutive failures before any live candidate.', flush=True)
+                break
+            continue
+
+    if best_candidate_path is None:
+        shutil.copyfile(baseline_origin, out_path)
+        best_candidate_path = out_path
+
+    _write_prompt_evolution_history(out_path, prompt_evolution_history)
+
+    return {
+        'best_score': best_score,
+        'best_metric': best_metric,
+        'best_round': best_round,
+        'scoring_enabled': scoring_enabled,
+        'history': score_history,
+        'rounds_requested': rounds,
+        'submitted_rounds': submitted_rounds,
+        'selected_round_already_submitted': best_round in submitted_rounds if best_round is not None else False,
+        'initial_baseline': str(baseline_origin),
+        'best_solver_sha256': best_solver_digest,
+        'best_submission_digest': best_submission_digest,
+        'best_submission_csv': str(best_submission_csv) if best_submission_csv else None,
+        'strict_guards': {
+            'reject_identical_candidates': bool(reject_identical_candidates),
+            'write_per_row_delta': bool(write_per_row_delta),
+            'strict_codegen': bool(keep_improving or self_improve_prompts),
+            'max_codegen_failures_before_live_candidate': int(max_codegen_failures_before_live_candidate),
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1680,6 +3192,35 @@ def cmd_show_pipeline(args: argparse.Namespace) -> None:
         print(f"  Generate solver:  python pipeline_cli.py generate-solver --competition {spec.key} --out generated/solve_{spec.key}.py")
 
 
+def _normalize_explicit_baseline_path(spec: PipelineSpec, baseline_value: Optional[str], *, command_name: str) -> Optional[Path]:
+    if not baseline_value:
+        return None
+    explicit_baseline = Path(baseline_value).resolve()
+    if not explicit_baseline.exists():
+        raise SystemExit(f"Explicit --baseline file does not exist: {explicit_baseline}")
+
+    if explicit_baseline.suffix.lower() == '.csv':
+        print(
+            f"[baseline] WARNING: {command_name} received a CSV via --baseline ({explicit_baseline}). "
+            f"This flag expects a solver .py file, so the CSV override will be ignored and the default solver baseline "
+            f"{spec.baseline_solver} will be used for prompt grounding and fallback.",
+            flush=True,
+        )
+        return None
+
+    try:
+        _validate_solver(explicit_baseline, spec.validator, _resolve_smoke_vectors(spec))
+    except Exception as exc:
+        print(
+            f"[baseline] WARNING: explicit override {explicit_baseline} failed preflight ({exc}). "
+            f"Falling back to default baseline {spec.baseline_solver}.",
+            flush=True,
+        )
+        return None
+
+    return explicit_baseline
+
+
 def cmd_generate_solver(args: argparse.Namespace) -> None:
     spec = get_pipeline(args.competition) if args.competition else None
     if spec is None:
@@ -1687,40 +3228,102 @@ def cmd_generate_solver(args: argparse.Namespace) -> None:
             "Unknown --competition. Run `python pipeline_cli.py list-pipelines` to see supported pipelines."
         )
 
+    explicit_baseline = _normalize_explicit_baseline_path(spec, getattr(args, 'baseline', None), command_name='generate-solver')
+
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Select prompt bundle (can be overridden)
-    prompt_file = Path(args.prompt_file) if args.prompt_file else spec.prompt_file
-    if prompt_file is None:
-        raise SystemExit(f"No prompt_file configured for {spec.key}; pass --prompt-file.")
+    # Select prompt bundle (can be overridden, or switched via --prompt-variant)
+    prompt_file, custom_prompts = _resolve_prompt_bundle(spec, args)
+    if explicit_baseline is not None:
+        effective_baseline = explicit_baseline
+        adaptive_baseline_info = {
+            'enabled': False,
+            'uses_baseline': True,
+            'from_scratch': _prompt_bundle_requests_from_scratch(prompt_file, custom_prompts),
+            'supports_ranked_reuse': False,
+            'bundle_slug': _adaptive_baseline_bundle_slug(prompt_file, custom_prompts),
+            'effective_baseline': str(explicit_baseline),
+            'default_baseline': str(spec.baseline_solver),
+            'source': 'explicit_override',
+        }
+        print(f"[baseline] using explicit override: {explicit_baseline}", flush=True)
+    else:
+        effective_baseline, adaptive_baseline_info = _resolve_effective_baseline(spec, prompt_file, custom_prompts)
 
-    custom_prompts = Path(args.custom_prompts) if args.custom_prompts else spec.custom_prompts_file
+        if adaptive_baseline_info.get('enabled'):
+            if adaptive_baseline_info.get('adaptive_exists') and adaptive_baseline_info.get('adaptive_valid') is False:
+                print(
+                    f"[adaptive-baseline] ignoring invalid saved baseline {adaptive_baseline_info.get('adaptive_solver')}: "
+                    f"{adaptive_baseline_info.get('adaptive_invalid_reason')}",
+                    flush=True,
+                )
+            print(
+                f"[adaptive-baseline] using {adaptive_baseline_info.get('effective_baseline')} "
+                f"for bundle={adaptive_baseline_info.get('bundle_slug')}",
+                flush=True,
+            )
 
     if args.no_llm:
-        # Copy baseline
-        shutil.copyfile(spec.baseline_solver, out_path)
+        shutil.copyfile(effective_baseline, out_path)
         print(f"[generate-solver] --no-llm: copied baseline -> {out_path}")
-        _validate_solver(out_path, spec.validator, spec.smoke_vector or [0, 1])
+        _validate_solver(out_path, spec.validator, _resolve_smoke_vectors(spec))
         return
 
     _gpu_diag_hint(args.models)
 
-    _run_agent_laboratory(
-        prompt_file=prompt_file,
+    adaptive_updates: list[dict[str, Any]] = []
+
+    def _candidate_round_hook(payload: dict[str, Any]) -> None:
+        if not adaptive_baseline_info.get('enabled'):
+            return
+        solver_candidate = Path(str(payload['candidate_path']))
+        novelty = payload.get('novelty_report') if isinstance(payload.get('novelty_report'), dict) else {}
+        if novelty.get('identical_solver') or novelty.get('identical_submission'):
+            print('[adaptive-baseline] not promoting: identical solver/submission fingerprint', flush=True)
+            return
+        delta = novelty.get('per_row_delta') if isinstance(novelty.get('per_row_delta'), dict) else {}
+        if delta.get('ok') and int(delta.get('improved_rows') or 0) <= 0:
+            print('[adaptive-baseline] not promoting: no per-row improvement', flush=True)
+            return
+        manifest = _persist_adaptive_baseline(
+            spec=spec,
+            prompt_file=prompt_file,
+            custom_prompts=custom_prompts,
+            solver_path=solver_candidate,
+            round_idx=int(payload['round']),
+            local_score=payload.get('candidate_score'),
+            round_result=payload.get('post_validation'),
+        )
+        if manifest is not None:
+            adaptive_updates.append(manifest)
+            metric = manifest.get('selection_metric') if isinstance(manifest.get('selection_metric'), dict) else {}
+            print(
+                f"[adaptive-baseline] promoted round {manifest.get('round')} -> {manifest.get('solver_path')} "
+                f"via {metric.get('source')}={metric.get('value')}",
+                flush=True,
+            )
+
+    puzzles_for_score = _resolve_default_puzzles(spec) if args.keep_improving else None
+    result = _generate_solver_with_optional_improvement(
+        spec=spec,
         out_path=out_path,
-        validator=spec.validator,
-        baseline=spec.baseline_solver,
+        prompt_file=prompt_file,
         custom_prompts=custom_prompts,
         llm=args.models,
         agent_models=args.agent_models,
         planner_models=args.planner_models,
         coder_models=args.coder_models,
         fixer_models=args.fixer_models,
+        search_mode=args.search_mode,
+        plan_beam_width=args.plan_beam_width,
+        frontier_width=args.frontier_width,
+        archive_size=args.archive_size,
+        refine_rounds=args.refine_rounds,
         max_iters=args.max_iters,
-        no_llm=False,
         allow_baseline=args.allow_baseline,
         g4f_recovery_rounds=args.g4f_recovery_rounds,
+        baseline_patch_max_iters=args.baseline_patch_max_iters,
         g4f_recovery_max_iters=args.g4f_recovery_max_iters,
         g4f_recovery_sleep=args.g4f_recovery_sleep,
         worker_no_kill_process_group=args.worker_no_kill_process_group,
@@ -1730,9 +3333,25 @@ def cmd_generate_solver(args: argparse.Namespace) -> None:
         max_response_chars=args.max_response_chars,
         g4f_request_timeout=args.g4f_request_timeout,
         g4f_stop_at_python_fence=args.g4f_stop_at_python_fence,
+        keep_improving=args.keep_improving,
+        improvement_rounds=args.improvement_rounds,
+        puzzles_csv_for_score=puzzles_for_score,
+        competition_format_slug=spec.format_slug,
+        initial_baseline=effective_baseline,
+        candidate_round_hook=_candidate_round_hook if adaptive_baseline_info.get('enabled') else None,
+        self_improve_prompts=getattr(args, 'self_improve_prompts', False),
+        reject_identical_candidates=getattr(args, 'reject_identical_candidates', True),
+        write_per_row_delta=getattr(args, 'write_per_row_delta', True),
     )
-
-    _validate_solver(out_path, spec.validator, spec.smoke_vector or [0, 1])
+    if args.keep_improving:
+        print(f"[improve] best_round={result.get('best_round')} best_score={result.get('best_score')}", flush=True)
+    if adaptive_updates:
+        latest_metric = adaptive_updates[-1].get('selection_metric') if isinstance(adaptive_updates[-1].get('selection_metric'), dict) else {}
+        print(
+            f"[adaptive-baseline] saved reusable baseline {adaptive_updates[-1].get('solver_path')} "
+            f"with {latest_metric.get('source')}={latest_metric.get('value')}",
+            flush=True,
+        )
 
 
 def cmd_build_submission(args: argparse.Namespace) -> None:
@@ -1767,6 +3386,8 @@ def cmd_build_submission(args: argparse.Namespace) -> None:
     except Exception:
         sample_for_log = None
 
+    allowed_moves = _load_allowed_moves_from_validator(spec.validator)
+
     try:
         if candidate_out.exists():
             candidate_out.unlink()
@@ -1787,7 +3408,6 @@ def cmd_build_submission(args: argparse.Namespace) -> None:
         report["stages"]["build_submission"]["seconds"] = report["stages"]["build_submission"]["end"] - report["stages"]["build_submission"]["start"]
         _stage_done("build submission", t2)
 
-        allowed_moves = _load_allowed_moves_from_validator(spec.validator)
         if allowed_moves:
             tmc = _stage("content check")
             report["stages"]["content_check"] = {"start": time.time()}
@@ -1936,6 +3556,8 @@ def cmd_run(args: argparse.Namespace) -> None:
             f"Unknown competition/pipeline '{args.competition}'. Run `python pipeline_cli.py list-pipelines`."
         )
 
+    explicit_baseline = _normalize_explicit_baseline_path(spec, getattr(args, 'baseline', None), command_name='run')
+
     generated_dir = ROOT / "generated"
     generated_dir.mkdir(exist_ok=True)
 
@@ -1966,7 +3588,22 @@ def cmd_run(args: argparse.Namespace) -> None:
             "planner_models": args.planner_models,
             "coder_models": args.coder_models,
             "fixer_models": args.fixer_models,
+            "search_mode": args.search_mode,
+            "plan_beam_width": args.plan_beam_width,
+            "frontier_width": args.frontier_width,
+            "archive_size": args.archive_size,
+            "refine_rounds": args.refine_rounds,
             "max_iters": args.max_iters,
+            "print_generation": bool(args.print_generation),
+            "print_generation_max_chars": args.print_generation_max_chars,
+            "g4f_async": args.g4f_async,
+            "max_response_chars": args.max_response_chars,
+            "g4f_request_timeout": args.g4f_request_timeout,
+            "g4f_stop_at_python_fence": args.g4f_stop_at_python_fence,
+            "keep_improving": bool(getattr(args, 'keep_improving', False)),
+            "improvement_rounds": getattr(args, 'improvement_rounds', 1),
+            "baseline_patch_max_iters": getattr(args, 'baseline_patch_max_iters', None),
+            "g4f_recovery_max_iters": getattr(args, 'g4f_recovery_max_iters', None),
             "vector_col": args.vector_col,
             "max_rows": args.max_rows,
             "submit": bool(args.submit),
@@ -1982,34 +3619,215 @@ def cmd_run(args: argparse.Namespace) -> None:
     except Exception:
         sample_for_log = None
 
+    if args.submit and not args.message:
+        raise SystemExit("--submit requires --message")
+
+    submit_availability = {
+        'enabled': False,
+        'source': 'submit_disabled',
+        'credentials_path': None,
+    }
+    if args.submit:
+        submit_availability = _resolve_kaggle_submit_availability(
+            kaggle_json=args.kaggle_json,
+            kaggle_config_dir=args.kaggle_config_dir,
+        )
+        if submit_availability.get('enabled'):
+            source = submit_availability.get('source')
+            cred_path = submit_availability.get('credentials_path')
+            suffix = f" ({cred_path})" if cred_path else ''
+            recovered_from = submit_availability.get('recovered_from_missing_explicit')
+            print(f"[kaggle] live submit enabled via {source}{suffix}", flush=True)
+            if recovered_from:
+                print(
+                    f"[kaggle] recovered missing credentials path {recovered_from} using {cred_path}",
+                    flush=True,
+                )
+        else:
+            reason = str(submit_availability.get('reason') or 'Kaggle live submit is unavailable.')
+            if submit_availability.get('nonfatal'):
+                print(f"[kaggle] WARNING: {reason}", flush=True)
+            else:
+                raise SystemExit(reason)
+    effective_kaggle_json = (
+        str(submit_availability.get('credentials_path'))
+        if submit_availability.get('enabled') and submit_availability.get('credentials_path')
+        else args.kaggle_json
+    )
+
+    improvement_result: dict[str, Any] | None = None
+    per_round_submit_reports: list[dict[str, Any]] = []
+    do_schema_check = (args.submit or args.schema_check) and (not args.no_schema_check)
+    allowed_moves = _load_allowed_moves_from_validator(spec.validator)
+    move_column, joiner = _resolve_submission_move_column(args.format or spec.competition)
+    schema_sample: Path | None = None
+    if do_schema_check:
+        try:
+            schema_sample = _resolve_sample_submission(spec)
+        except Exception:
+            schema_sample = None
+    submit_during_improvement = bool(args.submit and submit_availability.get('enabled') and getattr(args, 'keep_improving', False) and not args.no_llm)
+    callback_state = {'schema_warning_emitted': False}
+    prompt_file: Path | None = None
+    custom_prompts: Path | None = None
+    effective_baseline = explicit_baseline or spec.baseline_solver
+    adaptive_baseline_info: dict[str, Any] = {'enabled': False}
+    adaptive_updates: list[dict[str, Any]] = []
+
+    if not args.no_llm:
+        prompt_file, custom_prompts = _resolve_prompt_bundle(spec, args)
+        if explicit_baseline is not None:
+            adaptive_baseline_info = {
+                'enabled': False,
+                'uses_baseline': True,
+                'from_scratch': _prompt_bundle_requests_from_scratch(prompt_file, custom_prompts),
+                'supports_ranked_reuse': False,
+                'bundle_slug': _adaptive_baseline_bundle_slug(prompt_file, custom_prompts),
+                'effective_baseline': str(explicit_baseline),
+                'default_baseline': str(spec.baseline_solver),
+                'source': 'explicit_override',
+            }
+            print(f"[baseline] using explicit override: {explicit_baseline}", flush=True)
+        else:
+            effective_baseline, adaptive_baseline_info = _resolve_effective_baseline(spec, prompt_file, custom_prompts)
+            if adaptive_baseline_info.get('enabled'):
+                print(
+                    f"[adaptive-baseline] using {adaptive_baseline_info.get('effective_baseline')} "
+                    f"for bundle={adaptive_baseline_info.get('bundle_slug')}",
+                    flush=True,
+                )
+        report['adaptive_baseline'] = adaptive_baseline_info
+
+    def _candidate_round_hook(payload: dict[str, Any]) -> None:
+        if not adaptive_baseline_info.get('enabled') or prompt_file is None:
+            return
+        novelty = payload.get('novelty_report') if isinstance(payload.get('novelty_report'), dict) else {}
+        if novelty.get('identical_solver') or novelty.get('identical_submission'):
+            print('[adaptive-baseline] not promoting: identical solver/submission fingerprint', flush=True)
+            return
+        delta = novelty.get('per_row_delta') if isinstance(novelty.get('per_row_delta'), dict) else {}
+        if delta.get('ok') and int(delta.get('improved_rows') or 0) <= 0:
+            print('[adaptive-baseline] not promoting: no per-row improvement', flush=True)
+            return
+        manifest = _persist_adaptive_baseline(
+            spec=spec,
+            prompt_file=prompt_file,
+            custom_prompts=custom_prompts,
+            solver_path=Path(str(payload['candidate_path'])),
+            round_idx=int(payload['round']),
+            local_score=payload.get('candidate_score'),
+            round_result=payload.get('post_validation'),
+        )
+        if manifest is not None:
+            adaptive_updates.append(manifest)
+            metric = manifest.get('selection_metric') if isinstance(manifest.get('selection_metric'), dict) else {}
+            print(
+                f"[adaptive-baseline] promoted round {manifest.get('round')} -> {manifest.get('solver_path')} "
+                f"via {metric.get('source')}={metric.get('value')}",
+                flush=True,
+            )
+
+    def _validated_round_hook(round_idx: int, candidate_solver_path: Path) -> dict[str, Any]:
+        round_submission_csv = _round_submission_output_path(out_csv, round_idx)
+        if round_submission_csv.exists():
+            round_submission_csv.unlink()
+
+        print(f"[improve] round {round_idx}: build submission before next iteration", flush=True)
+        _build_submission(
+            puzzles_csv=puzzles_csv,
+            out_csv=round_submission_csv,
+            competition_format_slug=args.format or spec.format_slug,
+            solver_path=candidate_solver_path,
+            spec=spec,
+            vector_col_override=args.vector_col,
+            max_rows=args.max_rows,
+            no_progress=True,
+        )
+
+        round_result: dict[str, Any] = {
+            'round': round_idx,
+            'submission_csv': str(round_submission_csv),
+            'submitted': False,
+        }
+
+        if allowed_moves:
+            round_result['move_validation'] = _validate_submission_move_tokens(
+                submission_csv=round_submission_csv,
+                move_column=move_column,
+                allowed_moves=allowed_moves,
+                joiner=joiner,
+            )
+
+        if do_schema_check:
+            if schema_sample is None:
+                if not callback_state['schema_warning_emitted']:
+                    print(f"[schema] WARNING: no bundled sample_submission.csv found for '{spec.key}'. Skipping.")
+                    callback_state['schema_warning_emitted'] = True
+            else:
+                round_result['schema'] = {
+                    'sample': str(schema_sample),
+                    **_validate_submission_schema(
+                        submission_csv=round_submission_csv,
+                        sample_submission_csv=schema_sample,
+                        check_ids=(not args.no_schema_check_ids),
+                    ),
+                }
+
+        if submit_during_improvement:
+            submit_comp = args.submit_competition or spec.competition
+            _improvement_rounds = max(1, int(getattr(args, 'improvement_rounds', 1)))
+            round_message = args.message if _improvement_rounds <= 1 else f"{args.message} [round {round_idx}/{_improvement_rounds}]"
+            print(f"[improve] round {round_idx}: submit to Kaggle before next iteration", flush=True)
+            try:
+                round_result['kaggle_submit'] = _kaggle_submit(
+                    competition=submit_comp,
+                    submission_csv=round_submission_csv,
+                    message=round_message,
+                    kaggle_json=effective_kaggle_json,
+                    submit_via=args.submit_via,
+                    kaggle_config_dir=args.kaggle_config_dir,
+                )
+                round_result['submitted'] = bool(round_result['kaggle_submit'].get('status') or round_result['kaggle_submit'].get('submitted', True))
+                if round_result['submitted']:
+                    per_round_submit_reports.append(round_result)
+            except KeyboardInterrupt:
+                raise
+            except SystemExit as submit_exc:
+                round_result['kaggle_submit'] = _nonfatal_kaggle_submit_report(submit_exc, submit_comp)
+                print(f"[kaggle] WARNING: round {round_idx} live submit failed; keeping validated solver and continuing: {submit_exc}", flush=True)
+            except Exception as submit_exc:
+                round_result['kaggle_submit'] = _nonfatal_kaggle_submit_report(submit_exc, submit_comp)
+                print(f"[kaggle] WARNING: round {round_idx} live submit failed; keeping validated solver and continuing: {type(submit_exc).__name__}: {submit_exc}", flush=True)
+
+        return round_result
+
     try:
         t0 = _stage("generate solver")
         report["stages"]["generate_solver"] = {"start": time.time()}
         if args.no_llm:
-            shutil.copyfile(spec.baseline_solver, solver_path)
+            shutil.copyfile(effective_baseline, solver_path)
             print(f"[run] --no-llm: copied baseline solver -> {solver_path}")
         else:
-            prompt_file = Path(args.prompt_file) if args.prompt_file else spec.prompt_file
-            if prompt_file is None:
-                raise SystemExit(f"No prompt_file configured for {spec.key}; pass --prompt-file.")
-
-            custom_prompts = Path(args.custom_prompts) if args.custom_prompts else spec.custom_prompts_file
-
-            _run_agent_laboratory(
-                prompt_file=prompt_file,
+            assert prompt_file is not None
+            improvement_result = _generate_solver_with_optional_improvement(
+                spec=spec,
                 out_path=solver_path,
-                validator=spec.validator,
-                baseline=spec.baseline_solver,
+                prompt_file=prompt_file,
                 custom_prompts=custom_prompts,
                 llm=args.models,
                 agent_models=args.agent_models,
                 planner_models=args.planner_models,
                 coder_models=args.coder_models,
                 fixer_models=args.fixer_models,
+                search_mode=args.search_mode,
+                plan_beam_width=args.plan_beam_width,
+                frontier_width=args.frontier_width,
+                archive_size=args.archive_size,
+                refine_rounds=args.refine_rounds,
                 max_iters=args.max_iters,
-                no_llm=False,
                 allow_baseline=args.allow_baseline,
                 g4f_recovery_rounds=args.g4f_recovery_rounds,
+                baseline_patch_max_iters=args.baseline_patch_max_iters,
                 g4f_recovery_max_iters=args.g4f_recovery_max_iters,
                 g4f_recovery_sleep=args.g4f_recovery_sleep,
                 worker_no_kill_process_group=args.worker_no_kill_process_group,
@@ -2019,16 +3837,33 @@ def cmd_run(args: argparse.Namespace) -> None:
                 max_response_chars=args.max_response_chars,
                 g4f_request_timeout=args.g4f_request_timeout,
                 g4f_stop_at_python_fence=args.g4f_stop_at_python_fence,
+                keep_improving=getattr(args, 'keep_improving', False),
+                improvement_rounds=getattr(args, 'improvement_rounds', 1),
+                puzzles_csv_for_score=puzzles_csv if getattr(args, 'keep_improving', False) else None,
+                competition_format_slug=args.format or spec.format_slug,
+                vector_col_override=args.vector_col,
+                max_rows=args.max_rows,
+                validated_round_hook=_validated_round_hook if submit_during_improvement else None,
+                initial_baseline=effective_baseline,
+                candidate_round_hook=_candidate_round_hook if adaptive_baseline_info.get('enabled') else None,
+                self_improve_prompts=getattr(args, 'self_improve_prompts', False),
+                reject_identical_candidates=getattr(args, 'reject_identical_candidates', True),
+                write_per_row_delta=getattr(args, 'write_per_row_delta', True),
             )
+            report['stages']['generate_solver']['improvement'] = improvement_result
+            if per_round_submit_reports:
+                report['round_kaggle_submissions'] = per_round_submit_reports
+            if adaptive_updates:
+                report['adaptive_baseline_updates'] = adaptive_updates
 
         report["stages"]["generate_solver"]["end"] = time.time()
         report["stages"]["generate_solver"]["seconds"] = report["stages"]["generate_solver"]["end"] - report["stages"]["generate_solver"]["start"]
         _stage_done("generate solver", t0)
 
-        # Smoke validate
+        # Smoke validate (generation helper already validated in-loop; keep a final explicit check for the selected artifact)
         t1 = _stage("validate solver")
         report["stages"]["validate_solver"] = {"start": time.time()}
-        _validate_solver(solver_path, spec.validator, spec.smoke_vector or [0, 1])
+        _validate_solver(solver_path, spec.validator, _resolve_smoke_vectors(spec))
         report["stages"]["validate_solver"]["end"] = time.time()
         report["stages"]["validate_solver"]["seconds"] = report["stages"]["validate_solver"]["end"] - report["stages"]["validate_solver"]["start"]
         _stage_done("validate solver", t1)
@@ -2070,20 +3905,18 @@ def cmd_run(args: argparse.Namespace) -> None:
             _stage_done("content check", tmc)
 
         # Schema check (auto before submit; optional otherwise)
-        do_schema_check = (args.submit or args.schema_check) and (not args.no_schema_check)
         if do_schema_check:
-            sample = _resolve_sample_submission(spec)
-            if sample is None:
+            if schema_sample is None:
                 print(f"[schema] WARNING: no bundled sample_submission.csv found for '{spec.key}'. Skipping.")
             else:
                 tsc = _stage("schema check")
                 report["stages"]["schema_check"] = {"start": time.time()}
                 stats = _validate_submission_schema(
                     submission_csv=candidate_out,
-                    sample_submission_csv=sample,
+                    sample_submission_csv=schema_sample,
                     check_ids=(not args.no_schema_check_ids),
                 )
-                report["schema"] = {"sample": str(sample), **stats}
+                report["schema"] = {"sample": str(schema_sample), **stats}
                 report["stages"]["schema_check"]["end"] = time.time()
                 report["stages"]["schema_check"]["seconds"] = report["stages"]["schema_check"]["end"] - report["stages"]["schema_check"]["start"]
                 _stage_done("schema check", tsc)
@@ -2092,24 +3925,52 @@ def cmd_run(args: argparse.Namespace) -> None:
 
         # Optionally submit to Kaggle
         if args.submit:
-            if not args.message:
-                raise SystemExit("--submit requires --message")
-
-            t3 = _stage("submit to Kaggle")
-            report["stages"]["submit_kaggle"] = {"start": time.time()}
-            submit_comp = args.submit_competition or spec.competition
-            kaggle_submit_report = _kaggle_submit(
-                competition=submit_comp,
-                submission_csv=out_csv,
-                message=args.message,
-                kaggle_json=args.kaggle_json,
-                submit_via=args.submit_via,
-                kaggle_config_dir=args.kaggle_config_dir,
-            )
-            report["kaggle_submit"] = kaggle_submit_report
-            report["stages"]["submit_kaggle"]["end"] = time.time()
-            report["stages"]["submit_kaggle"]["seconds"] = report["stages"]["submit_kaggle"]["end"] - report["stages"]["submit_kaggle"]["start"]
-            _stage_done("submit to Kaggle", t3)
+            if not submit_availability.get('enabled'):
+                report["kaggle_submit"] = {
+                    "mode": "skipped",
+                    "submitted": False,
+                    **submit_availability,
+                }
+                print(f"[kaggle] skipping final live submit: {submit_availability.get('reason')}", flush=True)
+                if getattr(args, 'require_submit_success', True):
+                    raise RuntimeError(f"Kaggle submit was required but unavailable: {submit_availability.get('reason')}")
+            elif submit_during_improvement and improvement_result is not None and improvement_result.get('selected_round_already_submitted'):
+                report["kaggle_submit"] = {
+                    "mode": "already_submitted_in_round",
+                    "selected_round": improvement_result.get('best_round'),
+                    "submitted_rounds": improvement_result.get('submitted_rounds', []),
+                }
+                print(
+                    f"[kaggle] final selected solver was already submitted during improvement round {improvement_result.get('best_round')}; skipping duplicate final submit.",
+                    flush=True,
+                )
+            else:
+                t3 = _stage("submit to Kaggle")
+                report["stages"]["submit_kaggle"] = {"start": time.time()}
+                submit_comp = args.submit_competition or spec.competition
+                try:
+                    kaggle_submit_report = _kaggle_submit(
+                        competition=submit_comp,
+                        submission_csv=out_csv,
+                        message=args.message,
+                        kaggle_json=effective_kaggle_json,
+                        submit_via=args.submit_via,
+                        kaggle_config_dir=args.kaggle_config_dir,
+                    )
+                except KeyboardInterrupt:
+                    raise
+                except SystemExit as submit_exc:
+                    kaggle_submit_report = _nonfatal_kaggle_submit_report(submit_exc, submit_comp)
+                    print(f"[kaggle] WARNING: final live submit failed non-fatally: {submit_exc}", flush=True)
+                except Exception as submit_exc:
+                    kaggle_submit_report = _nonfatal_kaggle_submit_report(submit_exc, submit_comp)
+                    print(f"[kaggle] WARNING: final live submit failed non-fatally: {type(submit_exc).__name__}: {submit_exc}", flush=True)
+                report["kaggle_submit"] = kaggle_submit_report
+                report["stages"]["submit_kaggle"]["end"] = time.time()
+                report["stages"]["submit_kaggle"]["seconds"] = report["stages"]["submit_kaggle"]["end"] - report["stages"]["submit_kaggle"]["start"]
+                _stage_done("submit to Kaggle", t3)
+                if getattr(args, 'require_submit_success', True) and not bool(kaggle_submit_report.get('submitted') or kaggle_submit_report.get('status')):
+                    raise RuntimeError(f"Kaggle submit was required but not confirmed: {kaggle_submit_report.get('error') or kaggle_submit_report}")
 
         report["status"] = "ok"
         print("[run] Done.")
@@ -2173,7 +4034,7 @@ def cmd_selftest(_: argparse.Namespace) -> None:
         shutil.copyfile(spec.baseline_solver, solver_path)
 
         # Validate on smoke vector
-        _validate_solver(solver_path, spec.validator, spec.smoke_vector or [0, 1])
+        _validate_solver(solver_path, spec.validator, _resolve_smoke_vectors(spec))
 
         # Build a tiny puzzles.csv depending on pipeline
         puzzles_csv = tmp / f"{spec.key}_puzzles.csv"
@@ -2186,11 +4047,11 @@ def cmd_selftest(_: argparse.Namespace) -> None:
                 w.writeheader()
                 w.writerow({"id": "0", "n": "5", "permutation": "3,0,1,4,2"})
         elif spec.key == "cayleypy-pancake":
-            # initial_state_id,initial_state,state_size
+            # id,n,permutation
             with puzzles_csv.open("w", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=["initial_state_id", "initial_state", "state_size"])
+                w = csv.DictWriter(f, fieldnames=["id", "n", "permutation"])
                 w.writeheader()
-                w.writerow({"initial_state_id": "0", "initial_state": "3,1,2,0", "state_size": "4"})
+                w.writerow({"id": "0", "n": "4", "permutation": "3,1,2,0"})
         else:
             # generic vector column
             with puzzles_csv.open("w", newline="") as f:
@@ -2230,6 +4091,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--competition", required=True, help="Competition slug / pipeline key")
     sp.add_argument("--out", required=True, help="Output path for generated solver")
     sp.add_argument("--prompt-file", default=None, help="Override user prompt file")
+    sp.add_argument("--prompt-variant", default=None, choices=["regular", "improved", "dataset_adapted", "structured", "heuristic_boosted", "master_hybrid", "neighbour_model_hybrid", "score_guarded", "algorithmic_population", "portfolio_orchestrated", "hard_row_routed", "exact_score_population", "strict_self_improvement", "failure_aware_self_improvement"], help="Select a competition prompt bundle variant when available")
     sp.add_argument("--custom-prompts", default=None, help="Override AgentLaboratory custom prompts JSON")
     sp.add_argument(
         "--models",
@@ -2238,16 +4100,23 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Comma-separated model list (passed to AgentLaboratory --models). "
             "Bare names use g4f backend (remote providers). "
-            "To use local GPU inference, pass items like 'local:<hf_model_id>'."
+            "You can also pass explicit backends like 'local:<hf_model_id>', 'ollama:<model>', 'vllm:<model>', "
+            "'lmstudio:<model>', 'g4fapi:<model>', or plain g4f model names like 'gpt-4o-mini'."
         ),
     )
     sp.add_argument("--llm", dest="models", default=None, help=argparse.SUPPRESS)
-    sp.add_argument("--agent-models", default=None, help="Optional per-agent override mapping for AgentLaboratory, e.g. 'planner=gpt-4;coder=local:Qwen/Qwen2.5-Coder-1.5B;fixer=gpt-4o-mini'.")
+    sp.add_argument("--agent-models", default=None, help="Optional per-agent override mapping for AgentLaboratory, e.g. 'planner=claude-3.5-sonnet;coder=deepseek-chat,qwen2.5-coder;fixer=gpt-4o-mini'.")
     sp.add_argument("--planner-models", default=None, help="Optional model list override for the planner agent.")
     sp.add_argument("--coder-models", default=None, help="Optional model list override for the coder agent.")
     sp.add_argument("--fixer-models", default=None, help="Optional model list override for the fixer agent.")
-    sp.add_argument("--max-iters", type=int, default=8)
+    sp.add_argument("--search-mode", default="hybrid", choices=["classic", "hybrid"], help="classic = single-plan linear search; hybrid = multi-plan frontier search with experiment-memory refinement.")
+    sp.add_argument("--plan-beam-width", type=int, default=3, help="Planner beam width in hybrid mode.")
+    sp.add_argument("--frontier-width", type=int, default=6, help="Planner/coder frontier width per hybrid round.")
+    sp.add_argument("--archive-size", type=int, default=6, help="How many failed attempts to retain as hybrid experiment memory.")
+    sp.add_argument("--refine-rounds", type=int, default=1, help="How many planner refinement rounds to run in hybrid mode.")
+    sp.add_argument("--max-iters", type=int, default=100000)
     sp.add_argument("--g4f-recovery-rounds", type=int, default=None, help="Extra recovery rounds before offline fallback (forwarded to AgentLaboratory).")
+    sp.add_argument("--baseline-patch-max-iters", type=int, default=None, help="Optional fixer iterations for the baseline-patcher stage (forwarded as AGENTLAB_BASELINE_PATCH_MAX_ITERS).")
     sp.add_argument("--g4f-recovery-max-iters", type=int, default=None, help="Fixer iterations per recovery round (forwarded to AgentLaboratory).")
     sp.add_argument("--g4f-recovery-sleep", type=float, default=None, help="Cooldown in seconds before each recovery round (forwarded to AgentLaboratory).")
     sp.add_argument("--worker-no-kill-process-group", action="store_true", help="Do not hard-kill the entire worker process group on timeout; only terminate the worker process itself.")
@@ -2260,7 +4129,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--g4f-stop-at-python-fence", dest="g4f_stop_at_python_fence", action="store_true", help="Trim g4f output after the first complete ```python``` fence.")
     sp.add_argument("--no-g4f-stop-at-python-fence", dest="g4f_stop_at_python_fence", action="store_false", help="Do not trim g4f output at the first python fence.")
     sp.set_defaults(g4f_async=None, g4f_stop_at_python_fence=None)
+    sp.add_argument("--keep-improving", action="store_true", help="Do not stop after the first validated solver; keep running additional locally scored improvement rounds.")
+    sp.add_argument("--improvement-rounds", type=int, default=3, help="How many validated generation rounds to run when --keep-improving is enabled.")
+    sp.add_argument("--self-improve-prompts", action="store_true", help="For competition-specific pipelines that support it, synthesize a stronger round-specific prompt bundle from the previous accepted solver before each new improvement round.")
+    sp.add_argument("--reject-identical-candidates", action=argparse.BooleanOptionalAction, default=True, help="Reject keep-improving candidates whose solver/submission fingerprint is identical to the current best artifact.")
+    sp.add_argument("--write-per-row-delta", action=argparse.BooleanOptionalAction, default=True, help="Write per-row candidate-vs-best move-count deltas for every locally scored improvement round.")
     sp.add_argument("--allow-baseline", action="store_true")
+    sp.add_argument("--baseline", default=None, help="Optional explicit baseline solve_module.py override used for prompt grounding, fallback, and --no-llm.")
     sp.add_argument("--no-llm", action="store_true", help="Skip LLM: just copy baseline")
     sp.set_defaults(func=cmd_generate_solver)
 
@@ -2301,6 +4176,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--puzzles", required=False, default=None, help="Input puzzles/test CSV (optional; uses bundled competitions/<slug>/data/test.csv if omitted)")
     sp.add_argument("--output", required=True, help="Submission CSV output")
     sp.add_argument("--prompt-file", default=None, help="Override user prompt file")
+    sp.add_argument("--prompt-variant", default=None, choices=["regular", "improved", "dataset_adapted", "structured", "heuristic_boosted", "master_hybrid", "neighbour_model_hybrid", "score_guarded", "algorithmic_population", "portfolio_orchestrated", "hard_row_routed", "exact_score_population", "strict_self_improvement", "failure_aware_self_improvement"], help="Select a competition prompt bundle variant when available")
     sp.add_argument("--custom-prompts", default=None, help="Override custom prompts JSON")
     sp.add_argument(
         "--models",
@@ -2309,16 +4185,23 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Comma-separated model list (passed to AgentLaboratory --models). "
             "Bare names use g4f backend (remote providers). "
-            "To use local GPU inference, pass items like 'local:<hf_model_id>'."
+            "You can also pass explicit backends like 'local:<hf_model_id>', 'ollama:<model>', 'vllm:<model>', "
+            "'lmstudio:<model>', 'g4fapi:<model>', or plain g4f model names like 'gpt-4o-mini'."
         ),
     )
     sp.add_argument("--llm", dest="models", default=None, help=argparse.SUPPRESS)
-    sp.add_argument("--agent-models", default=None, help="Optional per-agent override mapping for AgentLaboratory, e.g. 'planner=gpt-4;coder=local:Qwen/Qwen2.5-Coder-1.5B;fixer=gpt-4o-mini'.")
+    sp.add_argument("--agent-models", default=None, help="Optional per-agent override mapping for AgentLaboratory, e.g. 'planner=claude-3.5-sonnet;coder=deepseek-chat,qwen2.5-coder;fixer=gpt-4o-mini'.")
     sp.add_argument("--planner-models", default=None, help="Optional model list override for the planner agent.")
     sp.add_argument("--coder-models", default=None, help="Optional model list override for the coder agent.")
     sp.add_argument("--fixer-models", default=None, help="Optional model list override for the fixer agent.")
-    sp.add_argument("--max-iters", type=int, default=8)
+    sp.add_argument("--search-mode", default="hybrid", choices=["classic", "hybrid"], help="classic = single-plan linear search; hybrid = multi-plan frontier search with experiment-memory refinement.")
+    sp.add_argument("--plan-beam-width", type=int, default=3, help="Planner beam width in hybrid mode.")
+    sp.add_argument("--frontier-width", type=int, default=6, help="Planner/coder frontier width per hybrid round.")
+    sp.add_argument("--archive-size", type=int, default=6, help="How many failed attempts to retain as hybrid experiment memory.")
+    sp.add_argument("--refine-rounds", type=int, default=1, help="How many planner refinement rounds to run in hybrid mode.")
+    sp.add_argument("--max-iters", type=int, default=100000)
     sp.add_argument("--g4f-recovery-rounds", type=int, default=None, help="Extra recovery rounds before offline fallback (forwarded to AgentLaboratory).")
+    sp.add_argument("--baseline-patch-max-iters", type=int, default=None, help="Optional fixer iterations for the baseline-patcher stage (forwarded as AGENTLAB_BASELINE_PATCH_MAX_ITERS).")
     sp.add_argument("--g4f-recovery-max-iters", type=int, default=None, help="Fixer iterations per recovery round (forwarded to AgentLaboratory).")
     sp.add_argument("--g4f-recovery-sleep", type=float, default=None, help="Cooldown in seconds before each recovery round (forwarded to AgentLaboratory).")
     sp.add_argument("--worker-no-kill-process-group", action="store_true", help="Do not hard-kill the entire worker process group on timeout; only terminate the worker process itself.")
@@ -2331,13 +4214,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--g4f-stop-at-python-fence", dest="g4f_stop_at_python_fence", action="store_true", help="Trim g4f output after the first complete ```python``` fence.")
     sp.add_argument("--no-g4f-stop-at-python-fence", dest="g4f_stop_at_python_fence", action="store_false", help="Do not trim g4f output at the first python fence.")
     sp.set_defaults(g4f_async=None, g4f_stop_at_python_fence=None)
+    sp.add_argument("--keep-improving", action="store_true", help="Do not stop after the first validated solver; keep running additional locally scored improvement rounds.")
+    sp.add_argument("--improvement-rounds", type=int, default=3, help="How many validated generation rounds to run when --keep-improving is enabled.")
+    sp.add_argument("--self-improve-prompts", action="store_true", help="For competition-specific pipelines that support it, synthesize a stronger round-specific prompt bundle from the previous accepted solver before each new improvement round.")
+    sp.add_argument("--reject-identical-candidates", action=argparse.BooleanOptionalAction, default=True, help="Reject keep-improving candidates whose solver/submission fingerprint is identical to the current best artifact.")
+    sp.add_argument("--write-per-row-delta", action=argparse.BooleanOptionalAction, default=True, help="Write per-row candidate-vs-best move-count deltas for every locally scored improvement round.")
     sp.add_argument("--allow-baseline", action="store_true")
+    sp.add_argument("--baseline", default=None, help="Optional explicit baseline solve_module.py override used for prompt grounding, fallback, and --no-llm.")
     sp.add_argument("--no-llm", action="store_true")
     sp.add_argument("--format", default=None, help="Override llm-puzzles format slug")
     sp.add_argument("--vector-col", default=None, help="Override state column")
     sp.add_argument("--max-rows", type=int, default=None)
     sp.add_argument("--no-progress", action="store_true", help="Disable progress bar")
     sp.add_argument("--submit", action="store_true")
+    sp.add_argument("--require-submit-success", action=argparse.BooleanOptionalAction, default=True, help="When --submit is enabled, fail the run unless Kaggle upload is confirmed.")
     sp.add_argument("--message", default=None, help="Kaggle submission message")
     sp.add_argument("--kaggle-json", default=None, help="Path to a Kaggle credentials file (legacy kaggle.json or access_token). If set, credentials are loaded for both API and CLI submission paths.")
     sp.add_argument("--kaggle-config-dir", default=None, help="Optional directory to place a temporary kaggle.json copy")
@@ -2373,7 +4263,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> None:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    rewritten_argv, rewrite_note = _rewrite_embedded_kaggle_submit(raw_argv)
+    args, unknown = parser.parse_known_args(rewritten_argv)
+    if unknown:
+        parser.error(_format_unknown_args_error(unknown))
+    if rewrite_note:
+        print(rewrite_note, flush=True)
     args.func(args)
 
 
